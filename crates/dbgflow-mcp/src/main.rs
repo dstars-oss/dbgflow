@@ -1,17 +1,16 @@
-use dbgflow_core::session::SessionManager;
-use dbgflow_mcp::tools::{ToolService, CREATE_SESSION};
+use dbgflow_mcp::mcp::{default_server, run_stdio};
+use std::io::{self, BufReader};
 
 fn main() {
-    let service = ToolService::new(SessionManager::with_default_backends());
-    let output = serde_json::json!({
-        "server": "dbgflow-mcp",
-        "status": "ready",
-        "tools": service.tool_descriptors(),
-        "default_tool": CREATE_SESSION,
-    });
+    let stdin = io::stdin();
+    let stdout = io::stdout();
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).expect("serialize startup output")
-    );
+    if let Err(error) = run_stdio(
+        default_server(),
+        BufReader::new(stdin.lock()),
+        stdout.lock(),
+    ) {
+        eprintln!("dbgflow-mcp server error: {error}");
+        std::process::exit(1);
+    }
 }

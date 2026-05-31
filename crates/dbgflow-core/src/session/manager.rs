@@ -76,12 +76,16 @@ impl SessionManager {
     }
 
     pub fn with_default_backends() -> Self {
+        Self::with_default_backends_at("artifacts")
+    }
+
+    pub fn with_default_backends_at(artifact_root: impl Into<PathBuf>) -> Self {
         let mut backends: Vec<Arc<dyn DebugBackend>> = vec![Arc::new(MockBackend::new())];
         #[cfg(windows)]
         {
             backends.push(Arc::new(DbgEngBackend::new()));
         }
-        Self::new(backends)
+        Self::with_artifact_root(backends, artifact_root)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {

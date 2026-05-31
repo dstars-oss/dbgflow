@@ -475,13 +475,23 @@ continue until exception
 * 添加生成 crash dump fixture 的 Windows integration test，已跑通 `!analyze -v`。
 * Dump target 允许指向任意已存在的本地 dump 文件，路径会先校验和规范化；输出和日志仍写入受控 artifact root。
 
+已补齐第一阶段 MCP server 入口：
+
+* `dbgflow-mcp` 从启动信息打印改为 stdio JSON-RPC MCP server。
+* 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list` 和 `tools/call`。
+* `create_session`、`list_sessions`、`close_session`、`execute` 暴露 MCP `inputSchema`。
+* `create_session` 的 MCP 参数采用 `{ "target": { "kind": "mock" } }` / `{ "target": { "kind": "dump", "path": "..." } }` 形态，再转换到 core 层 `DebugTarget`。
+* Tool 调用结果以 JSON text content 返回；后端错误作为 MCP tool error 返回。
+* MCP server 增加 JSON-RPC envelope 校验、protocolVersion 协商、unknown tool / invalid arguments 的 protocol error 分类。
+* MCP server 默认 artifact root 固定为 workspace 级 `artifacts/`，并支持 `DBGFLOW_ARTIFACT_ROOT` 覆盖。
+
 ## 10. 当前待办
 
 ### P0
 
 * [x] 确定项目名称。
 * [x] 初始化 Rust workspace。
-* [ ] 定义 MCP tool schema。
+* [x] 定义 MCP tool schema。
 * [x] 定义 `DebugBackend` trait。
 * [x] 定义 `SessionState`。
 * [x] 定义 `SessionManager`。
@@ -588,13 +598,11 @@ dump、trace、transcript 可能包含内存、路径、注册表、凭据或业
 下一轮建议执行顺序：
 
 ```text
-1. 创建仓库结构
-2. 添加 AGENTS.md 和 GOALS.md
-3. 定义核心 domain model
-4. 实现 mock backend
-5. 实现 MCP tools skeleton
-6. 跑通 create/query/close session
-7. 再接入真实调试后端
+1. 补齐 transcript.log 和 events.jsonl 审计链路
+2. 为 session 创建、关闭、命令执行和状态变化写入事件记录
+3. 增强 command policy 的参数、安全边界和测试覆盖
+4. 新增 analyze / get_stack / list_modules 等结构化 dump 查询工具
+5. 在结构化工具稳定后推进 launch / attach / continue_until_event
 ```
 
 优先保持架构清晰，而不是过早追求完整调试能力。

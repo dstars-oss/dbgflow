@@ -2,18 +2,23 @@ use dbgflow_core::backend::DebugTarget;
 use dbgflow_core::session::{
     CreateSession, ExecuteSession, ExecuteSessionResult, Session, SessionId, SessionManager,
 };
-use dbgflow_core::Result;
+use dbgflow_core::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::fmt;
+use std::path::PathBuf;
 
 pub const CREATE_SESSION: &str = "create_session";
 pub const LIST_SESSIONS: &str = "list_sessions";
 pub const CLOSE_SESSION: &str = "close_session";
 pub const EXECUTE: &str = "execute";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
     pub name: &'static str,
     pub description: &'static str,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
 }
 
 #[derive(Clone)]
@@ -32,18 +37,86 @@ impl ToolService {
                 name: CREATE_SESSION,
                 description:
                     "Create a debug session or return an existing session for the same target.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "object",
+                            "description": "Debug target. Omit for a mock session.",
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "mock" }
+                                    },
+                                    "required": ["kind"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "dump" },
+                                        "path": {
+                                            "type": "string",
+                                            "description": "Path to a local Windows dump file."
+                                        }
+                                    },
+                                    "required": ["kind", "path"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        }
+                    },
+                    "additionalProperties": false
+                }),
             },
             ToolDescriptor {
                 name: LIST_SESSIONS,
                 description: "List debug sessions.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
             },
             ToolDescriptor {
                 name: CLOSE_SESSION,
                 description: "Close a debug session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by create_session."
+                        }
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
             },
             ToolDescriptor {
                 name: EXECUTE,
                 description: "Execute an allowlisted debugger command in a session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by create_session."
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Allowlisted debugger command."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional command timeout in milliseconds."
+                        }
+                    },
+                    "required": ["session_id", "command"],
+                    "additionalProperties": false
+                }),
             },
         ]
     }
@@ -69,9 +142,65 @@ impl ToolService {
             timeout_ms: request.timeout_ms,
         })
     }
+
+    pub fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> std::result::Result<Value, ToolCallError> {
+        match name {
+            CREATE_SESSION => self
+                .create_session(decode_arguments(arguments)?)
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            LIST_SESSIONS => self
+                .list_sessions()
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            CLOSE_SESSION => {
+                let request: CloseSessionRequest = decode_arguments(arguments)?;
+                self.close_session(request.session_id)
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            EXECUTE => self
+                .execute(decode_arguments(arguments)?)
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            _ => Err(ToolCallError::invalid_request(format!(
+                "unknown tool: {name}"
+            ))),
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug)]
+pub enum ToolCallError {
+    InvalidRequest(String),
+    Execution(String),
+}
+
+impl ToolCallError {
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self::InvalidRequest(message.into())
+    }
+
+    fn execution(error: DbgFlowError) -> Self {
+        Self::Execution(error.to_string())
+    }
+}
+
+impl fmt::Display for ToolCallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest(message) | Self::Execution(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CreateSessionRequest {
     pub target: DebugTarget,
 }
@@ -89,4 +218,74 @@ pub struct ExecuteRequest {
     pub session_id: SessionId,
     pub command: String,
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseSessionRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct McpCreateSessionRequest {
+    #[serde(default)]
+    target: McpDebugTarget,
+}
+
+impl From<McpCreateSessionRequest> for CreateSessionRequest {
+    fn from(value: McpCreateSessionRequest) -> Self {
+        Self {
+            target: value.target.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum McpDebugTarget {
+    Mock,
+    Dump { path: PathBuf },
+}
+
+impl Default for McpDebugTarget {
+    fn default() -> Self {
+        Self::Mock
+    }
+}
+
+impl From<McpDebugTarget> for DebugTarget {
+    fn from(value: McpDebugTarget) -> Self {
+        match value {
+            McpDebugTarget::Mock => DebugTarget::Mock,
+            McpDebugTarget::Dump { path } => DebugTarget::Dump { path },
+        }
+    }
+}
+
+fn decode_arguments<T>(arguments: Value) -> std::result::Result<T, ToolCallError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let arguments = match arguments {
+        Value::Null => Value::Object(Default::default()),
+        other => other,
+    };
+    serde_json::from_value(arguments)
+        .map_err(|error| ToolCallError::invalid_request(format!("invalid tool arguments: {error}")))
+}
+
+fn to_value<T>(value: T) -> std::result::Result<Value, ToolCallError>
+where
+    T: Serialize,
+{
+    serde_json::to_value(value)
+        .map_err(|error| ToolCallError::Execution(format!("serialize tool result: {error}")))
+}
+
+impl<'de> Deserialize<'de> for CreateSessionRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        McpCreateSessionRequest::deserialize(deserializer).map(Into::into)
+    }
 }
