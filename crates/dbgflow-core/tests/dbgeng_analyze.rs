@@ -31,7 +31,9 @@ fn dbgeng_can_run_analyze_v_on_generated_dump() {
     }
 
     let artifact_root = test_artifact_root("dbgeng-analyze");
-    let dump_path = artifact_root.join("test-fixtures").join("crash.dmp");
+    let dump_path = test_artifact_root("dbgeng-analyze-input")
+        .join("test-fixtures")
+        .join("crash.dmp");
     std::fs::create_dir_all(dump_path.parent().expect("dump parent")).expect("create dump dir");
     generate_crash_dump(&dump_path);
     assert!(

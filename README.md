@@ -29,3 +29,6 @@ creates a new session and returns the same detail shape.
 
 On Windows, dump sessions use `dbgeng.dll` resolved in this order: WinDbg /
 WinDbg Preview app package, Windows SDK Debuggers, then System32 fallback.
+Dump targets may point to any existing local dump file with a supported dump
+extension; command output and logs are still written under the controlled
+artifact root.

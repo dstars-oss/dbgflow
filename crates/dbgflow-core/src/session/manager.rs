@@ -296,8 +296,9 @@ impl SessionManager {
     fn validate_target(&self, target: DebugTarget) -> Result<DebugTarget> {
         match target {
             DebugTarget::Mock => Ok(DebugTarget::Mock),
-            DebugTarget::Dump { path } => validate_dump_target(self.artifacts.root(), &path)
-                .map(|path| DebugTarget::Dump { path }),
+            DebugTarget::Dump { path } => {
+                validate_dump_target(&path).map(|path| DebugTarget::Dump { path })
+            }
         }
     }
 }
@@ -352,7 +353,7 @@ fn truncate_for_preview(output: &str, limit: usize) -> (String, bool) {
     (output[..end].to_string(), true)
 }
 
-fn validate_dump_target(artifact_root: &Path, path: &Path) -> Result<PathBuf> {
+fn validate_dump_target(path: &Path) -> Result<PathBuf> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -371,18 +372,6 @@ fn validate_dump_target(artifact_root: &Path, path: &Path) -> Result<PathBuf> {
     if !canonical_path.is_file() {
         return Err(DbgFlowError::Backend(format!(
             "dump path is not a file: {}",
-            canonical_path.display()
-        )));
-    }
-
-    std::fs::create_dir_all(artifact_root)
-        .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
-    let root = artifact_root
-        .canonicalize()
-        .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
-    if !canonical_path.starts_with(root) {
-        return Err(DbgFlowError::Backend(format!(
-            "dump path is outside artifact root: {}",
             canonical_path.display()
         )));
     }

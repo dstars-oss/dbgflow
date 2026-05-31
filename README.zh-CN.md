@@ -27,3 +27,5 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 当前 backend 选择属于内部实现细节，不作为公开 tool 暴露。调用方只需要描述要调试的 target，后续由内部机制选择合适的 backend。
 
 在 Windows 上，dump session 会按 WinDbg / WinDbg Preview 应用包、Windows SDK Debuggers、System32 fallback 的顺序解析 `dbgeng.dll`。
+
+Dump target 可以指向任意已存在的本地 dump 文件，只要扩展名受支持；命令输出和日志仍写入受控 artifact root。

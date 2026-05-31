@@ -85,7 +85,7 @@ query_exception
 所有调试能力必须经过权限策略控制：
 
 * 默认禁止危险命令。
-* 默认禁止任意路径访问。
+* 外部输入路径必须校验、规范化并记录。
 * 插件加载必须 allowlist。
 * dump、trace、transcript 视为敏感文件。
 * 所有工具调用必须可审计。
@@ -128,7 +128,7 @@ TTD trace 必须作为敏感 artifact 管理。
 * 支持 kernel debugging。
 * 支持所有 WinDbg 命令的结构化解析。
 * 自动修复所有 bug。
-* 对任意本地路径开放调试器能力。
+* 对未校验或未记录的任意本地路径开放调试器能力。
 * 将 AI agent 暴露为不受限制的 shell。
 * 默认上传 dump、trace 或内存内容到外部服务。
 
@@ -473,6 +473,7 @@ continue until exception
 * 支持受控 `execute`，当前可执行 policy allowlist 中的查询命令。
 * `execute` 输出写入 session artifact，响应返回截断预览和 artifact 引用。
 * 添加生成 crash dump fixture 的 Windows integration test，已跑通 `!analyze -v`。
+* Dump target 允许指向任意已存在的本地 dump 文件，路径会先校验和规范化；输出和日志仍写入受控 artifact root。
 
 ## 10. 当前待办
 
