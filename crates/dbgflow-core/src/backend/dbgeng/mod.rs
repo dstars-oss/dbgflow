@@ -10,15 +10,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use windows::core::{implement, Interface, Type, GUID, HRESULT, PCSTR, PCWSTR};
-use windows::Win32::Foundation::HMODULE;
+use windows::core::{implement, Interface, Type, GUID, HRESULT, PCSTR, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+use windows::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugClient, IDebugClient4, IDebugControl, IDebugOutputCallbacks, IDebugOutputCallbacks_Impl,
-    DEBUG_END_PASSIVE, DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_ALL_CLIENTS,
+    DEBUG_ATTACH_DEFAULT, DEBUG_END_PASSIVE, DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_ALL_CLIENTS,
+    DEBUG_STATUS_GO,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+};
+use windows::Win32::System::Threading::{
+    CreateProcessW, OpenProcess, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
+    CREATE_SUSPENDED, PROCESS_CREATE_THREAD, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_OPERATION, PROCESS_VM_WRITE, STARTUPINFOW,
 };
 
 mod resolver;
@@ -26,6 +33,9 @@ mod resolver;
 pub use resolver::{resolve_dbgeng, DbgEngLocation, DbgEngSource};
 
 const DEFAULT_WAIT_TIMEOUT_MS: u32 = 120_000;
+const S_OK: HRESULT = HRESULT(0);
+const S_FALSE: HRESULT = HRESULT(1);
+const E_UNEXPECTED: HRESULT = HRESULT(0x8000FFFFu32 as i32);
 
 #[derive(Default)]
 pub struct DbgEngBackend {
@@ -48,22 +58,24 @@ impl DebugBackend for DbgEngBackend {
                 BackendCapability::SessionLifecycle,
                 BackendCapability::Execute,
                 BackendCapability::DumpAnalysis,
+                BackendCapability::LaunchProcess,
+                BackendCapability::AttachProcess,
             ],
         }
     }
 
     fn create_session(&self, request: CreateBackendSession) -> Result<BackendSession> {
-        let DebugTarget::Dump { path } = request.target else {
+        if matches!(request.target, DebugTarget::Mock) {
             return Err(DbgFlowError::Backend(
-                "DbgEngBackend only supports dump targets".to_string(),
+                "DbgEngBackend does not support mock targets".to_string(),
             ));
-        };
+        }
 
         let id = format!("dbgeng-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let worker_id = id.clone();
-        let join = thread::spawn(move || worker_main(worker_id, path, rx, init_tx));
+        let join = thread::spawn(move || worker_main(worker_id, request.target, rx, init_tx));
 
         let warnings = init_rx.recv().map_err(|_| {
             DbgFlowError::Backend("dbgeng worker exited during startup".to_string())
@@ -100,12 +112,13 @@ impl DebugBackend for DbgEngBackend {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         tx.send(WorkerCommand::Execute {
             command: request.command,
+            timeout_ms: request.timeout_ms,
             reply: reply_tx,
         })
         .map_err(|_| DbgFlowError::Backend("dbgeng worker is not available".to_string()))?;
 
         reply_rx
-            .recv_timeout(Duration::from_millis(request.timeout_ms))
+            .recv_timeout(reply_timeout(request.timeout_ms))
             .map_err(|_| DbgFlowError::Backend("dbgeng execute timed out".to_string()))?
     }
 
@@ -144,6 +157,7 @@ struct WorkerHandle {
 enum WorkerCommand {
     Execute {
         command: String,
+        timeout_ms: u64,
         reply: mpsc::SyncSender<Result<ExecuteBackendResult>>,
     },
     Close {
@@ -153,11 +167,11 @@ enum WorkerCommand {
 
 fn worker_main(
     _id: String,
-    dump_path: PathBuf,
+    target: DebugTarget,
     rx: mpsc::Receiver<WorkerCommand>,
     init_tx: mpsc::SyncSender<Result<Vec<String>>>,
 ) {
-    let mut session = match DbgEngSession::open_dump(&dump_path) {
+    let mut session = match DbgEngSession::open_target(&target) {
         Ok(session) => {
             let _ = init_tx.send(Ok(session.warnings.clone()));
             session
@@ -170,8 +184,12 @@ fn worker_main(
 
     while let Ok(command) = rx.recv() {
         match command {
-            WorkerCommand::Execute { command, reply } => {
-                let _ = reply.send(session.execute(&command));
+            WorkerCommand::Execute {
+                command,
+                timeout_ms,
+                reply,
+            } => {
+                let _ = reply.send(session.execute(&command, timeout_ms));
             }
             WorkerCommand::Close { reply } => {
                 let result = session.close();
@@ -189,11 +207,12 @@ struct DbgEngSession {
     control: IDebugControl,
     _callbacks: IDebugOutputCallbacks,
     output: Arc<Mutex<String>>,
+    _launched_process: Option<LaunchedProcess>,
     warnings: Vec<String>,
 }
 
 impl DbgEngSession {
-    fn open_dump(path: &Path) -> Result<Self> {
+    fn open_target(target: &DebugTarget) -> Result<Self> {
         let location = resolve_dbgeng()?;
         let mut warnings = Vec::new();
         warnings.push(format!(
@@ -220,20 +239,57 @@ impl DbgEngSession {
         }
         .into();
 
+        let mut launched_process = None;
+
         unsafe {
             client.SetOutputCallbacks(&callbacks).map_err(|error| {
                 DbgFlowError::Backend(format!("SetOutputCallbacks failed: {error}"))
             })?;
 
-            let wide_path = to_wide_null(path);
-            client4
-                .OpenDumpFileWide(PCWSTR(wide_path.as_ptr()), 0)
-                .map_err(|error| {
-                    DbgFlowError::Backend(format!("OpenDumpFileWide failed: {error}"))
-                })?;
-            control
-                .WaitForEvent(0, DEFAULT_WAIT_TIMEOUT_MS)
-                .map_err(|error| DbgFlowError::Backend(format!("WaitForEvent failed: {error}")))?;
+            match target {
+                DebugTarget::Dump { path } => {
+                    let wide_path = to_wide_null(path);
+                    client4
+                        .OpenDumpFileWide(PCWSTR(wide_path.as_ptr()), 0)
+                        .map_err(|error| {
+                            DbgFlowError::Backend(format!("OpenDumpFileWide failed: {error}"))
+                        })?;
+                    control
+                        .WaitForEvent(0, DEFAULT_WAIT_TIMEOUT_MS)
+                        .map_err(|error| {
+                            DbgFlowError::Backend(format!("WaitForEvent failed: {error}"))
+                        })?;
+                }
+                DebugTarget::Attach { pid } => {
+                    attach_process(&client4, *pid)?;
+                    break_process(*pid)?;
+                    control
+                        .WaitForEvent(0, DEFAULT_WAIT_TIMEOUT_MS)
+                        .map_err(|error| {
+                            DbgFlowError::Backend(format!(
+                                "WaitForEvent after attach failed: {error}"
+                            ))
+                        })?;
+                }
+                DebugTarget::Launch { executable, args } => {
+                    let mut launched = create_suspended_process(executable, args)?;
+                    attach_process(&client4, launched.pid)?;
+                    launched.resume()?;
+                    control
+                        .WaitForEvent(0, DEFAULT_WAIT_TIMEOUT_MS)
+                        .map_err(|error| {
+                            DbgFlowError::Backend(format!(
+                                "WaitForEvent after launch failed: {error}"
+                            ))
+                        })?;
+                    launched_process = Some(launched);
+                }
+                DebugTarget::Mock => {
+                    return Err(DbgFlowError::Backend(
+                        "DbgEngSession does not support mock targets".to_string(),
+                    ));
+                }
+            }
         }
 
         Ok(Self {
@@ -243,17 +299,40 @@ impl DbgEngSession {
             control,
             _callbacks: callbacks,
             output,
+            _launched_process: launched_process,
             warnings,
         })
     }
 
-    fn execute(&mut self, command: &str) -> Result<ExecuteBackendResult> {
+    fn execute(&mut self, command: &str, timeout_ms: u64) -> Result<ExecuteBackendResult> {
         {
             let mut output = self
                 .output
                 .lock()
                 .map_err(|_| DbgFlowError::Backend("dbgeng output buffer poisoned".to_string()))?;
             output.clear();
+        }
+
+        if command.trim() == "g" {
+            let mut warnings = Vec::new();
+            unsafe {
+                self.control
+                    .SetExecutionStatus(DEBUG_STATUS_GO)
+                    .map_err(|error| {
+                        DbgFlowError::Backend(format!(
+                            "SetExecutionStatus(DEBUG_STATUS_GO) failed: {error}"
+                        ))
+                    })?;
+            }
+            warnings.extend(wait_for_go_event(&self.control, timeout_ms)?);
+
+            let output = self
+                .output
+                .lock()
+                .map_err(|_| DbgFlowError::Backend("dbgeng output buffer poisoned".to_string()))?
+                .clone();
+
+            return Ok(ExecuteBackendResult { output, warnings });
         }
 
         let command = CString::new(command)
@@ -365,4 +444,169 @@ fn to_wide_null(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn wait_timeout(timeout_ms: u64) -> u32 {
+    timeout_ms.min(u32::MAX as u64) as u32
+}
+
+fn reply_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5))
+}
+
+fn break_process(pid: u32) -> Result<()> {
+    let access =
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE;
+    let process = unsafe { OpenProcess(access, false, pid) }
+        .map_err(|error| DbgFlowError::Backend(format!("OpenProcess for break failed: {error}")))?;
+    let result = unsafe { DebugBreakProcess(process) }
+        .map_err(|error| DbgFlowError::Backend(format!("DebugBreakProcess failed: {error}")));
+    let _ = unsafe { CloseHandle(process) };
+    result
+}
+
+fn attach_process(client: &IDebugClient4, pid: u32) -> Result<()> {
+    let hr = unsafe {
+        (Interface::vtable(client).AttachProcess)(
+            Interface::as_raw(client),
+            0,
+            pid,
+            DEBUG_ATTACH_DEFAULT,
+        )
+    };
+    if hr != S_OK {
+        return Err(DbgFlowError::Backend(format!(
+            "AttachProcess failed: {hr:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn wait_for_go_event(control: &IDebugControl, timeout_ms: u64) -> Result<Vec<String>> {
+    let hr = unsafe {
+        (Interface::vtable(control).WaitForEvent)(
+            Interface::as_raw(control),
+            0,
+            wait_timeout(timeout_ms),
+        )
+    };
+    if hr == S_OK {
+        return Ok(Vec::new());
+    }
+    if hr == S_FALSE {
+        return Err(DbgFlowError::Backend(
+            "WaitForEvent after g timed out".to_string(),
+        ));
+    }
+    if hr == E_UNEXPECTED {
+        return Ok(vec![
+            "target exited or no debuggee remains after g".to_string()
+        ]);
+    }
+    Err(DbgFlowError::Backend(format!(
+        "WaitForEvent after g failed: {hr:?}"
+    )))
+}
+
+struct LaunchedProcess {
+    process: HANDLE,
+    thread: HANDLE,
+    pid: u32,
+    resumed: bool,
+}
+
+impl LaunchedProcess {
+    fn resume(&mut self) -> Result<()> {
+        let previous_suspend_count = unsafe { ResumeThread(self.thread) };
+        if previous_suspend_count == u32::MAX {
+            return Err(DbgFlowError::Backend("ResumeThread failed".to_string()));
+        }
+        self.resumed = true;
+        Ok(())
+    }
+}
+
+impl Drop for LaunchedProcess {
+    fn drop(&mut self) {
+        if !self.resumed {
+            let _ = unsafe { TerminateProcess(self.process, 1) };
+        }
+        let _ = unsafe { CloseHandle(self.thread) };
+        let _ = unsafe { CloseHandle(self.process) };
+    }
+}
+
+fn create_suspended_process(executable: &Path, args: &[String]) -> Result<LaunchedProcess> {
+    let mut executable_wide = to_wide_null(executable);
+    let command_line = launch_command_line(executable, args);
+    let mut command_line_wide = to_wide_null_str(&command_line);
+    let startup_info = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process_info = PROCESS_INFORMATION::default();
+
+    unsafe {
+        CreateProcessW(
+            PCWSTR(executable_wide.as_mut_ptr()),
+            Some(PWSTR(command_line_wide.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            None,
+            PCWSTR::null(),
+            &startup_info,
+            &mut process_info,
+        )
+    }
+    .map_err(|error| DbgFlowError::Backend(format!("CreateProcessW suspended failed: {error}")))?;
+
+    Ok(LaunchedProcess {
+        process: process_info.hProcess,
+        thread: process_info.hThread,
+        pid: process_info.dwProcessId,
+        resumed: false,
+    })
+}
+
+fn to_wide_null_str(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn launch_command_line(executable: &Path, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(quote_windows_arg(&executable.display().to_string()));
+    parts.extend(args.iter().map(|arg| quote_windows_arg(arg)));
+    parts.join(" ")
+}
+
+fn quote_windows_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+    quoted.push('"');
+    quoted
 }

@@ -43,7 +43,16 @@ pub struct CreateBackendSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DebugTarget {
     Mock,
-    Dump { path: PathBuf },
+    Dump {
+        path: PathBuf,
+    },
+    Attach {
+        pid: u32,
+    },
+    Launch {
+        executable: PathBuf,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -108,6 +108,46 @@ fn mock_session_execute_rejects_denied_command() {
     assert!(error.to_string().contains("command denied"));
 }
 
+#[test]
+fn attach_target_rejects_invalid_pid() {
+    let manager = SessionManager::with_mock_backend();
+
+    let zero = manager
+        .create_session(CreateSession {
+            target: DebugTarget::Attach { pid: 0 },
+        })
+        .expect_err("reject zero pid");
+    assert!(zero.to_string().contains("attach pid"));
+
+    let current = manager
+        .create_session(CreateSession {
+            target: DebugTarget::Attach {
+                pid: std::process::id(),
+            },
+        })
+        .expect_err("reject current process");
+    assert!(current.to_string().contains("current dbgflow process"));
+}
+
+#[test]
+fn launch_target_is_disabled_by_default() {
+    let manager = SessionManager::with_mock_backend();
+    let missing = std::env::temp_dir()
+        .join(format!("dbgflow-missing-{}", std::process::id()))
+        .join("missing.exe");
+
+    let error = manager
+        .create_session(CreateSession {
+            target: DebugTarget::Launch {
+                executable: missing,
+                args: Vec::new(),
+            },
+        })
+        .expect_err("reject disabled launch");
+
+    assert!(error.to_string().contains("launch targets are disabled"));
+}
+
 fn test_artifact_root(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

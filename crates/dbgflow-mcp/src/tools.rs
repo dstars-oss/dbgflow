@@ -63,6 +63,36 @@ impl ToolService {
                                     },
                                     "required": ["kind", "path"],
                                     "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "attach" },
+                                        "pid": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "description": "Process id to attach."
+                                        }
+                                    },
+                                    "required": ["kind", "pid"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "launch" },
+                                        "executable": {
+                                            "type": "string",
+                                            "description": "Path to a local executable. Disabled unless DBGFLOW_ENABLE_LAUNCH=1."
+                                        },
+                                        "args": {
+                                            "type": "array",
+                                            "items": { "type": "string" },
+                                            "description": "Command-line arguments. Omit for no arguments."
+                                        }
+                                    },
+                                    "required": ["kind", "executable"],
+                                    "additionalProperties": false
                                 }
                             ]
                         }
@@ -243,7 +273,17 @@ impl From<McpCreateSessionRequest> for CreateSessionRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum McpDebugTarget {
     Mock,
-    Dump { path: PathBuf },
+    Dump {
+        path: PathBuf,
+    },
+    Attach {
+        pid: u32,
+    },
+    Launch {
+        executable: PathBuf,
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 impl Default for McpDebugTarget {
@@ -257,6 +297,8 @@ impl From<McpDebugTarget> for DebugTarget {
         match value {
             McpDebugTarget::Mock => DebugTarget::Mock,
             McpDebugTarget::Dump { path } => DebugTarget::Dump { path },
+            McpDebugTarget::Attach { pid } => DebugTarget::Attach { pid },
+            McpDebugTarget::Launch { executable, args } => DebugTarget::Launch { executable, args },
         }
     }
 }

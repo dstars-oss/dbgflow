@@ -208,6 +208,7 @@ impl SessionManager {
 
     pub fn execute(&self, request: ExecuteSession) -> Result<ExecuteSessionResult> {
         self.command_policy.check_command(&request.command)?;
+        let is_run_control = self.command_policy.is_run_control_command(&request.command);
 
         let operation_lock = self.operation_lock(request.session_id)?;
         let _operation_guard = operation_lock
@@ -217,6 +218,9 @@ impl SessionManager {
         let session = self.query_session(request.session_id)?;
         if session.state.is_terminal() {
             return Err(DbgFlowError::SessionClosed(request.session_id));
+        }
+        if is_run_control {
+            self.set_session_state(request.session_id, SessionState::Running)?;
         }
 
         let backend = self
@@ -241,6 +245,9 @@ impl SessionManager {
                 return Err(error);
             }
         };
+        if is_run_control {
+            self.set_session_state(request.session_id, SessionState::Break)?;
+        }
 
         let (output_preview, output_truncated) =
             truncate_for_preview(&backend_result.output, OUTPUT_PREVIEW_LIMIT);
@@ -303,6 +310,8 @@ impl SessionManager {
             DebugTarget::Dump { path } => {
                 validate_dump_target(&path).map(|path| DebugTarget::Dump { path })
             }
+            DebugTarget::Attach { pid } => validate_attach_target(pid),
+            DebugTarget::Launch { executable, args } => validate_launch_target(&executable, args),
         }
     }
 }
@@ -310,14 +319,18 @@ impl SessionManager {
 fn select_backend_for_target(target: &DebugTarget) -> String {
     match target {
         DebugTarget::Mock => "mock".to_string(),
-        DebugTarget::Dump { .. } => "dbgeng".to_string(),
+        DebugTarget::Dump { .. } | DebugTarget::Attach { .. } | DebugTarget::Launch { .. } => {
+            "dbgeng".to_string()
+        }
     }
 }
 
 fn state_for_target(target: &DebugTarget) -> SessionState {
     match target {
         DebugTarget::Mock => SessionState::Ready,
-        DebugTarget::Dump { .. } => SessionState::Break,
+        DebugTarget::Dump { .. } | DebugTarget::Attach { .. } | DebugTarget::Launch { .. } => {
+            SessionState::Break
+        }
     }
 }
 
@@ -381,4 +394,49 @@ fn validate_dump_target(path: &Path) -> Result<PathBuf> {
     }
 
     Ok(canonical_path)
+}
+
+fn validate_attach_target(pid: u32) -> Result<DebugTarget> {
+    if pid == 0 {
+        return Err(DbgFlowError::Backend(
+            "attach pid must be greater than zero".to_string(),
+        ));
+    }
+    if pid == std::process::id() {
+        return Err(DbgFlowError::Backend(
+            "refusing to attach to the current dbgflow process".to_string(),
+        ));
+    }
+    Ok(DebugTarget::Attach { pid })
+}
+
+fn validate_launch_target(executable: &Path, args: Vec<String>) -> Result<DebugTarget> {
+    if !launch_enabled() {
+        return Err(DbgFlowError::Backend(
+            "launch targets are disabled; set DBGFLOW_ENABLE_LAUNCH=1 to enable controlled process launch".to_string(),
+        ));
+    }
+
+    let executable = executable
+        .canonicalize()
+        .map_err(|error| DbgFlowError::Backend(format!("invalid launch executable: {error}")))?;
+    if !executable.is_file() {
+        return Err(DbgFlowError::Backend(format!(
+            "launch executable is not a file: {}",
+            executable.display()
+        )));
+    }
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err(DbgFlowError::Backend(
+            "launch arguments must not contain NUL bytes".to_string(),
+        ));
+    }
+
+    Ok(DebugTarget::Launch { executable, args })
+}
+
+fn launch_enabled() -> bool {
+    std::env::var("DBGFLOW_ENABLE_LAUNCH")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }

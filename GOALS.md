@@ -485,6 +485,15 @@ continue until exception
 * MCP server 增加 JSON-RPC envelope 校验、protocolVersion 协商、unknown tool / invalid arguments 的 protocol error 分类。
 * MCP server 默认 artifact root 固定为 workspace 级 `artifacts/`，并支持 `DBGFLOW_ARTIFACT_ROOT` 覆盖。
 
+已落地最小进程调试 MVP：
+
+* `DebugTarget` 扩展支持 `Attach { pid }` 和 `Launch { executable, args }`。
+* MCP `create_session` target schema 支持 `attach` 和 `launch`，不新增公开 tool。
+* `DbgEngBackend` 支持通过 `AttachProcess` attach PID；launch 默认关闭，需要 `DBGFLOW_ENABLE_LAUNCH=1` 显式启用，并采用 suspended Win32 process creation、DbgEng attach 后再 resume 的最小实现。
+* `execute` 继续作为唯一调试命令入口，并开放精确 `g` 作为最小运行控制命令。
+* `g` 在后端通过 `SetExecutionStatus(DEBUG_STATUS_GO) + WaitForEvent(timeout)` 执行。
+* 进程调试集成测试已添加，但默认 ignored；当前本机显式运行 attach / launch 测试已通过。
+
 ## 10. 当前待办
 
 ### P0
@@ -511,9 +520,9 @@ continue until exception
 
 ### P2
 
-* [ ] 支持 attach process。
-* [ ] 支持 launch process。
-* [ ] 支持 continue until event。
+* [x] 支持 attach process MVP。
+* [x] 支持 launch process MVP。
+* [x] 支持最小 continue until event：通过 `execute` 精确命令 `g` + timeout。
 * [ ] 支持结构化 stack parser 或 DbgEng stack API。
 * [ ] 支持 module list。
 * [ ] 支持 exception summary。
@@ -598,11 +607,11 @@ dump、trace、transcript 可能包含内存、路径、注册表、凭据或业
 下一轮建议执行顺序：
 
 ```text
-1. 补齐 transcript.log 和 events.jsonl 审计链路
-2. 为 session 创建、关闭、命令执行和状态变化写入事件记录
-3. 增强 command policy 的参数、安全边界和测试覆盖
-4. 新增 analyze / get_stack / list_modules 等结构化 dump 查询工具
-5. 在结构化工具稳定后推进 launch / attach / continue_until_event
+1. 在更多真实目标上验证 live attach / launch ignored integration tests
+2. 增强 command policy 的参数、安全边界和测试覆盖
+3. 新增 analyze / get_stack / list_modules 等结构化 dump 查询工具
+4. 补齐 transcript.log 和 events.jsonl 审计链路
+5. 在结构化工具稳定后扩展 breakpoint / step / break_execution 等运行控制
 ```
 
 优先保持架构清晰，而不是过早追求完整调试能力。

@@ -3,6 +3,7 @@ use crate::{DbgFlowError, Result};
 #[derive(Debug, Clone)]
 pub struct CommandPolicy {
     allowed_prefixes: Vec<String>,
+    allowed_exact: Vec<String>,
     denied_prefixes: Vec<String>,
 }
 
@@ -24,15 +25,19 @@ impl CommandPolicy {
                 ".sympath".to_string(),
                 "dx".to_string(),
             ],
+            allowed_exact: vec!["g".to_string()],
             denied_prefixes: vec![
                 ".shell".to_string(),
                 ".load".to_string(),
                 ".scriptload".to_string(),
-                "g".to_string(),
                 "p".to_string(),
                 "t".to_string(),
             ],
         }
+    }
+
+    pub fn is_run_control_command(&self, command: &str) -> bool {
+        command.trim() == "g"
     }
 
     pub fn check_command(&self, command: &str) -> Result<()> {
@@ -54,6 +59,14 @@ impl CommandPolicy {
                 command: command.to_string(),
                 reason: "command is explicitly denied".to_string(),
             });
+        }
+
+        if self
+            .allowed_exact
+            .iter()
+            .any(|allowed| normalized == allowed)
+        {
+            return Ok(());
         }
 
         if self
@@ -88,6 +101,7 @@ mod tests {
 
         policy.check_command("!analyze -v").expect("allow analyze");
         policy.check_command("kv 20").expect("allow stack query");
+        policy.check_command("g").expect("allow go");
     }
 
     #[test]
@@ -95,7 +109,9 @@ mod tests {
         let policy = CommandPolicy::default_query_policy();
 
         assert!(policy.check_command(".shell dir").is_err());
-        assert!(policy.check_command("g").is_err());
+        assert!(policy.check_command("g foo").is_err());
+        assert!(policy.check_command("p").is_err());
+        assert!(policy.check_command("t").is_err());
         assert!(policy.check_command("unknown").is_err());
     }
 }

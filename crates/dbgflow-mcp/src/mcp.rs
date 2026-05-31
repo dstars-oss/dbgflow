@@ -315,6 +315,21 @@ mod tests {
         assert!(tools.iter().any(|tool| {
             tool["name"] == "create_session" && tool["inputSchema"]["type"] == "object"
         }));
+        let create_session = tools
+            .iter()
+            .find(|tool| tool["name"] == "create_session")
+            .expect("create_session tool");
+        let target_schema = &create_session["inputSchema"]["properties"]["target"]["oneOf"];
+        assert!(target_schema
+            .as_array()
+            .expect("target variants")
+            .iter()
+            .any(|target| target["properties"]["kind"]["const"] == "attach"));
+        assert!(target_schema
+            .as_array()
+            .expect("target variants")
+            .iter()
+            .any(|target| target["properties"]["kind"]["const"] == "launch"));
         assert!(tools.iter().any(|tool| {
             tool["name"] == "execute" && tool["inputSchema"]["required"][0] == "session_id"
         }));
