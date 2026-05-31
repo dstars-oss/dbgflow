@@ -1,7 +1,10 @@
+#[cfg(windows)]
+pub mod dbgeng;
 pub mod mock;
 
 use crate::Result;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendInfo {
@@ -29,6 +32,7 @@ pub enum BackendCapability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSession {
     pub id: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,10 +43,25 @@ pub struct CreateBackendSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DebugTarget {
     Mock,
+    Dump { path: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteBackendRequest {
+    pub backend_session_id: String,
+    pub command: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteBackendResult {
+    pub output: String,
+    pub warnings: Vec<String>,
 }
 
 pub trait DebugBackend: Send + Sync {
     fn info(&self) -> BackendInfo;
     fn create_session(&self, request: CreateBackendSession) -> Result<BackendSession>;
+    fn execute(&self, request: ExecuteBackendRequest) -> Result<ExecuteBackendResult>;
     fn close_session(&self, backend_session_id: &str) -> Result<()>;
 }

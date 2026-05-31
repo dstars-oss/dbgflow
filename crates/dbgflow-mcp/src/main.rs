@@ -2,7 +2,7 @@ use dbgflow_core::session::SessionManager;
 use dbgflow_mcp::tools::{ToolService, CREATE_SESSION};
 
 fn main() {
-    let service = ToolService::new(SessionManager::with_mock_backend());
+    let service = ToolService::new(SessionManager::with_default_backends());
     let output = serde_json::json!({
         "server": "dbgflow-mcp",
         "status": "ready",

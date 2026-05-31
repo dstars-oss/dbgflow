@@ -464,6 +464,16 @@ continue until exception
 * `create_session` 采用 get-or-create 语义：同一 target 已存在 active session 时返回现有详情，否则创建并返回相同详情结构。
 * 添加 mock session lifecycle 测试，覆盖 create / query / list / close。
 
+已落地 DbgEng / dump 分析 MVP：
+
+* 实现 Windows-only `DbgEngBackend`，直接接入 DbgEng，不引入 CdbBackend。
+* 实现 `dbgeng.dll` resolver，查找顺序为 WinDbg / WinDbg Preview 应用商店版、Windows SDK Debuggers、System32 fallback。
+* 通过动态加载 `dbgeng.dll` 和 `DebugCreate` 创建 DbgEng client。
+* 支持 `DebugTarget::Dump`，打开 dump 后调用 `WaitForEvent` 进入可分析状态。
+* 支持受控 `execute`，当前可执行 policy allowlist 中的查询命令。
+* `execute` 输出写入 session artifact，响应返回截断预览和 artifact 引用。
+* 添加生成 crash dump fixture 的 Windows integration test，已跑通 `!analyze -v`。
+
 ## 10. 当前待办
 
 ### P0
@@ -480,13 +490,13 @@ continue until exception
 
 ### P1
 
-* [ ] 实现 DbgEngBackend 最小版本。
-* [ ] 支持打开 dump。
-* [ ] 支持文本命令执行。
-* [ ] 支持 `!analyze -v`。
+* [x] 实现 DbgEngBackend 最小版本。
+* [x] 支持打开 dump。
+* [x] 支持文本命令执行。
+* [x] 支持 `!analyze -v`。
 * [ ] 支持 transcript。
-* [ ] 支持 close session。
-* [ ] 增加集成测试。
+* [x] 支持 close session。
+* [x] 增加集成测试。
 
 ### P2
 

@@ -1,11 +1,14 @@
 use dbgflow_core::backend::DebugTarget;
-use dbgflow_core::session::{CreateSession, Session, SessionId, SessionManager};
+use dbgflow_core::session::{
+    CreateSession, ExecuteSession, ExecuteSessionResult, Session, SessionId, SessionManager,
+};
 use dbgflow_core::Result;
 use serde::{Deserialize, Serialize};
 
 pub const CREATE_SESSION: &str = "create_session";
 pub const LIST_SESSIONS: &str = "list_sessions";
 pub const CLOSE_SESSION: &str = "close_session";
+pub const EXECUTE: &str = "execute";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -38,6 +41,10 @@ impl ToolService {
                 name: CLOSE_SESSION,
                 description: "Close a debug session.",
             },
+            ToolDescriptor {
+                name: EXECUTE,
+                description: "Execute an allowlisted debugger command in a session.",
+            },
         ]
     }
 
@@ -54,6 +61,14 @@ impl ToolService {
     pub fn close_session(&self, session_id: SessionId) -> Result<Session> {
         self.sessions.close_session(session_id)
     }
+
+    pub fn execute(&self, request: ExecuteRequest) -> Result<ExecuteSessionResult> {
+        self.sessions.execute(ExecuteSession {
+            session_id: request.session_id,
+            command: request.command,
+            timeout_ms: request.timeout_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,4 +82,11 @@ impl Default for CreateSessionRequest {
             target: DebugTarget::Mock,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteRequest {
+    pub session_id: SessionId,
+    pub command: String,
+    pub timeout_ms: Option<u64>,
 }

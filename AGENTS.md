@@ -249,6 +249,8 @@ cargo test
 
 重要开发、架构调整或调试能力扩展后，应更新 `GOALS.md`。
 
+完成 feature 后，应同步更新 `README.md` 和 `README.zh-CN.md`，确保中英文 README 反映当前可用能力、入口和限制。
+
 ## 11. 禁止事项
 
 除非已有明确设计决策，否则不要：

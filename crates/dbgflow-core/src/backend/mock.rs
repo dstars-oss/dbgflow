@@ -1,5 +1,6 @@
 use super::{
-    BackendCapability, BackendInfo, BackendKind, BackendSession, CreateBackendSession, DebugBackend,
+    BackendCapability, BackendInfo, BackendKind, BackendSession, CreateBackendSession,
+    DebugBackend, ExecuteBackendRequest, ExecuteBackendResult,
 };
 use crate::{DbgFlowError, Result};
 use std::collections::HashSet;
@@ -23,7 +24,10 @@ impl DebugBackend for MockBackend {
         BackendInfo {
             name: "mock".to_string(),
             kind: BackendKind::Mock,
-            capabilities: vec![BackendCapability::SessionLifecycle],
+            capabilities: vec![
+                BackendCapability::SessionLifecycle,
+                BackendCapability::Execute,
+            ],
         }
     }
 
@@ -34,7 +38,29 @@ impl DebugBackend for MockBackend {
             .lock()
             .map_err(|_| DbgFlowError::Backend("mock backend lock poisoned".to_string()))?;
         open_sessions.insert(id.clone());
-        Ok(BackendSession { id })
+        Ok(BackendSession {
+            id,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn execute(&self, request: ExecuteBackendRequest) -> Result<ExecuteBackendResult> {
+        let open_sessions = self
+            .open_sessions
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("mock backend lock poisoned".to_string()))?;
+
+        if !open_sessions.contains(&request.backend_session_id) {
+            return Err(DbgFlowError::Backend(format!(
+                "mock session not found: {}",
+                request.backend_session_id
+            )));
+        }
+
+        Ok(ExecuteBackendResult {
+            output: format!("mock executed: {}", request.command),
+            warnings: Vec::new(),
+        })
     }
 
     fn close_session(&self, backend_session_id: &str) -> Result<()> {

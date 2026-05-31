@@ -1,3 +1,3 @@
 mod manager;
 
-pub use manager::ArtifactManager;
+pub use manager::{ArtifactKind, ArtifactManager, ArtifactRef, CommandArtifactRecord};
