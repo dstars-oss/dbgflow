@@ -1,0 +1,8 @@
+target/
+artifacts/*
+!artifacts/.gitkeep
+*.pdb
+*.ilk
+*.dmp
+*.run
+*.trace
