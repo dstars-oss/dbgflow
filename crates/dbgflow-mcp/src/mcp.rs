@@ -5,8 +5,9 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 const JSONRPC_VERSION: &str = "2.0";
-const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[DEFAULT_PROTOCOL_VERSION];
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", DEFAULT_PROTOCOL_VERSION];
 const ARTIFACT_ROOT_ENV: &str = "DBGFLOW_ARTIFACT_ROOT";
 
 #[derive(Clone)]
@@ -218,8 +219,12 @@ fn tool_error(message: String) -> Value {
 }
 
 pub fn default_server() -> McpServer {
+    server_with_artifact_root(default_artifact_root())
+}
+
+pub fn server_with_artifact_root(artifact_root: impl Into<PathBuf>) -> McpServer {
     McpServer::new(ToolService::new(
-        dbgflow_core::session::SessionManager::with_default_backends_at(default_artifact_root()),
+        dbgflow_core::session::SessionManager::with_default_backends_at(artifact_root),
     ))
 }
 
@@ -274,15 +279,30 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18" }
+            }))
+            .expect("response");
+
+        assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(
+            response["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
+    }
+
+    #[test]
+    fn initialize_keeps_legacy_supported_protocol_version() {
+        let server = test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
                 "params": { "protocolVersion": "2024-11-05" }
             }))
             .expect("response");
 
         assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(
-            response["result"]["capabilities"]["tools"]["listChanged"],
-            false
-        );
     }
 
     #[test]
@@ -297,7 +317,7 @@ mod tests {
             }))
             .expect("response");
 
-        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
     }
 
     #[test]

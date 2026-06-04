@@ -8,3 +8,6 @@ license.workspace = true
 dbgflow-core = { path = "../dbgflow-core" }
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"

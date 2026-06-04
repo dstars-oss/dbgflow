@@ -1,0 +1,409 @@
+use crate::mcp::McpServer;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::Receiver;
+use std::thread;
+use std::time::Duration;
+
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpConfig {
+    pub bind: SocketAddr,
+}
+
+pub fn run_http(server: McpServer, config: HttpConfig, shutdown: Receiver<()>) -> io::Result<()> {
+    let listener = TcpListener::bind(config.bind)?;
+    listener.set_nonblocking(true)?;
+
+    loop {
+        if shutdown.try_recv().is_ok() {
+            return Ok(());
+        }
+
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                let server = server.clone();
+                thread::spawn(move || {
+                    let _ = handle_connection(server, stream);
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT))?;
+    let request = match read_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            write_response(
+                &mut stream,
+                HttpResponse::json(400, json!({ "error": error.to_string() })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let response = route_request(server, request);
+    write_response(&mut stream, response)
+}
+
+fn route_request(server: McpServer, request: HttpRequest) -> HttpResponse {
+    if !origin_is_allowed(request.headers.get("origin")) {
+        return HttpResponse::json(403, json!({ "error": "forbidden origin" }));
+    }
+
+    let path = request
+        .path
+        .split_once('?')
+        .map(|(path, _query)| path)
+        .unwrap_or(&request.path);
+
+    match (request.method.as_str(), path) {
+        ("GET", "/healthz") => HttpResponse::json(200, json!({ "status": "ok" })),
+        ("GET", "/mcp") => HttpResponse::empty(405),
+        ("POST", "/mcp") => handle_mcp_post(server, request),
+        _ => HttpResponse::json(404, json!({ "error": "not found" })),
+    }
+}
+
+fn handle_mcp_post(server: McpServer, request: HttpRequest) -> HttpResponse {
+    if !content_type_is_json(request.headers.get("content-type")) {
+        return HttpResponse::json(
+            415,
+            json!({ "error": "content type must be application/json" }),
+        );
+    }
+
+    let message = match serde_json::from_slice::<Value>(&request.body) {
+        Ok(message) => message,
+        Err(error) => {
+            return HttpResponse::json(400, json!({ "error": format!("parse error: {error}") }));
+        }
+    };
+
+    if is_jsonrpc_response(&message) {
+        return HttpResponse::empty(202);
+    }
+
+    if is_jsonrpc_notification(&message) {
+        if message.get("method").and_then(Value::as_str) == Some("notifications/initialized") {
+            let _ = server.handle_message(message);
+        }
+        return HttpResponse::empty(202);
+    }
+
+    match server.handle_message(message) {
+        Some(response) => HttpResponse::json(200, response),
+        None => HttpResponse::empty(202),
+    }
+}
+
+fn is_jsonrpc_notification(message: &Value) -> bool {
+    message.get("method").is_some() && message.get("id").is_none()
+}
+
+fn is_jsonrpc_response(message: &Value) -> bool {
+    message.get("method").is_none()
+        && message.get("id").is_some()
+        && (message.get("result").is_some() || message.get("error").is_some())
+}
+
+fn content_type_is_json(value: Option<&String>) -> bool {
+    value
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|content_type| content_type.eq_ignore_ascii_case("application/json"))
+        })
+        .unwrap_or(false)
+}
+
+fn origin_is_allowed(value: Option<&String>) -> bool {
+    let Some(origin) = value
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+
+    let origin = origin.to_ascii_lowercase();
+    origin == "http://localhost"
+        || origin == "https://localhost"
+        || origin.starts_with("http://localhost:")
+        || origin.starts_with("https://localhost:")
+        || origin == "http://127.0.0.1"
+        || origin == "https://127.0.0.1"
+        || origin.starts_with("http://127.0.0.1:")
+        || origin.starts_with("https://127.0.0.1:")
+        || origin == "http://[::1]"
+        || origin == "https://[::1]"
+        || origin.starts_with("http://[::1]:")
+        || origin.starts_with("https://[::1]:")
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    if request_line.trim().is_empty() {
+        return Err(invalid_input("empty request"));
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| invalid_input("missing HTTP method"))?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or_else(|| invalid_input("missing HTTP path"))?
+        .to_string();
+    let version = parts
+        .next()
+        .ok_or_else(|| invalid_input("missing HTTP version"))?;
+    if !version.starts_with("HTTP/1.") {
+        return Err(invalid_input("unsupported HTTP version"));
+    }
+
+    let mut headers = HashMap::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(invalid_input("invalid HTTP header"));
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+
+    let content_length = headers
+        .get("content-length")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| invalid_input("invalid content length"))?
+        .unwrap_or(0);
+    if content_length > MAX_REQUEST_BYTES {
+        return Err(invalid_input("request body too large"));
+    }
+
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body)?;
+
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    content_type: Option<&'static str>,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    fn json(status: u16, value: Value) -> Self {
+        Self {
+            status,
+            content_type: Some("application/json"),
+            body: serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec()),
+        }
+    }
+
+    fn empty(status: u16) -> Self {
+        Self {
+            status,
+            content_type: None,
+            body: Vec::new(),
+        }
+    }
+}
+
+fn write_response(stream: &mut TcpStream, response: HttpResponse) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response.status,
+        reason_phrase(response.status),
+        response.body.len()
+    )?;
+    if let Some(content_type) = response.content_type {
+        write!(stream, "Content-Type: {content_type}; charset=utf-8\r\n")?;
+    }
+    write!(stream, "\r\n")?;
+    stream.write_all(&response.body)?;
+    stream.flush()
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        _ => "Internal Server Error",
+    }
+}
+
+fn invalid_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        content_type_is_json, origin_is_allowed, route_request, HttpRequest, HttpResponse,
+    };
+    use crate::mcp::McpServer;
+    use crate::tools::ToolService;
+    use dbgflow_core::backend::mock::MockBackend;
+    use dbgflow_core::session::SessionManager;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn validates_json_content_type() {
+        assert!(content_type_is_json(Some(&"application/json".to_string())));
+        assert!(content_type_is_json(Some(
+            &"application/json; charset=utf-8".to_string()
+        )));
+        assert!(!content_type_is_json(Some(&"text/plain".to_string())));
+        assert!(!content_type_is_json(None));
+    }
+
+    #[test]
+    fn allows_only_empty_or_localhost_origin() {
+        assert!(origin_is_allowed(None));
+        assert!(origin_is_allowed(Some(
+            &"http://localhost:7331".to_string()
+        )));
+        assert!(origin_is_allowed(Some(&"http://127.0.0.1".to_string())));
+        assert!(origin_is_allowed(Some(&"http://[::1]:7331".to_string())));
+        assert!(!origin_is_allowed(Some(&"http://example.com".to_string())));
+    }
+
+    #[test]
+    fn healthz_returns_ok() {
+        let response = route_request(
+            test_server(),
+            request("GET", "/healthz", HashMap::new(), Vec::new()),
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(json_body(response)["status"], "ok");
+    }
+
+    #[test]
+    fn mcp_get_returns_method_not_allowed() {
+        let response = route_request(
+            test_server(),
+            request("GET", "/mcp", HashMap::new(), Vec::new()),
+        );
+
+        assert_eq!(response.status, 405);
+        assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn mcp_post_initialize_returns_json_response() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .expect("serialize body");
+
+        let response = route_request(test_server(), request("POST", "/mcp", headers, body));
+
+        assert_eq!(response.status, 200);
+        assert_eq!(json_body(response)["id"], 1);
+    }
+
+    #[test]
+    fn mcp_post_notification_returns_accepted() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .expect("serialize body");
+
+        let response = route_request(test_server(), request("POST", "/mcp", headers, body));
+
+        assert_eq!(response.status, 202);
+        assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn mcp_post_rejects_non_localhost_origin() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("origin".to_string(), "http://example.com".to_string());
+
+        let response = route_request(
+            test_server(),
+            request("POST", "/mcp", headers, b"{}".to_vec()),
+        );
+
+        assert_eq!(response.status, 403);
+    }
+
+    fn test_server() -> McpServer {
+        McpServer::new(ToolService::new(SessionManager::with_artifact_root(
+            vec![Arc::new(MockBackend::new())],
+            std::env::temp_dir().join(format!("dbgflow-http-test-{}", std::process::id())),
+        )))
+    }
+
+    fn request(
+        method: &str,
+        path: &str,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    ) -> HttpRequest {
+        HttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers,
+            body,
+        }
+    }
+
+    fn json_body(response: HttpResponse) -> Value {
+        serde_json::from_slice(&response.body).expect("json response")
+    }
+}

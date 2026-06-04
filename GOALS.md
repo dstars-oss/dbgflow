@@ -494,6 +494,18 @@ continue until exception
 * `g` 在后端通过 `SetExecutionStatus(DEBUG_STATUS_GO) + WaitForEvent(timeout)` 执行。
 * 进程调试集成测试已添加，但默认 ignored；当前本机显式运行 attach / launch 测试已通过。
 
+### 2026-06-04
+
+已落地本地 HTTP / Windows service MVP：
+
+* `dbgflow-mcp` 保留无参数 stdio MCP transport，并新增 `http` 子命令。
+* 新增本地 Streamable HTTP MCP endpoint：`POST /mcp` 复用现有 JSON-RPC MCP handler，`GET /healthz` 提供健康检查。
+* 当前 HTTP 第一版返回 `application/json`，`GET /mcp` 返回 405，暂不提供服务端主动 SSE stream。
+* HTTP 默认绑定 `127.0.0.1:7331`，非空 `Origin` 仅允许 localhost / loopback，第一版不提供远程访问或认证。
+* 新增原生 Windows service 运行模式，支持 SCM stop / shutdown 控制并有序停止 HTTP listener。
+* 新增 `scripts/install-service.ps1`：构建 release binary，替换已有服务，复制 exe 到用户 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动 `dbgflow-mcp` 服务。
+* 新增 `scripts/uninstall-service.ps1`：停止并卸载服务；默认保留 artifacts 和 logs，避免误删敏感调试输出。
+
 ## 10. 当前待办
 
 ### P0
@@ -523,12 +535,16 @@ continue until exception
 * [x] 支持 attach process MVP。
 * [x] 支持 launch process MVP。
 * [x] 支持最小 continue until event：通过 `execute` 精确命令 `g` + timeout。
+* [x] 支持本地 Streamable HTTP MCP endpoint。
+* [x] 支持 Windows service 安装 / 卸载脚本。
 * [ ] 支持结构化 stack parser 或 DbgEng stack API。
 * [ ] 支持 module list。
 * [ ] 支持 exception summary。
 
 ### P3
 
+* [ ] 支持 HTTP token / auth 策略。
+* [ ] 支持 Streamable HTTP SSE stream 或 legacy SSE 兼容模式。
 * [ ] 支持 extension allowlist。
 * [ ] 支持 TTD recording。
 * [ ] 支持 TTD trace artifact。
