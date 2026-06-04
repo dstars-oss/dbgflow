@@ -104,7 +104,8 @@ When `--data-dir` is used, runtime logs are written as daily JSONL files under
 `<data-dir>\logs` and artifacts under `<data-dir>\artifacts`. Runtime logs are
 retained for 7 days; artifacts are not automatically removed.
 
-Install or uninstall the Windows service from an elevated PowerShell session:
+Install or uninstall the Windows service from PowerShell. If the session is not
+elevated, the scripts prompt for UAC elevation and continue after confirmation:
 
 ```text
 .\scripts\install-service.ps1

@@ -505,6 +505,7 @@ continue until exception
 * 新增原生 Windows service 运行模式，支持 SCM stop / shutdown 控制并有序停止 HTTP listener。
 * 新增 `scripts/install-service.ps1`：构建 release binary，替换已有服务，复制 exe 到用户 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动 `dbgflow-mcp` 服务。
 * 新增 `scripts/uninstall-service.ps1`：停止并卸载服务；默认保留 artifacts 和 logs，避免误删敏感调试输出。
+* 安装 / 卸载脚本支持非管理员 PowerShell 入口；检测到未提权时会弹出 UAC，并把当前参数转交给提权后的脚本进程。
 
 已落地 dump 打开超时与易用性修复：
 

@@ -80,7 +80,8 @@ HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response
 
 使用 `--data-dir` 时，运行日志以按日 JSONL 文件写入 `<data-dir>\logs`，artifacts 写入 `<data-dir>\artifacts`。运行日志保留 7 天；artifacts 不会自动删除。
 
-在管理员 PowerShell 中安装或卸载 Windows service：
+在 PowerShell 中安装或卸载 Windows service；如果当前 session 未提权，脚本会弹出 UAC
+确认窗口并在确认后继续执行：
 
 ```text
 .\scripts\install-service.ps1

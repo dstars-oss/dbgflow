@@ -9,12 +9,67 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Assert-Administrator {
+function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "This script must be run from an elevated PowerShell session."
+    $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function ConvertTo-PowerShellStringLiteral {
+    param([string]$Value)
+
+    "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Invoke-SelfElevated {
+    param([string]$Command)
+
+    $powershell = Join-Path $PSHOME "powershell.exe"
+    if (-not (Test-Path $powershell)) {
+        $powershell = "powershell.exe"
     }
+
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+    Write-Host "Administrator privileges are required. Requesting elevation with UAC..."
+
+    try {
+        $process = Start-Process `
+            -FilePath $powershell `
+            -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedCommand) `
+            -Verb RunAs `
+            -Wait `
+            -PassThru
+    }
+    catch {
+        throw "Elevation was cancelled or failed: $($_.Exception.Message)"
+    }
+
+    exit $process.ExitCode
+}
+
+function Assert-Administrator {
+    if (Test-Administrator) {
+        return
+    }
+
+    $scriptPath = ConvertTo-PowerShellStringLiteral -Value $PSCommandPath
+    $serviceNameArgument = ConvertTo-PowerShellStringLiteral -Value $ServiceName
+    $displayNameArgument = ConvertTo-PowerShellStringLiteral -Value $DisplayName
+    $bindArgument = ConvertTo-PowerShellStringLiteral -Value $Bind
+    $installRootArgument = ConvertTo-PowerShellStringLiteral -Value $InstallRoot
+    $command = @(
+        '$ErrorActionPreference = "Stop"'
+        'try {'
+        "    & $scriptPath -ServiceName $serviceNameArgument -DisplayName $displayNameArgument -Bind $bindArgument -InstallRoot $installRootArgument"
+        '    exit 0'
+        '}'
+        'catch {'
+        '    Write-Error $_'
+        '    exit 1'
+        '}'
+    ) -join [Environment]::NewLine
+
+    Invoke-SelfElevated -Command $command
 }
 
 function Wait-ServiceDeleted {
