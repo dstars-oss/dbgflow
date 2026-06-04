@@ -2,42 +2,36 @@ use crate::{DbgFlowError, Result};
 
 #[derive(Debug, Clone)]
 pub struct CommandPolicy {
-    allowed_prefixes: Vec<String>,
-    allowed_exact: Vec<String>,
     denied_prefixes: Vec<String>,
 }
 
 impl CommandPolicy {
     pub fn default_query_policy() -> Self {
         Self {
-            allowed_prefixes: vec![
-                "!analyze -v".to_string(),
-                "k".to_string(),
-                "kb".to_string(),
-                "kv".to_string(),
-                "~* k".to_string(),
-                "lm".to_string(),
-                "r".to_string(),
-                ".ecxr".to_string(),
-                ".exr".to_string(),
-                ".cxr".to_string(),
-                ".reload".to_string(),
-                ".sympath".to_string(),
-                "dx".to_string(),
-            ],
-            allowed_exact: vec!["g".to_string()],
             denied_prefixes: vec![
                 ".shell".to_string(),
                 ".load".to_string(),
+                ".loadby".to_string(),
                 ".scriptload".to_string(),
-                "p".to_string(),
-                "t".to_string(),
+                ".scriptrun".to_string(),
+                ".dump".to_string(),
+                ".writemem".to_string(),
+                "$<".to_string(),
+                "$><".to_string(),
+                "$$<".to_string(),
+                "$$><".to_string(),
+                "$$>a<".to_string(),
+                "as".to_string(),
             ],
         }
     }
 
     pub fn is_run_control_command(&self, command: &str) -> bool {
-        command.trim() == "g"
+        let normalized = command.trim();
+        matches!(normalized, "g" | "p" | "t")
+            || has_command_prefix(normalized, "g")
+            || has_command_prefix(normalized, "p")
+            || has_command_prefix(normalized, "t")
     }
 
     pub fn check_command(&self, command: &str) -> Result<()> {
@@ -49,11 +43,36 @@ impl CommandPolicy {
                 reason: "empty command".to_string(),
             });
         }
+        if contains_command_separator(normalized) {
+            return Err(DbgFlowError::CommandDenied {
+                command: command.to_string(),
+                reason: "command separators are not allowed".to_string(),
+            });
+        }
 
+        let lowered = normalized.to_ascii_lowercase();
+        if lowered.starts_with('$') {
+            return Err(DbgFlowError::CommandDenied {
+                command: command.to_string(),
+                reason: "dollar-prefixed debugger metacommands are denied".to_string(),
+            });
+        }
+        if contains_fixed_alias_reference(&lowered) {
+            return Err(DbgFlowError::CommandDenied {
+                command: command.to_string(),
+                reason: "fixed-name aliases are denied".to_string(),
+            });
+        }
+        if defines_fixed_alias(&lowered) {
+            return Err(DbgFlowError::CommandDenied {
+                command: command.to_string(),
+                reason: "fixed-name alias definition is denied".to_string(),
+            });
+        }
         if self
             .denied_prefixes
             .iter()
-            .any(|prefix| has_command_prefix(normalized, prefix))
+            .any(|prefix| has_command_prefix(&lowered, prefix))
         {
             return Err(DbgFlowError::CommandDenied {
                 command: command.to_string(),
@@ -61,27 +80,29 @@ impl CommandPolicy {
             });
         }
 
-        if self
-            .allowed_exact
-            .iter()
-            .any(|allowed| normalized == allowed)
-        {
-            return Ok(());
-        }
-
-        if self
-            .allowed_prefixes
-            .iter()
-            .any(|prefix| has_command_prefix(normalized, prefix))
-        {
-            return Ok(());
-        }
-
-        Err(DbgFlowError::CommandDenied {
-            command: command.to_string(),
-            reason: "command is not allowlisted".to_string(),
-        })
+        Ok(())
     }
+}
+
+fn contains_command_separator(command: &str) -> bool {
+    command
+        .chars()
+        .any(|ch| matches!(ch, ';' | '\r' | '\n' | '\u{2028}' | '\u{2029}'))
+}
+
+fn contains_fixed_alias_reference(command: &str) -> bool {
+    (0..=9).any(|index| command.contains(&format!("$u{index}")))
+}
+
+fn defines_fixed_alias(command: &str) -> bool {
+    let Some(rest) = command.strip_prefix('r') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    (0..=9).any(|index| {
+        rest.strip_prefix(&format!(".u{index}"))
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
 }
 
 fn has_command_prefix(command: &str, prefix: &str) -> bool {
@@ -96,12 +117,17 @@ mod tests {
     use super::CommandPolicy;
 
     #[test]
-    fn allows_allowlisted_query_commands() {
+    fn allows_non_denied_debugger_commands() {
         let policy = CommandPolicy::default_query_policy();
 
         policy.check_command("!analyze -v").expect("allow analyze");
         policy.check_command("kv 20").expect("allow stack query");
         policy.check_command("g").expect("allow go");
+        policy.check_command("dt ntdll!_PEB").expect("allow dt");
+        policy.check_command("!avrf").expect("allow verifier query");
+        policy
+            .check_command(".sympath+ C:\\symbols")
+            .expect("allow sympath append");
     }
 
     #[test]
@@ -109,9 +135,22 @@ mod tests {
         let policy = CommandPolicy::default_query_policy();
 
         assert!(policy.check_command(".shell dir").is_err());
-        assert!(policy.check_command("g foo").is_err());
-        assert!(policy.check_command("p").is_err());
-        assert!(policy.check_command("t").is_err());
-        assert!(policy.check_command("unknown").is_err());
+        assert!(policy.check_command(".load evil.dll").is_err());
+        assert!(policy.check_command(".scriptload evil.js").is_err());
+        assert!(policy.check_command(".dump /ma C:\\temp\\x.dmp").is_err());
+        assert!(policy.check_command("$>< C:\\temp\\commands.txt").is_err());
+        assert!(policy.check_command("$><C:\\temp\\commands.txt").is_err());
+        assert!(policy
+            .check_command("$$>a< C:\\temp\\commands.txt")
+            .is_err());
+        assert!(policy
+            .check_command("$$>a<C:\\temp\\commands.txt arg")
+            .is_err());
+        assert!(policy.check_command("as x .shell dir").is_err());
+        assert!(policy.check_command("r .u0 = .shell dir").is_err());
+        assert!(policy.check_command("k $u0").is_err());
+        assert!(policy.check_command("k; .shell dir").is_err());
+        assert!(policy.check_command("k\n.shell dir").is_err());
+        assert!(policy.check_command("unknown").is_ok());
     }
 }

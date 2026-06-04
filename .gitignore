@@ -6,3 +6,4 @@ artifacts/*
 *.dmp
 *.run
 *.trace
+issue/

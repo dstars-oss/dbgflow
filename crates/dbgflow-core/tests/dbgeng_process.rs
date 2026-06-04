@@ -23,8 +23,10 @@ fn dbgeng_can_attach_to_process_and_query_modules() {
     let session = manager
         .create_session(CreateSession {
             target: DebugTarget::Attach { pid: child.id() },
+            startup_timeout_ms: None,
         })
         .expect("attach process session");
+    let session = wait_for_break(&manager, session.id);
     assert_eq!(session.state, SessionState::Break);
 
     let result = manager
@@ -36,7 +38,7 @@ fn dbgeng_can_attach_to_process_and_query_modules() {
         .expect("query modules after attach");
 
     assert!(
-        !result.output_preview.trim().is_empty(),
+        !result.output.trim().is_empty(),
         "expected module output after attach"
     );
 
@@ -60,8 +62,10 @@ fn dbgeng_can_launch_process_and_continue_to_exit() {
                 executable: ping,
                 args: vec!["127.0.0.1".to_string(), "-n".to_string(), "3".to_string()],
             },
+            startup_timeout_ms: None,
         })
         .expect("launch process session");
+    let session = wait_for_break(&manager, session.id);
     assert_eq!(session.state, SessionState::Break);
 
     let result = manager
@@ -134,6 +138,24 @@ fn test_artifact_root(name: &str) -> PathBuf {
 fn live_debug_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn wait_for_break(
+    manager: &SessionManager,
+    session_id: dbgflow_core::session::SessionId,
+) -> dbgflow_core::session::Session {
+    let deadline = std::time::Instant::now() + Duration::from_secs(130);
+    loop {
+        let session = manager.query_session(session_id).expect("query session");
+        if session.state == SessionState::Break {
+            return session;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session did not break: {session:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 struct EnvVarGuard {

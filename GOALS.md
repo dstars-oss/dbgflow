@@ -222,7 +222,7 @@ close_session
 
 验收标准：
 
-* 可执行 allowlisted 命令。
+* 可执行未被 denylist 拒绝的诊断命令。
 * 非法命令被拒绝。
 * 超时命令被中止或 session 标记为 error。
 * 所有命令有审计记录。
@@ -470,8 +470,8 @@ continue until exception
 * 实现 `dbgeng.dll` resolver，查找顺序为 WinDbg / WinDbg Preview 应用商店版、Windows SDK Debuggers、System32 fallback。
 * 通过动态加载 `dbgeng.dll` 和 `DebugCreate` 创建 DbgEng client。
 * 支持 `DebugTarget::Dump`，打开 dump 后调用 `WaitForEvent` 进入可分析状态。
-* 支持受控 `execute`，当前可执行 policy allowlist 中的查询命令。
-* `execute` 输出写入 session artifact，响应返回截断预览和 artifact 引用。
+* 支持受控 `execute`，当前采用 denylist-only policy，默认允许诊断命令并拒绝危险命令。
+* `execute` 输出写入 session artifact，响应返回完整输出和 artifact 引用。
 * 添加生成 crash dump fixture 的 Windows integration test，已跑通 `!analyze -v`。
 * Dump target 允许指向任意已存在的本地 dump 文件，路径会先校验和规范化；输出和日志仍写入受控 artifact root。
 
@@ -479,7 +479,7 @@ continue until exception
 
 * `dbgflow-mcp` 从启动信息打印改为 stdio JSON-RPC MCP server。
 * 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list` 和 `tools/call`。
-* `create_session`、`list_sessions`、`close_session`、`execute` 暴露 MCP `inputSchema`。
+* `create_session`、`get_session`、`list_sessions`、`close_session`、`execute`、`set_symbols` 暴露 MCP `inputSchema`。
 * `create_session` 的 MCP 参数采用 `{ "target": { "kind": "mock" } }` / `{ "target": { "kind": "dump", "path": "..." } }` 形态，再转换到 core 层 `DebugTarget`。
 * Tool 调用结果以 JSON text content 返回；后端错误作为 MCP tool error 返回。
 * MCP server 增加 JSON-RPC envelope 校验、protocolVersion 协商、unknown tool / invalid arguments 的 protocol error 分类。
@@ -500,11 +500,22 @@ continue until exception
 
 * `dbgflow-mcp` 保留无参数 stdio MCP transport，并新增 `http` 子命令。
 * 新增本地 Streamable HTTP MCP endpoint：`POST /mcp` 复用现有 JSON-RPC MCP handler，`GET /healthz` 提供健康检查。
-* 当前 HTTP 第一版返回 `application/json`，`GET /mcp` 返回 405，暂不提供服务端主动 SSE stream。
+* HTTP `POST /mcp` 返回 `application/json`，`GET /mcp` 提供服务端 SSE stream。
 * HTTP 默认绑定 `127.0.0.1:7331`，非空 `Origin` 仅允许 localhost / loopback，第一版不提供远程访问或认证。
 * 新增原生 Windows service 运行模式，支持 SCM stop / shutdown 控制并有序停止 HTTP listener。
 * 新增 `scripts/install-service.ps1`：构建 release binary，替换已有服务，复制 exe 到用户 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动 `dbgflow-mcp` 服务。
 * 新增 `scripts/uninstall-service.ps1`：停止并卸载服务；默认保留 artifacts 和 logs，避免误删敏感调试输出。
+
+已落地 dump 打开超时与易用性修复：
+
+* `create_session` 改为异步创建，先返回 `Starting` session，后端启动完成后转为 `Ready` / `Break`，失败或超时转为 `Error`。
+* session 状态增加更新时间、当前操作、错误信息和可空 backend session id；新增 `get_session` 工具用于查询单个 session。
+* session 间不共享创建阶段阻塞路径；不同 session 可并发，同 session 操作仍串行。
+* `close_session` 对 Starting / Running session 采用尽力关闭语义，先返回 `Closed`，后端资源后台释放。
+* DbgEng 命令执行和输出 callback 改为 Wide API，提高 Windows Unicode 路径兼容性。
+* 新增 `set_symbols` 工具，先验证本地符号目录，再通过 `.sympath` / `.sympath+` 设置符号路径。
+* HTTP `GET /mcp` 支持 SSE，session 状态变化通过 `notifications/resources/updated` 推送；同时支持 session resources 的 list/read。
+* Windows service 默认 artifacts/logs 目录调整为 `%LOCALAPPDATA%\dbgflow\var`。
 
 ## 10. 当前待办
 
@@ -544,7 +555,7 @@ continue until exception
 ### P3
 
 * [ ] 支持 HTTP token / auth 策略。
-* [ ] 支持 Streamable HTTP SSE stream 或 legacy SSE 兼容模式。
+* [x] 支持 Streamable HTTP SSE stream。
 * [ ] 支持 extension allowlist。
 * [ ] 支持 TTD recording。
 * [ ] 支持 TTD trace artifact。
@@ -573,8 +584,7 @@ WinDbg 命令能力过强，可能被滥用。
 
 缓解：
 
-* command allowlist。
-* denylist。
+* denylist-only command policy。
 * path sandbox。
 * extension allowlist。
 * 默认禁用危险命令。

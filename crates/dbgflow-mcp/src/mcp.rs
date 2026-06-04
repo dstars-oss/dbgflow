@@ -1,8 +1,10 @@
 use crate::tools::{ToolCallError, ToolService};
+use dbgflow_core::session::SessionId;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -55,6 +57,10 @@ impl McpServer {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": self.service.tool_descriptors() })),
             "tools/call" => self.call_tool(message.get("params").cloned().unwrap_or_default()),
+            "resources/list" => self.resources_list(),
+            "resources/read" => {
+                self.resources_read(message.get("params").cloned().unwrap_or_default())
+            }
             _ => Err(ServerError::new(
                 -32601,
                 format!("method not found: {method}"),
@@ -93,13 +99,17 @@ impl McpServer {
             "capabilities": {
                 "tools": {
                     "listChanged": false
+                },
+                "resources": {
+                    "subscribe": false,
+                    "listChanged": false
                 }
             },
             "serverInfo": {
                 "name": "dbgflow",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Use dbgflow tools to create debug sessions and run allowlisted debugger queries."
+            "instructions": "Use dbgflow tools to create debug sessions and run denylist-protected debugger commands."
         }))
     }
 
@@ -120,6 +130,51 @@ impl McpServer {
         };
 
         Ok(result)
+    }
+
+    fn resources_list(&self) -> std::result::Result<Value, ServerError> {
+        let sessions = self
+            .service
+            .list_sessions()
+            .map_err(|error| ServerError::new(-32000, error.to_string()))?;
+        let resources = sessions
+            .into_iter()
+            .map(|session| {
+                json!({
+                    "uri": session_resource_uri(session.id),
+                    "name": format!("dbgflow session {}", session.id),
+                    "description": format!("dbgflow session state: {:?}", session.state),
+                    "mimeType": "application/json"
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "resources": resources }))
+    }
+
+    fn resources_read(&self, params: Value) -> std::result::Result<Value, ServerError> {
+        let params: ResourceReadParams = serde_json::from_value(params).map_err(|error| {
+            ServerError::new(-32602, format!("invalid resources/read params: {error}"))
+        })?;
+        let session_id = parse_session_resource_uri(&params.uri)?;
+        let session = self
+            .service
+            .query_session(session_id)
+            .map_err(|error| ServerError::new(-32000, error.to_string()))?;
+        let text = serde_json::to_string_pretty(&session)
+            .map_err(|error| ServerError::new(-32000, format!("serialize session: {error}")))?;
+        Ok(json!({
+            "contents": [
+                {
+                    "uri": params.uri,
+                    "mimeType": "application/json",
+                    "text": text
+                }
+            ]
+        }))
+    }
+
+    pub fn session_update_receiver(&self) -> mpsc::Receiver<SessionId> {
+        self.service.subscribe_session_updates()
     }
 }
 
@@ -157,6 +212,11 @@ where
 struct CallToolParams {
     name: String,
     arguments: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResourceReadParams {
+    uri: String,
 }
 
 #[derive(Debug)]
@@ -216,6 +276,18 @@ fn tool_error(message: String) -> Value {
         ],
         "isError": true
     })
+}
+
+pub fn session_resource_uri(session_id: SessionId) -> String {
+    format!("dbgflow://sessions/{session_id}")
+}
+
+fn parse_session_resource_uri(uri: &str) -> std::result::Result<SessionId, ServerError> {
+    let id = uri
+        .strip_prefix("dbgflow://sessions/")
+        .ok_or_else(|| ServerError::new(-32602, format!("invalid session resource uri: {uri}")))?;
+    serde_json::from_value(Value::String(id.to_string()))
+        .map_err(|error| ServerError::new(-32602, format!("invalid session id in uri: {error}")))
 }
 
 pub fn default_server() -> McpServer {
@@ -353,6 +425,8 @@ mod tests {
         assert!(tools.iter().any(|tool| {
             tool["name"] == "execute" && tool["inputSchema"]["required"][0] == "session_id"
         }));
+        assert!(tools.iter().any(|tool| tool["name"] == "get_session"));
+        assert!(tools.iter().any(|tool| tool["name"] == "set_symbols"));
     }
 
     #[test]
@@ -374,6 +448,7 @@ mod tests {
 
         let session = tool_text_json(&create_response);
         let session_id = session["id"].as_str().expect("session id");
+        wait_for_ready(&server, session_id);
 
         let execute_response = server
             .handle_message(json!({
@@ -391,9 +466,9 @@ mod tests {
             .expect("execute response");
 
         let execute = tool_text_json(&execute_response);
-        assert!(execute["output_preview"]
+        assert!(execute["output"]
             .as_str()
-            .expect("output preview")
+            .expect("output")
             .contains("mock executed: k"));
     }
 
@@ -563,5 +638,33 @@ mod tests {
             .as_str()
             .expect("tool text");
         serde_json::from_str(text).expect("tool json text")
+    }
+
+    fn wait_for_ready(server: &McpServer, session_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let response = server
+                .handle_message(json!({
+                    "jsonrpc": "2.0",
+                    "id": "get-session",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "get_session",
+                        "arguments": {
+                            "session_id": session_id
+                        }
+                    }
+                }))
+                .expect("get session response");
+            let session = tool_text_json(&response);
+            if session["state"] == "Ready" {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session did not become ready: {session}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

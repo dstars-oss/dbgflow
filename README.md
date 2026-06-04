@@ -15,23 +15,26 @@ Streamable HTTP MCP endpoint, and Windows service scripts:
 - artifact manager
 - DbgEng backend for dump targets
 - DbgEng backend for process attach and launch targets
-- allowlisted `execute` command support
+- denylist-protected `execute` command support
 - MCP-facing tool facade
 - stdio JSON-RPC MCP entrypoint with tool schemas
-- Streamable HTTP MCP endpoint at `/mcp`
+- Streamable HTTP MCP endpoint at `/mcp` with resource update SSE
 - native Windows service mode
 - PowerShell install / uninstall service scripts
 
 Initial tool names:
 
 - `create_session`
+- `get_session`
 - `list_sessions`
 - `close_session`
 - `execute`
+- `set_symbols`
 
-`create_session` uses get-or-create semantics: if an active session already
-exists for the same target, it returns that session's details; otherwise, it
-creates a new session and returns the same detail shape.
+`create_session` uses get-or-create semantics and returns quickly with a
+`Starting` session while the backend opens the target in the background. Use
+`get_session`, `list_sessions`, or the HTTP resource update stream to observe
+the transition to `Ready`, `Break`, `Closed`, or `Error`.
 
 On Windows, DbgEng sessions use `dbgeng.dll` resolved in this order: WinDbg /
 WinDbg Preview app package, Windows SDK Debuggers, then System32 fallback.
@@ -59,8 +62,10 @@ uses a suspended Win32 process creation path and attaches DbgEng before resuming
 the target. The executable must be an existing path; shell invocation, custom
 current directories, and custom environments are not part of this MVP.
 Command output and logs are still written under the controlled artifact root.
-The only run-control command currently allowlisted through `execute` is exact
-`g`; other step/breakpoint commands remain denied.
+`execute` no longer uses an allowlist, but dangerous commands such as shell
+execution, script loading, extension loading, dump writing, and memory writing
+remain denied by policy. Run-control commands update session state separately
+from ordinary queries.
 
 Run the MCP server over stdio:
 
@@ -74,14 +79,15 @@ Run the MCP server over local Streamable HTTP:
 cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331
 ```
 
-The HTTP endpoint is `http://127.0.0.1:7331/mcp`. This first HTTP version
-returns JSON responses for `POST /mcp` and returns `405 Method Not Allowed` for
-`GET /mcp`; it does not provide a server-initiated SSE stream yet. `GET
+The HTTP endpoint is `http://127.0.0.1:7331/mcp`. `POST /mcp` returns JSON
+responses. `GET /mcp` opens a server-sent event stream for MCP notifications,
+including `notifications/resources/updated` for session state changes. `GET
 /healthz` returns a simple health response.
 
 The server supports `initialize`, `notifications/initialized`, `ping`,
-`tools/list`, and `tools/call`. Tool results are returned as JSON text content;
-raw debugger command output is still written to session artifacts.
+`tools/list`, `tools/call`, `resources/list`, and `resources/read`. Tool
+results are returned as JSON text content. Debugger command output is returned
+in full and also written to session artifacts.
 
 By default, the MCP server writes artifacts under the workspace-level
 `artifacts/` directory. Set `DBGFLOW_ARTIFACT_ROOT` to override that location.
@@ -97,7 +103,7 @@ The install script builds the release binary, replaces an existing
 `dbgflow-mcp` service if present, copies the executable to
 `%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem, starts it, and checks
 `/healthz`. Service artifacts and logs are written under
-`%LOCALAPPDATA%\dbgflow`; uninstall does not delete artifacts or logs by
+`%LOCALAPPDATA%\dbgflow\var`; uninstall does not delete artifacts or logs by
 default.
 
 Live process DbgEng integration tests are ignored by default because attach and

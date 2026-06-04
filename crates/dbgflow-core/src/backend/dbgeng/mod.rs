@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{DbgFlowError, Result};
 use std::collections::HashMap;
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -14,9 +14,9 @@ use windows::core::{implement, Interface, Type, GUID, HRESULT, PCSTR, PCWSTR, PW
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    IDebugClient, IDebugClient4, IDebugControl, IDebugOutputCallbacks, IDebugOutputCallbacks_Impl,
-    DEBUG_ATTACH_DEFAULT, DEBUG_END_PASSIVE, DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_ALL_CLIENTS,
-    DEBUG_STATUS_GO,
+    IDebugClient, IDebugClient4, IDebugClient5, IDebugControl4, IDebugOutputCallbacksWide,
+    IDebugOutputCallbacksWide_Impl, DEBUG_ATTACH_DEFAULT, DEBUG_END_PASSIVE, DEBUG_EXECUTE_DEFAULT,
+    DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_STATUS_GO,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
@@ -204,8 +204,9 @@ struct DbgEngSession {
     _library: LoadedDbgEng,
     client: IDebugClient,
     _client4: IDebugClient4,
-    control: IDebugControl,
-    _callbacks: IDebugOutputCallbacks,
+    client5: IDebugClient5,
+    control: IDebugControl4,
+    _callbacks: IDebugOutputCallbacksWide,
     output: Arc<Mutex<String>>,
     _launched_process: Option<LaunchedProcess>,
     warnings: Vec<String>,
@@ -229,12 +230,15 @@ impl DbgEngSession {
         let client4: IDebugClient4 = client.cast().map_err(|error| {
             DbgFlowError::Backend(format!("query IDebugClient4 failed: {error}"))
         })?;
-        let control: IDebugControl = client.cast().map_err(|error| {
-            DbgFlowError::Backend(format!("query IDebugControl failed: {error}"))
+        let client5: IDebugClient5 = client.cast().map_err(|error| {
+            DbgFlowError::Backend(format!("query IDebugClient5 failed: {error}"))
+        })?;
+        let control: IDebugControl4 = client.cast().map_err(|error| {
+            DbgFlowError::Backend(format!("query IDebugControl4 failed: {error}"))
         })?;
 
         let output = Arc::new(Mutex::new(String::new()));
-        let callbacks: IDebugOutputCallbacks = DbgEngOutputCallbacks {
+        let callbacks: IDebugOutputCallbacksWide = DbgEngOutputCallbacks {
             output: Arc::clone(&output),
         }
         .into();
@@ -242,9 +246,11 @@ impl DbgEngSession {
         let mut launched_process = None;
 
         unsafe {
-            client.SetOutputCallbacks(&callbacks).map_err(|error| {
-                DbgFlowError::Backend(format!("SetOutputCallbacks failed: {error}"))
-            })?;
+            client5
+                .SetOutputCallbacksWide(&callbacks)
+                .map_err(|error| {
+                    DbgFlowError::Backend(format!("SetOutputCallbacksWide failed: {error}"))
+                })?;
 
             match target {
                 DebugTarget::Dump { path } => {
@@ -296,6 +302,7 @@ impl DbgEngSession {
             _library: library,
             client,
             _client4: client4,
+            client5,
             control,
             _callbacks: callbacks,
             output,
@@ -335,17 +342,21 @@ impl DbgEngSession {
             return Ok(ExecuteBackendResult { output, warnings });
         }
 
-        let command = CString::new(command)
-            .map_err(|_| DbgFlowError::Backend("command contains NUL byte".to_string()))?;
+        if command.contains('\0') {
+            return Err(DbgFlowError::Backend(
+                "command contains NUL byte".to_string(),
+            ));
+        }
+        let command = to_wide_null_str(command);
         unsafe {
             self.control
-                .Execute(
+                .ExecuteWide(
                     DEBUG_OUTCTL_ALL_CLIENTS,
-                    PCSTR(command.as_ptr() as *const u8),
+                    PCWSTR(command.as_ptr()),
                     DEBUG_EXECUTE_DEFAULT,
                 )
                 .map_err(|error| {
-                    DbgFlowError::Backend(format!("IDebugControl::Execute failed: {error}"))
+                    DbgFlowError::Backend(format!("IDebugControl4::ExecuteWide failed: {error}"))
                 })?;
         }
 
@@ -366,8 +377,8 @@ impl DbgEngSession {
             self.client
                 .EndSession(DEBUG_END_PASSIVE)
                 .map_err(|error| DbgFlowError::Backend(format!("EndSession failed: {error}")))?;
-            self.client.SetOutputCallbacks(None).map_err(|error| {
-                DbgFlowError::Backend(format!("clear output callbacks failed: {error}"))
+            self.client5.SetOutputCallbacksWide(None).map_err(|error| {
+                DbgFlowError::Backend(format!("clear wide output callbacks failed: {error}"))
             })?;
         }
         Ok(())
@@ -417,18 +428,16 @@ impl LoadedDbgEng {
     }
 }
 
-#[implement(IDebugOutputCallbacks)]
+#[implement(IDebugOutputCallbacksWide)]
 struct DbgEngOutputCallbacks {
     output: Arc<Mutex<String>>,
 }
 
 #[allow(non_snake_case)]
-impl IDebugOutputCallbacks_Impl for DbgEngOutputCallbacks_Impl {
-    fn Output(&self, _mask: u32, text: &PCSTR) -> windows::core::Result<()> {
+impl IDebugOutputCallbacksWide_Impl for DbgEngOutputCallbacks_Impl {
+    fn Output(&self, _mask: u32, text: &PCWSTR) -> windows::core::Result<()> {
         if !text.is_null() {
-            let text = unsafe { CStr::from_ptr(text.as_ptr() as *const i8) }
-                .to_string_lossy()
-                .into_owned();
+            let text = unsafe { pcwstr_to_string(*text) };
             if let Ok(mut output) = self.output.lock() {
                 output.push_str(&text);
             }
@@ -482,7 +491,7 @@ fn attach_process(client: &IDebugClient4, pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_go_event(control: &IDebugControl, timeout_ms: u64) -> Result<Vec<String>> {
+fn wait_for_go_event(control: &IDebugControl4, timeout_ms: u64) -> Result<Vec<String>> {
     let hr = unsafe {
         (Interface::vtable(control).WaitForEvent)(
             Interface::as_raw(control),
@@ -572,6 +581,15 @@ fn create_suspended_process(executable: &Path, args: &[String]) -> Result<Launch
 
 fn to_wide_null_str(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+unsafe fn pcwstr_to_string(value: PCWSTR) -> String {
+    let mut len = 0;
+    let ptr = value.as_ptr();
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
 }
 
 fn launch_command_line(executable: &Path, args: &[String]) -> String {

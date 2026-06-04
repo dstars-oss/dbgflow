@@ -1,4 +1,4 @@
-use crate::mcp::McpServer;
+use crate::mcp::{session_resource_uri, McpServer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -52,6 +52,10 @@ fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()>
         }
     };
 
+    if is_mcp_sse_request(&request) {
+        return handle_mcp_sse(server, request, stream);
+    }
+
     let response = route_request(server, request);
     write_response(&mut stream, response)
 }
@@ -73,6 +77,62 @@ fn route_request(server: McpServer, request: HttpRequest) -> HttpResponse {
         ("POST", "/mcp") => handle_mcp_post(server, request),
         _ => HttpResponse::json(404, json!({ "error": "not found" })),
     }
+}
+
+fn is_mcp_sse_request(request: &HttpRequest) -> bool {
+    let path = request
+        .path
+        .split_once('?')
+        .map(|(path, _query)| path)
+        .unwrap_or(&request.path);
+    request.method == "GET" && path == "/mcp"
+}
+
+fn handle_mcp_sse(
+    server: McpServer,
+    request: HttpRequest,
+    mut stream: TcpStream,
+) -> io::Result<()> {
+    if !origin_is_allowed(request.headers.get("origin")) {
+        write_response(
+            &mut stream,
+            HttpResponse::json(403, json!({ "error": "forbidden origin" })),
+        )?;
+        return Ok(());
+    }
+
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
+    )?;
+    stream.flush()?;
+
+    let updates = server.session_update_receiver();
+    loop {
+        match updates.recv_timeout(Duration::from_secs(30)) {
+            Ok(session_id) => {
+                let notification = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": {
+                        "uri": session_resource_uri(session_id)
+                    }
+                });
+                write_sse_json(&mut stream, &notification)?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                stream.write_all(b": keepalive\n\n")?;
+                stream.flush()?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+fn write_sse_json(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    write!(stream, "data: {text}\n\n")?;
+    stream.flush()
 }
 
 fn handle_mcp_post(server: McpServer, request: HttpRequest) -> HttpResponse {

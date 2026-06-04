@@ -71,7 +71,6 @@ pub struct CommandArtifactRecord {
     pub started_at_unix_ms: u128,
     pub duration_ms: u128,
     pub output_bytes: usize,
-    pub output_truncated_in_response: bool,
 }
 
 fn append_jsonl(path: &Path, line: &str) -> Result<()> {

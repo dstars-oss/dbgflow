@@ -53,8 +53,10 @@ fn dbgeng_can_run_analyze_v_on_generated_dump() {
             target: DebugTarget::Dump {
                 path: dump_path.clone(),
             },
+            startup_timeout_ms: None,
         })
         .expect("open dump session");
+    let session = wait_for_break(&manager, session.id);
     assert_eq!(session.state, SessionState::Break);
 
     let result = manager
@@ -72,7 +74,7 @@ fn dbgeng_can_run_analyze_v_on_generated_dump() {
             .iter()
             .any(|needle| output_upper.contains(needle)),
         "unexpected !analyze -v output:\n{}",
-        result.output_preview
+        result.output
     );
 
     manager.close_session(session.id).expect("close session");
@@ -162,4 +164,22 @@ fn test_artifact_root(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create artifact root");
     root
+}
+
+fn wait_for_break(
+    manager: &SessionManager,
+    session_id: dbgflow_core::session::SessionId,
+) -> dbgflow_core::session::Session {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(130);
+    loop {
+        let session = manager.query_session(session_id).expect("query session");
+        if session.state == SessionState::Break {
+            return session;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session did not break: {session:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }

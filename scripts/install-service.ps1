@@ -155,8 +155,9 @@ Assert-Administrator
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = Split-Path -Parent $ScriptDir
 $BinDir = Join-Path $InstallRoot "bin"
-$LogDir = Join-Path $InstallRoot "logs"
-$ArtifactRoot = Join-Path $InstallRoot "artifacts"
+$VarDir = Join-Path $InstallRoot "var"
+$LogDir = Join-Path $VarDir "logs"
+$ArtifactRoot = Join-Path $VarDir "artifacts"
 $SourceExe = Join-Path $RepoRoot "target\release\dbgflow-mcp.exe"
 $InstalledExe = Join-Path $BinDir "dbgflow-mcp.exe"
 

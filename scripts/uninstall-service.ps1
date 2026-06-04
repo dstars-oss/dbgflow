@@ -76,4 +76,4 @@ if ($RemoveInstallFiles) {
     Remove-BinDirectory -Root $InstallRoot
 }
 
-Write-Host "Service '$ServiceName' has been uninstalled. Artifacts and logs were left in '$InstallRoot'."
+Write-Host "Service '$ServiceName' has been uninstalled. Artifacts and logs were left under '$(Join-Path $InstallRoot "var")'."

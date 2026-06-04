@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 pub const CREATE_SESSION: &str = "create_session";
+pub const GET_SESSION: &str = "get_session";
 pub const LIST_SESSIONS: &str = "list_sessions";
 pub const CLOSE_SESSION: &str = "close_session";
 pub const EXECUTE: &str = "execute";
+pub const SET_SYMBOLS: &str = "set_symbols";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -39,6 +42,7 @@ impl ToolService {
                     "Create a debug session or return an existing session for the same target.",
                 input_schema: json!({
                     "type": "object",
+                    "description": "Example dump target: {\"target\":{\"kind\":\"dump\",\"path\":\"C:\\\\path\\\\file.dmp\"}}",
                     "properties": {
                         "target": {
                             "type": "object",
@@ -95,8 +99,28 @@ impl ToolService {
                                     "additionalProperties": false
                                 }
                             ]
+                        },
+                        "startup_timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional backend startup/open-target timeout in milliseconds. Symbol loading commands use execute.timeout_ms instead."
                         }
                     },
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: GET_SESSION,
+                description: "Get the current state of a debug session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by create_session."
+                        }
+                    },
+                    "required": ["session_id"],
                     "additionalProperties": false
                 }),
             },
@@ -126,7 +150,7 @@ impl ToolService {
             },
             ToolDescriptor {
                 name: EXECUTE,
-                description: "Execute an allowlisted debugger command in a session.",
+                description: "Execute a debugger command in a session. Dangerous commands are denied by policy.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -136,7 +160,7 @@ impl ToolService {
                         },
                         "command": {
                             "type": "string",
-                            "description": "Allowlisted debugger command."
+                            "description": "Debugger command. Dangerous commands and command separators are denied by policy."
                         },
                         "timeout_ms": {
                             "type": "integer",
@@ -148,13 +172,48 @@ impl ToolService {
                     "additionalProperties": false
                 }),
             },
+            ToolDescriptor {
+                name: SET_SYMBOLS,
+                description: "Set or append debugger symbol paths after validating local paths.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by create_session."
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "description": "Local symbol directories."
+                        },
+                        "append": {
+                            "type": "boolean",
+                            "description": "Append to the current symbol path instead of replacing it."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional command timeout in milliseconds."
+                        }
+                    },
+                    "required": ["session_id", "paths"],
+                    "additionalProperties": false
+                }),
+            },
         ]
     }
 
     pub fn create_session(&self, request: CreateSessionRequest) -> Result<Session> {
         self.sessions.create_session(CreateSession {
             target: request.target,
+            startup_timeout_ms: request.startup_timeout_ms,
         })
+    }
+
+    pub fn query_session(&self, session_id: SessionId) -> Result<Session> {
+        self.sessions.query_session(session_id)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -173,6 +232,57 @@ impl ToolService {
         })
     }
 
+    pub fn set_symbols(&self, request: SetSymbolsRequest) -> Result<ExecuteSessionResult> {
+        let mut validated = Vec::with_capacity(request.paths.len());
+        for path in request.paths {
+            let path_text = path.to_string_lossy();
+            if path_text.chars().any(|ch| {
+                matches!(ch, ';' | '\r' | '\n' | '\u{2028}' | '\u{2029}') || ch.is_control()
+            }) {
+                return Err(DbgFlowError::Backend(format!(
+                    "symbol path contains unsupported control or command separator characters: {}",
+                    path.display()
+                )));
+            }
+            let path = path
+                .canonicalize()
+                .map_err(|error| DbgFlowError::Backend(format!("invalid symbol path: {error}")))?;
+            if !path.is_dir() {
+                return Err(DbgFlowError::Backend(format!(
+                    "symbol path is not a directory: {}",
+                    path.display()
+                )));
+            }
+            validated.push(path);
+        }
+        if validated.is_empty() {
+            return Err(DbgFlowError::Backend(
+                "at least one symbol path is required".to_string(),
+            ));
+        }
+
+        let append = request.append.unwrap_or(false);
+        let mut result = None;
+        for (index, path) in validated.iter().enumerate() {
+            let command = if append || index > 0 {
+                format!(".sympath+ {}", path.display())
+            } else {
+                format!(".sympath {}", path.display())
+            };
+            result = Some(self.execute(ExecuteRequest {
+                session_id: request.session_id,
+                command,
+                timeout_ms: request.timeout_ms,
+            })?);
+        }
+
+        result.ok_or_else(|| DbgFlowError::Backend("no symbol paths were applied".to_string()))
+    }
+
+    pub fn subscribe_session_updates(&self) -> mpsc::Receiver<SessionId> {
+        self.sessions.subscribe_session_updates()
+    }
+
     pub fn call_tool(
         &self,
         name: &str,
@@ -183,6 +293,12 @@ impl ToolService {
                 .create_session(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
+            GET_SESSION => {
+                let request: GetSessionRequest = decode_arguments(arguments)?;
+                self.query_session(request.session_id)
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
             LIST_SESSIONS => self
                 .list_sessions()
                 .map_err(ToolCallError::execution)
@@ -195,6 +311,10 @@ impl ToolService {
             }
             EXECUTE => self
                 .execute(decode_arguments(arguments)?)
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            SET_SYMBOLS => self
+                .set_symbols(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             _ => Err(ToolCallError::invalid_request(format!(
@@ -233,12 +353,14 @@ impl fmt::Display for ToolCallError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CreateSessionRequest {
     pub target: DebugTarget,
+    pub startup_timeout_ms: Option<u64>,
 }
 
 impl Default for CreateSessionRequest {
     fn default() -> Self {
         Self {
             target: DebugTarget::Mock,
+            startup_timeout_ms: None,
         }
     }
 }
@@ -255,16 +377,31 @@ pub struct CloseSessionRequest {
     pub session_id: SessionId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetSessionRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetSymbolsRequest {
+    pub session_id: SessionId,
+    pub paths: Vec<PathBuf>,
+    pub append: Option<bool>,
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct McpCreateSessionRequest {
     #[serde(default)]
     target: McpDebugTarget,
+    startup_timeout_ms: Option<u64>,
 }
 
 impl From<McpCreateSessionRequest> for CreateSessionRequest {
     fn from(value: McpCreateSessionRequest) -> Self {
         Self {
             target: value.target.into(),
+            startup_timeout_ms: value.startup_timeout_ms,
         }
     }
 }

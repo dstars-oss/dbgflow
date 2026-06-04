@@ -13,21 +13,23 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - artifact manager
 - 面向 dump target 的 DbgEng backend
 - 面向进程 attach / launch target 的 DbgEng backend
-- 受 allowlist 控制的 `execute` 命令
+- 受 denylist 保护的 `execute` 命令
 - 面向 MCP 的 tool facade
 - 带 tool schema 的 stdio JSON-RPC MCP 入口
-- `/mcp` Streamable HTTP MCP endpoint
+- 带 resource update SSE 的 `/mcp` Streamable HTTP MCP endpoint
 - 原生 Windows service 运行模式
 - PowerShell 安装 / 卸载服务脚本
 
 初始公开 tool 名称：
 
 - `create_session`
+- `get_session`
 - `list_sessions`
 - `close_session`
 - `execute`
+- `set_symbols`
 
-`create_session` 采用 get-or-create 语义：如果同一 target 已存在 active session，则返回该 session 的详情；否则创建新 session，并返回相同结构的详情。
+`create_session` 采用 get-or-create 语义，并会快速返回 `Starting` session；后端打开 target 在后台完成。调用方可以通过 `get_session`、`list_sessions` 或 HTTP resource update stream 观察状态转为 `Ready`、`Break`、`Closed` 或 `Error`。
 
 当前 backend 选择属于内部实现细节，不作为公开 tool 暴露。调用方只需要描述要调试的 target，后续由内部机制选择合适的 backend。
 
@@ -49,7 +51,7 @@ Target 示例：
 { "kind": "launch", "executable": "C:\\app\\app.exe", "args": ["--flag"] }
 ```
 
-Dump target 可以指向任意已存在的本地 dump 文件，只要扩展名受支持。Launch target 默认关闭；仅在可信本地环境中设置 `DBGFLOW_ENABLE_LAUNCH=1` 后才允许受控启动进程。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出和日志仍写入受控 artifact root。当前唯一通过 `execute` 开放的运行控制命令是精确的 `g`；step 和 breakpoint 相关命令仍默认拒绝。
+Dump target 可以指向任意已存在的本地 dump 文件，只要扩展名受支持。Launch target 默认关闭；仅在可信本地环境中设置 `DBGFLOW_ENABLE_LAUNCH=1` 后才允许受控启动进程。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出和日志仍写入受控 artifact root。`execute` 不再使用 allowlist，但 `.shell`、脚本加载、扩展加载、dump 写出和内存写出等危险命令仍会被 policy 拒绝。运行控制命令会单独更新 session 状态。
 
 通过 stdio 启动 MCP server：
 
@@ -63,9 +65,9 @@ cargo run -p dbgflow-mcp
 cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331
 ```
 
-HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。当前 HTTP 第一版对 `POST /mcp` 返回 JSON response，对 `GET /mcp` 返回 `405 Method Not Allowed`；暂不提供服务端主动 SSE stream。`GET /healthz` 返回简单健康检查响应。
+HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response；`GET /mcp` 打开 server-sent event stream，用于发送 MCP notifications，包括 session 状态变化对应的 `notifications/resources/updated`。`GET /healthz` 返回简单健康检查响应。
 
-当前 server 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list` 和 `tools/call`。Tool 结果以 JSON text content 返回；原始调试命令输出仍写入 session artifacts。
+当前 server 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`、`resources/list` 和 `resources/read`。Tool 结果以 JSON text content 返回；调试命令输出会完整返回，并同时写入 session artifacts。
 
 默认情况下，MCP server 会将 artifacts 写入 workspace 级 `artifacts/` 目录。可通过 `DBGFLOW_ARTIFACT_ROOT` 覆盖该位置。
 
@@ -76,6 +78,6 @@ HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。当前 HTTP 第一版对 `POST /
 .\scripts\uninstall-service.ps1
 ```
 
-安装脚本会构建 release binary；如果已存在 `dbgflow-mcp` 服务，则先停止并卸载；然后将 exe 复制到 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动服务，再检查 `/healthz`。服务 artifacts 和 logs 写入 `%LOCALAPPDATA%\dbgflow`；卸载脚本默认不删除 artifacts 或 logs。
+安装脚本会构建 release binary；如果已存在 `dbgflow-mcp` 服务，则先停止并卸载；然后将 exe 复制到 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动服务，再检查 `/healthz`。服务 artifacts 和 logs 写入 `%LOCALAPPDATA%\dbgflow\var`；卸载脚本默认不删除 artifacts 或 logs。
 
 Live process DbgEng 集成测试默认 ignored，因为 attach / launch 行为依赖本机调试权限和目标进程状态；验证进程调试能力时需要显式运行这些测试。
