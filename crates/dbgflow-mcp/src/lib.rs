@@ -1,4 +1,5 @@
 pub mod http;
+pub mod logging;
 pub mod mcp;
 pub mod runtime;
 #[cfg(windows)]

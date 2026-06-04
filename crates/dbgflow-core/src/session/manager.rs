@@ -4,6 +4,7 @@ use crate::artifacts::{ArtifactManager, ArtifactRef, CommandArtifactRecord};
 use crate::backend::dbgeng::DbgEngBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::{CreateBackendSession, DebugBackend, DebugTarget, ExecuteBackendRequest};
+use crate::logging::{noop_logger, LogEvent, LogLevel, LogSink};
 use crate::policy::CommandPolicy;
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,7 @@ pub struct SessionManager {
     artifacts: ArtifactManager,
     command_policy: CommandPolicy,
     event_subscribers: Arc<Mutex<Vec<mpsc::Sender<SessionId>>>>,
+    logger: Arc<dyn LogSink>,
 }
 
 impl SessionManager {
@@ -64,6 +66,14 @@ impl SessionManager {
     pub fn with_artifact_root(
         backends: Vec<Arc<dyn DebugBackend>>,
         artifact_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self::with_artifact_root_and_logger(backends, artifact_root, noop_logger())
+    }
+
+    pub fn with_artifact_root_and_logger(
+        backends: Vec<Arc<dyn DebugBackend>>,
+        artifact_root: impl Into<PathBuf>,
+        logger: Arc<dyn LogSink>,
     ) -> Self {
         let backends = backends
             .into_iter()
@@ -77,6 +87,7 @@ impl SessionManager {
             artifacts: ArtifactManager::new(artifact_root),
             command_policy: CommandPolicy::default_query_policy(),
             event_subscribers: Arc::new(Mutex::new(Vec::new())),
+            logger,
         }
     }
 
@@ -89,12 +100,19 @@ impl SessionManager {
     }
 
     pub fn with_default_backends_at(artifact_root: impl Into<PathBuf>) -> Self {
+        Self::with_default_backends_at_and_logger(artifact_root, noop_logger())
+    }
+
+    pub fn with_default_backends_at_and_logger(
+        artifact_root: impl Into<PathBuf>,
+        logger: Arc<dyn LogSink>,
+    ) -> Self {
         let mut backends: Vec<Arc<dyn DebugBackend>> = vec![Arc::new(MockBackend::new())];
         #[cfg(windows)]
         {
-            backends.push(Arc::new(DbgEngBackend::new()));
+            backends.push(Arc::new(DbgEngBackend::with_logger(logger.clone())));
         }
-        Self::with_artifact_root(backends, artifact_root)
+        Self::with_artifact_root_and_logger(backends, artifact_root, logger)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -155,6 +173,14 @@ impl SessionManager {
             .map_err(|_| DbgFlowError::Backend("session lock map poisoned".to_string()))?
             .insert(session.id, Arc::new(Mutex::new(())));
 
+        self.log(
+            LogEvent::new(LogLevel::Info, "session", "create_session_started")
+                .session_id(session.id)
+                .operation("create_session")
+                .field("backend", session.backend.clone())
+                .field("target", &session.target),
+        );
+
         self.spawn_backend_startup(
             session.id,
             backend,
@@ -210,6 +236,12 @@ impl SessionManager {
             };
             session.updated_at_unix_ms = now_unix_ms();
             session.current_operation = None;
+            self.log(
+                LogEvent::new(LogLevel::Info, "session", "close_session_requested")
+                    .session_id(session_id)
+                    .field("backend", session.backend.clone())
+                    .field("had_backend_session", session.backend_session_id.is_some()),
+            );
             (
                 session.clone(),
                 session.backend.clone(),
@@ -223,6 +255,12 @@ impl SessionManager {
                 let manager = self.clone();
                 thread::spawn(move || {
                     let _operation_guard = operation_lock.lock();
+                    manager.log(
+                        LogEvent::new(LogLevel::Info, "session", "backend_close_started")
+                            .session_id(session_id)
+                            .backend_session_id(backend_session_id.clone())
+                            .field("backend", backend_name.clone()),
+                    );
                     let close_result = backend.close_session(&backend_session_id);
                     manager.finish_backend_close(session_id, close_result);
                 });
@@ -271,9 +309,18 @@ impl SessionManager {
         let started_at_unix_ms = now_unix_ms();
         let started = Instant::now();
         let command_id = SessionId::new().to_string();
+        let command = request.command.clone();
+        self.log(
+            LogEvent::new(LogLevel::Info, "session", "execute_started")
+                .session_id(request.session_id)
+                .backend_session_id(backend_session_id.clone())
+                .operation(command.clone())
+                .field("command_id", command_id.clone())
+                .field("is_run_control", is_run_control),
+        );
         let backend_result = backend.execute(ExecuteBackendRequest {
             backend_session_id,
-            command: request.command.clone(),
+            command: command.clone(),
             timeout_ms: request.timeout_ms.unwrap_or(DEFAULT_EXECUTE_TIMEOUT_MS),
         });
         let duration_ms = started.elapsed().as_millis();
@@ -281,6 +328,13 @@ impl SessionManager {
         let backend_result = match backend_result {
             Ok(result) => result,
             Err(error) => {
+                self.log(
+                    LogEvent::new(LogLevel::Error, "session", "execute_failed")
+                        .session_id(request.session_id)
+                        .operation(command.clone())
+                        .duration_ms(duration_ms)
+                        .error(error.to_string()),
+                );
                 self.set_session_state(
                     request.session_id,
                     SessionState::Error,
@@ -306,7 +360,7 @@ impl SessionManager {
             &command_id,
             &CommandArtifactRecord {
                 command_id: command_id.clone(),
-                command: request.command,
+                command: command.clone(),
                 output_path,
                 started_at_unix_ms,
                 duration_ms,
@@ -314,6 +368,15 @@ impl SessionManager {
             },
             &backend_result.output,
         )?;
+
+        self.log(
+            LogEvent::new(LogLevel::Info, "session", "execute_finished")
+                .session_id(request.session_id)
+                .operation(command)
+                .duration_ms(duration_ms)
+                .field("command_id", command_id)
+                .field("output_bytes", backend_result.output.len()),
+        );
 
         Ok(ExecuteSessionResult {
             session: self.query_session(request.session_id)?,
@@ -367,15 +430,28 @@ impl SessionManager {
         }
     }
 
+    fn log(&self, event: LogEvent) {
+        self.logger.log(event);
+    }
+
     fn finish_backend_close(&self, session_id: SessionId, close_result: Result<()>) {
         if let Ok(mut sessions) = self.sessions.lock() {
             if let Some(session) = sessions.get_mut(&session_id) {
                 match close_result {
                     Ok(()) => {
+                        self.log(
+                            LogEvent::new(LogLevel::Info, "session", "backend_close_finished")
+                                .session_id(session_id),
+                        );
                         session.state = SessionState::Closed;
                         session.error = None;
                     }
                     Err(error) => {
+                        self.log(
+                            LogEvent::new(LogLevel::Error, "session", "backend_close_failed")
+                                .session_id(session_id)
+                                .error(error.to_string()),
+                        );
                         session.state = SessionState::Error;
                         session.error = Some(error.to_string());
                     }
@@ -398,26 +474,95 @@ impl SessionManager {
         thread::spawn(move || {
             let (reply_tx, reply_rx) = mpsc::sync_channel(1);
             let backend_for_startup = backend.clone();
+            let startup_started = Instant::now();
+            manager.log(
+                LogEvent::new(LogLevel::Info, "session", "backend_startup_thread_spawned")
+                    .session_id(session_id)
+                    .operation("create_session"),
+            );
             thread::spawn(move || {
                 let result = backend_for_startup.create_session(CreateBackendSession {
                     target: target.clone(),
+                    correlation_id: Some(session_id.to_string()),
                 });
                 let _ = reply_tx.send(result);
             });
 
             match reply_rx.recv_timeout(Duration::from_millis(startup_timeout_ms)) {
-                Ok(startup_result) => manager.finish_backend_startup(session_id, startup_result),
+                Ok(startup_result) => manager.finish_backend_startup(
+                    session_id,
+                    startup_result,
+                    startup_started.elapsed().as_millis(),
+                ),
                 Err(_) => {
+                    let timeout_error = DbgFlowError::Backend(format!(
+                        "backend startup timed out after {startup_timeout_ms}ms"
+                    ));
+                    manager.log(
+                        LogEvent::new(LogLevel::Error, "session", "backend_startup_timed_out")
+                            .session_id(session_id)
+                            .operation("create_session")
+                            .duration_ms(startup_started.elapsed().as_millis())
+                            .error(timeout_error.to_string())
+                            .field("startup_timeout_ms", startup_timeout_ms),
+                    );
                     manager.finish_backend_startup(
                         session_id,
-                        Err(DbgFlowError::Backend(format!(
-                            "backend startup timed out after {startup_timeout_ms}ms"
-                        ))),
+                        Err(timeout_error),
+                        startup_started.elapsed().as_millis(),
                     );
-                    thread::spawn(move || {
-                        if let Ok(Ok(backend_session)) = reply_rx.recv() {
-                            let _ = backend.close_session(&backend_session.id);
+                    let cleanup_manager = manager.clone();
+                    thread::spawn(move || match reply_rx.recv() {
+                        Ok(Ok(backend_session)) => {
+                            cleanup_manager.log(
+                                LogEvent::new(
+                                    LogLevel::Warn,
+                                    "session",
+                                    "backend_startup_late_success_cleanup_started",
+                                )
+                                .session_id(session_id)
+                                .backend_session_id(backend_session.id.clone()),
+                            );
+                            let close_result = backend.close_session(&backend_session.id);
+                            match close_result {
+                                Ok(()) => cleanup_manager.log(
+                                    LogEvent::new(
+                                        LogLevel::Info,
+                                        "session",
+                                        "backend_startup_late_success_cleanup_finished",
+                                    )
+                                    .session_id(session_id)
+                                    .backend_session_id(backend_session.id),
+                                ),
+                                Err(error) => cleanup_manager.log(
+                                    LogEvent::new(
+                                        LogLevel::Error,
+                                        "session",
+                                        "backend_startup_late_success_cleanup_failed",
+                                    )
+                                    .session_id(session_id)
+                                    .backend_session_id(backend_session.id)
+                                    .error(error.to_string()),
+                                ),
+                            }
                         }
+                        Ok(Err(error)) => cleanup_manager.log(
+                            LogEvent::new(
+                                LogLevel::Warn,
+                                "session",
+                                "backend_startup_late_failure",
+                            )
+                            .session_id(session_id)
+                            .error(error.to_string()),
+                        ),
+                        Err(_) => cleanup_manager.log(
+                            LogEvent::new(
+                                LogLevel::Warn,
+                                "session",
+                                "backend_startup_late_worker_disconnected",
+                            )
+                            .session_id(session_id),
+                        ),
                     });
                 }
             }
@@ -428,9 +573,17 @@ impl SessionManager {
         &self,
         session_id: SessionId,
         startup_result: Result<crate::backend::BackendSession>,
+        duration_ms: u128,
     ) {
         match startup_result {
             Ok(backend_session) => {
+                self.log(
+                    LogEvent::new(LogLevel::Info, "session", "backend_startup_finished")
+                        .session_id(session_id)
+                        .backend_session_id(backend_session.id.clone())
+                        .operation("create_session")
+                        .duration_ms(duration_ms),
+                );
                 let mut should_close_backend = false;
                 if let Ok(mut sessions) = self.sessions.lock() {
                     if let Some(session) = sessions.get_mut(&session_id) {
@@ -464,6 +617,13 @@ impl SessionManager {
                 }
             }
             Err(error) => {
+                self.log(
+                    LogEvent::new(LogLevel::Error, "session", "backend_startup_failed")
+                        .session_id(session_id)
+                        .operation("create_session")
+                        .duration_ms(duration_ms)
+                        .error(error.to_string()),
+                );
                 if let Ok(mut sessions) = self.sessions.lock() {
                     if let Some(session) = sessions.get_mut(&session_id) {
                         if !session.state.is_terminal() {

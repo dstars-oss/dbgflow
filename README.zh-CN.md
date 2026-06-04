@@ -65,11 +65,20 @@ cargo run -p dbgflow-mcp
 cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331
 ```
 
+如需使用安装后的数据目录布局，传入一个数据目录即可；dbgflow 会使用
+`<data-dir>\artifacts` 和 `<data-dir>\logs`：
+
+```text
+cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir C:\dbgflow\var
+```
+
 HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response；`GET /mcp` 打开 server-sent event stream，用于发送 MCP notifications，包括 session 状态变化对应的 `notifications/resources/updated`。`GET /healthz` 返回简单健康检查响应。
 
 当前 server 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`、`resources/list` 和 `resources/read`。Tool 结果以 JSON text content 返回；调试命令输出会完整返回，并同时写入 session artifacts。
 
-默认情况下，MCP server 会将 artifacts 写入 workspace 级 `artifacts/` 目录。可通过 `DBGFLOW_ARTIFACT_ROOT` 覆盖该位置。
+默认情况下，MCP server 会将 artifacts 写入 workspace 级 `artifacts/` 目录；未使用 `--data-dir` 时可通过 `DBGFLOW_ARTIFACT_ROOT` 覆盖该位置。
+
+使用 `--data-dir` 时，运行日志以按日 JSONL 文件写入 `<data-dir>\logs`，artifacts 写入 `<data-dir>\artifacts`。运行日志保留 7 天；artifacts 不会自动删除。
 
 在管理员 PowerShell 中安装或卸载 Windows service：
 
@@ -78,6 +87,6 @@ HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response
 .\scripts\uninstall-service.ps1
 ```
 
-安装脚本会构建 release binary；如果已存在 `dbgflow-mcp` 服务，则先停止并卸载；然后将 exe 复制到 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动服务，再检查 `/healthz`。服务 artifacts 和 logs 写入 `%LOCALAPPDATA%\dbgflow\var`；卸载脚本默认不删除 artifacts 或 logs。
+安装脚本会构建 release binary；如果已存在 `dbgflow-mcp` 服务，则先停止并卸载；然后将 exe 复制到 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 和 `--data-dir %LOCALAPPDATA%\dbgflow\var` 安装并启动服务，再检查 `/healthz`。服务 artifacts 和 logs 写入 `%LOCALAPPDATA%\dbgflow\var`；卸载脚本默认不删除 artifacts 或 logs。
 
 Live process DbgEng 集成测试默认 ignored，因为 attach / launch 行为依赖本机调试权限和目标进程状态；验证进程调试能力时需要显式运行这些测试。

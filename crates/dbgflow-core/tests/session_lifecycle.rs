@@ -1,6 +1,14 @@
-use dbgflow_core::backend::DebugTarget;
+use dbgflow_core::backend::{
+    BackendCapability, BackendInfo, BackendKind, BackendSession, CreateBackendSession,
+    DebugBackend, DebugTarget, ExecuteBackendRequest, ExecuteBackendResult,
+};
+use dbgflow_core::logging::{LogEvent, LogSink};
 use dbgflow_core::session::{CreateSession, ExecuteSession, SessionManager, SessionState};
+use dbgflow_core::Result;
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[test]
 fn mock_session_can_be_created_queried_and_closed() {
@@ -154,6 +162,44 @@ fn launch_target_is_disabled_by_default() {
     assert!(error.to_string().contains("launch targets are disabled"));
 }
 
+#[test]
+fn startup_timeout_logs_late_cleanup() {
+    let logger = Arc::new(RecordingLogSink::default());
+    let backend = Arc::new(SlowStartupBackend::default());
+    let manager = SessionManager::with_artifact_root_and_logger(
+        vec![backend.clone()],
+        test_artifact_root("startup-timeout-logs"),
+        logger.clone(),
+    );
+
+    let session = manager
+        .create_session(CreateSession {
+            target: DebugTarget::Mock,
+            startup_timeout_ms: Some(1),
+        })
+        .expect("create session");
+
+    let session = wait_for_error(&manager, session.id);
+    assert_eq!(session.state, SessionState::Error);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while backend.close_count.load(Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "late cleanup did not close backend session"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let events = logger.events();
+    assert!(events
+        .iter()
+        .any(|event| event.event == "backend_startup_timed_out"));
+    assert!(events
+        .iter()
+        .any(|event| event.event == "backend_startup_late_success_cleanup_finished"));
+}
+
 fn test_artifact_root(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
@@ -194,5 +240,75 @@ fn wait_for_closed(
             "session did not close: {session:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_error(
+    manager: &SessionManager,
+    session_id: dbgflow_core::session::SessionId,
+) -> dbgflow_core::session::Session {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let session = manager.query_session(session_id).expect("query session");
+        if session.state == SessionState::Error {
+            return session;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session did not become error: {session:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[derive(Default)]
+struct RecordingLogSink {
+    events: Mutex<Vec<LogEvent>>,
+}
+
+impl RecordingLogSink {
+    fn events(&self) -> Vec<LogEvent> {
+        self.events.lock().expect("events lock").clone()
+    }
+}
+
+impl LogSink for RecordingLogSink {
+    fn log(&self, event: LogEvent) {
+        self.events.lock().expect("events lock").push(event);
+    }
+}
+
+#[derive(Default)]
+struct SlowStartupBackend {
+    close_count: AtomicUsize,
+}
+
+impl DebugBackend for SlowStartupBackend {
+    fn info(&self) -> BackendInfo {
+        BackendInfo {
+            name: "mock".to_string(),
+            kind: BackendKind::Mock,
+            capabilities: vec![BackendCapability::SessionLifecycle],
+        }
+    }
+
+    fn create_session(&self, _request: CreateBackendSession) -> Result<BackendSession> {
+        std::thread::sleep(Duration::from_millis(50));
+        Ok(BackendSession {
+            id: "slow-backend-session".to_string(),
+            warnings: Vec::new(),
+        })
+    }
+
+    fn execute(&self, _request: ExecuteBackendRequest) -> Result<ExecuteBackendResult> {
+        Ok(ExecuteBackendResult {
+            output: String::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    fn close_session(&self, _backend_session_id: &str) -> Result<()> {
+        self.close_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }

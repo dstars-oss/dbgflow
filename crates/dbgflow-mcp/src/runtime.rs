@@ -1,4 +1,3 @@
-use crate::mcp::default_artifact_root;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,16 +8,14 @@ pub const SERVICE_NAME: &str = "dbgflow-mcp";
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind: SocketAddr,
-    pub artifact_root: PathBuf,
-    pub log_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             bind: DEFAULT_BIND.parse().expect("valid default bind address"),
-            artifact_root: default_artifact_root(),
-            log_dir: None,
+            data_dir: None,
         }
     }
 }
@@ -39,12 +36,8 @@ where
             config.bind = parse_bind(value)?;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--artifact-root=") {
-            config.artifact_root = PathBuf::from(value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--log-dir=") {
-            config.log_dir = Some(PathBuf::from(value));
+        if let Some(value) = arg.strip_prefix("--data-dir=") {
+            config.data_dir = Some(PathBuf::from(value));
             continue;
         }
 
@@ -53,13 +46,9 @@ where
                 let value = next_value(&mut args, "--bind")?;
                 config.bind = parse_bind(&value)?;
             }
-            "--artifact-root" => {
-                let value = next_value(&mut args, "--artifact-root")?;
-                config.artifact_root = PathBuf::from(value);
-            }
-            "--log-dir" => {
-                let value = next_value(&mut args, "--log-dir")?;
-                config.log_dir = Some(PathBuf::from(value));
+            "--data-dir" => {
+                let value = next_value(&mut args, "--data-dir")?;
+                config.data_dir = Some(PathBuf::from(value));
             }
             "--help" | "-h" => return Err(help_text().to_string()),
             other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
@@ -70,7 +59,7 @@ where
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp                         Run stdio MCP transport\n  dbgflow-mcp http [options]           Run Streamable HTTP MCP transport\n  dbgflow-mcp service [options]        Run as a Windows service\n\nOptions:\n  --bind <addr:port>                   Default: 127.0.0.1:7331\n  --artifact-root <path>               Default: workspace artifacts or DBGFLOW_ARTIFACT_ROOT\n  --log-dir <path>                     Service log directory"
+    "Usage:\n  dbgflow-mcp                         Run stdio MCP transport\n  dbgflow-mcp http [options]           Run Streamable HTTP MCP transport\n  dbgflow-mcp service [options]        Run as a Windows service\n\nOptions:\n  --bind <addr:port>                   Default: 127.0.0.1:7331\n  --data-dir <path>                    Data directory; uses <path>\\artifacts and <path>\\logs"
 }
 
 fn next_value<I>(args: &mut I, option: &str) -> Result<String, String>
@@ -106,18 +95,12 @@ mod tests {
         let config = parse_options([
             OsString::from("--bind"),
             OsString::from("127.0.0.1:9000"),
-            OsString::from("--artifact-root=C:\\dbgflow\\artifacts"),
-            OsString::from("--log-dir"),
-            OsString::from("C:\\dbgflow\\logs"),
+            OsString::from("--data-dir=C:\\dbgflow\\var"),
         ])
         .expect("parse options");
 
         assert_eq!(config.bind.to_string(), "127.0.0.1:9000");
-        assert_eq!(
-            config.artifact_root,
-            PathBuf::from("C:\\dbgflow\\artifacts")
-        );
-        assert_eq!(config.log_dir, Some(PathBuf::from("C:\\dbgflow\\logs")));
+        assert_eq!(config.data_dir, Some(PathBuf::from("C:\\dbgflow\\var")));
     }
 
     #[test]
@@ -132,5 +115,17 @@ mod tests {
             .expect_err("reject non-loopback bind");
 
         assert!(error.contains("loopback"));
+    }
+
+    #[test]
+    fn rejects_removed_directory_options() {
+        let artifact_error =
+            parse_options([OsString::from("--artifact-root=C:\\dbgflow\\artifacts")])
+                .expect_err("reject artifact-root");
+        assert!(artifact_error.contains("unknown option"));
+
+        let log_error = parse_options([OsString::from("--log-dir"), OsString::from("C:\\logs")])
+            .expect_err("reject log-dir");
+        assert!(log_error.contains("unknown option"));
     }
 }

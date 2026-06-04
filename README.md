@@ -79,6 +79,13 @@ Run the MCP server over local Streamable HTTP:
 cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331
 ```
 
+To enable the installed-style data layout in HTTP mode, pass one data
+directory; dbgflow will use `<data-dir>\artifacts` and `<data-dir>\logs`:
+
+```text
+cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir C:\dbgflow\var
+```
+
 The HTTP endpoint is `http://127.0.0.1:7331/mcp`. `POST /mcp` returns JSON
 responses. `GET /mcp` opens a server-sent event stream for MCP notifications,
 including `notifications/resources/updated` for session state changes. `GET
@@ -90,7 +97,12 @@ results are returned as JSON text content. Debugger command output is returned
 in full and also written to session artifacts.
 
 By default, the MCP server writes artifacts under the workspace-level
-`artifacts/` directory. Set `DBGFLOW_ARTIFACT_ROOT` to override that location.
+`artifacts/` directory. Set `DBGFLOW_ARTIFACT_ROOT` to override that location
+when `--data-dir` is not used.
+
+When `--data-dir` is used, runtime logs are written as daily JSONL files under
+`<data-dir>\logs` and artifacts under `<data-dir>\artifacts`. Runtime logs are
+retained for 7 days; artifacts are not automatically removed.
 
 Install or uninstall the Windows service from an elevated PowerShell session:
 
@@ -101,10 +113,10 @@ Install or uninstall the Windows service from an elevated PowerShell session:
 
 The install script builds the release binary, replaces an existing
 `dbgflow-mcp` service if present, copies the executable to
-`%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem, starts it, and checks
-`/healthz`. Service artifacts and logs are written under
-`%LOCALAPPDATA%\dbgflow\var`; uninstall does not delete artifacts or logs by
-default.
+`%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem with
+`--data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks `/healthz`.
+Service artifacts and logs are written under `%LOCALAPPDATA%\dbgflow\var`;
+uninstall does not delete artifacts or logs by default.
 
 Live process DbgEng integration tests are ignored by default because attach and
 launch behavior depends on local debugger permissions and target process state.

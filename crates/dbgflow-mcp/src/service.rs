@@ -1,13 +1,12 @@
 use crate::http::{run_http, HttpConfig};
-use crate::mcp::server_with_artifact_root;
+use crate::logging::FileLogSink;
+use crate::mcp::server_with_data_dir_and_logger;
 use crate::runtime::{parse_options, SERVICE_NAME};
+use dbgflow_core::logging::{LogEvent, LogLevel, LogSink};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use windows_service::define_windows_service;
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -32,7 +31,20 @@ fn service_main(_arguments: Vec<OsString>) {
 fn run_service() -> Result<(), String> {
     let args = std::env::args_os().skip(2);
     let config = parse_options(args)?;
-    log(&config.log_dir, "service starting");
+    let data_dir = config
+        .data_dir
+        .clone()
+        .ok_or_else(|| "service mode requires --data-dir".to_string())?;
+    let logger: Arc<dyn LogSink> = Arc::new(
+        FileLogSink::new(data_dir.join("logs"), 7)
+            .map_err(|error| format!("initialize log directory: {error}"))?,
+    );
+    log(
+        &logger,
+        LogLevel::Info,
+        "service_starting",
+        "service starting",
+    );
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -54,7 +66,7 @@ fn run_service() -> Result<(), String> {
     )?;
 
     let result = run_http(
-        server_with_artifact_root(config.artifact_root.clone()),
+        server_with_data_dir_and_logger(data_dir, logger.clone()),
         HttpConfig { bind: config.bind },
         shutdown_rx,
     )
@@ -68,9 +80,16 @@ fn run_service() -> Result<(), String> {
         false,
     )?;
     match &result {
-        Ok(()) => log(&config.log_dir, "service stopped"),
+        Ok(()) => log(
+            &logger,
+            LogLevel::Info,
+            "service_stopped",
+            "service stopped",
+        ),
         Err(error) => log(
-            &config.log_dir,
+            &logger,
+            LogLevel::Error,
+            "service_stopped_with_error",
             &format!("service stopped with error: {error}"),
         ),
     }
@@ -123,26 +142,10 @@ fn set_status(
         .map_err(|error| error.to_string())
 }
 
-fn log(log_dir: &Option<std::path::PathBuf>, message: &str) {
-    if let Some(log_dir) = log_dir {
-        let _ = append_log(log_dir, message);
-    }
-}
-
-fn append_log(log_dir: &Path, message: &str) -> std::io::Result<()> {
-    fs::create_dir_all(log_dir)?;
-    let path = log_dir.join("service.log");
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{} {message}", now_unix_ms())
+fn log(logger: &Arc<dyn LogSink>, level: LogLevel, event: &str, message: &str) {
+    logger.log(LogEvent::new(level, "service", event).message(message));
 }
 
 fn log_fallback(message: &str) {
     eprintln!("{message}");
-}
-
-fn now_unix_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
 }

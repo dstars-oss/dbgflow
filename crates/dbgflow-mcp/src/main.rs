@@ -1,5 +1,5 @@
 use dbgflow_mcp::http::{run_http, HttpConfig};
-use dbgflow_mcp::mcp::{default_server, run_stdio, server_with_artifact_root};
+use dbgflow_mcp::mcp::{default_server, run_stdio, server_with_data_dir};
 use dbgflow_mcp::runtime::{help_text, parse_options};
 use std::io::{self, BufReader};
 use std::sync::mpsc;
@@ -25,12 +25,12 @@ fn run() -> Result<(), String> {
         "http" => {
             let config = parse_options(args)?;
             let (_shutdown_tx, shutdown_rx) = mpsc::channel();
-            run_http(
-                server_with_artifact_root(config.artifact_root),
-                HttpConfig { bind: config.bind },
-                shutdown_rx,
-            )
-            .map_err(|error| error.to_string())
+            let server = match config.data_dir {
+                Some(data_dir) => server_with_data_dir(data_dir)?,
+                None => default_server(),
+            };
+            run_http(server, HttpConfig { bind: config.bind }, shutdown_rx)
+                .map_err(|error| error.to_string())
         }
         "service" => run_service(args),
         "--help" | "-h" | "help" => {

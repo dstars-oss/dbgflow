@@ -156,8 +156,6 @@ $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = Split-Path -Parent $ScriptDir
 $BinDir = Join-Path $InstallRoot "bin"
 $VarDir = Join-Path $InstallRoot "var"
-$LogDir = Join-Path $VarDir "logs"
-$ArtifactRoot = Join-Path $VarDir "artifacts"
 $SourceExe = Join-Path $RepoRoot "target\release\dbgflow-mcp.exe"
 $InstalledExe = Join-Path $BinDir "dbgflow-mcp.exe"
 
@@ -169,7 +167,7 @@ if (-not (Test-Path $SourceExe)) {
     throw "Expected release binary was not found: $SourceExe"
 }
 
-New-Item -ItemType Directory -Force -Path $BinDir, $LogDir, $ArtifactRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $BinDir, $VarDir | Out-Null
 Copy-Item -Path $SourceExe -Destination $InstalledExe -Force
 
 & icacls.exe $InstallRoot /grant "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" /T | Out-Null
@@ -177,7 +175,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "icacls failed for $InstallRoot."
 }
 
-$binPath = "`"$InstalledExe`" service --bind $Bind --artifact-root `"$ArtifactRoot`" --log-dir `"$LogDir`""
+$binPath = "`"$InstalledExe`" service --bind $Bind --data-dir `"$VarDir`""
 
 Write-Host "Creating service '$ServiceName'..."
 $create = & sc.exe create $ServiceName binPath= $binPath DisplayName= $DisplayName start= auto obj= LocalSystem

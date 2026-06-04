@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod backend;
 pub mod error;
+pub mod logging;
 pub mod policy;
 pub mod session;
 

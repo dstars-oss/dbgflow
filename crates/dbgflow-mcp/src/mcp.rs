@@ -1,10 +1,13 @@
+use crate::logging::FileLogSink;
 use crate::tools::{ToolCallError, ToolService};
+use dbgflow_core::logging::LogSink;
 use dbgflow_core::session::SessionId;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -297,6 +300,30 @@ pub fn default_server() -> McpServer {
 pub fn server_with_artifact_root(artifact_root: impl Into<PathBuf>) -> McpServer {
     McpServer::new(ToolService::new(
         dbgflow_core::session::SessionManager::with_default_backends_at(artifact_root),
+    ))
+}
+
+pub fn server_with_data_dir(
+    data_dir: impl Into<PathBuf>,
+) -> std::result::Result<McpServer, String> {
+    let data_dir = data_dir.into();
+    let logger = Arc::new(
+        FileLogSink::new(data_dir.join("logs"), 7)
+            .map_err(|error| format!("initialize log directory: {error}"))?,
+    );
+    Ok(server_with_data_dir_and_logger(data_dir, logger))
+}
+
+pub fn server_with_data_dir_and_logger(
+    data_dir: impl Into<PathBuf>,
+    logger: Arc<dyn LogSink>,
+) -> McpServer {
+    let data_dir = data_dir.into();
+    McpServer::new(ToolService::new(
+        dbgflow_core::session::SessionManager::with_default_backends_at_and_logger(
+            data_dir.join("artifacts"),
+            logger,
+        ),
     ))
 }
 

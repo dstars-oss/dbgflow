@@ -38,6 +38,7 @@ pub struct BackendSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateBackendSession {
     pub target: DebugTarget,
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

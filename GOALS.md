@@ -517,6 +517,15 @@ continue until exception
 * HTTP `GET /mcp` 支持 SSE，session 状态变化通过 `notifications/resources/updated` 推送；同时支持 session resources 的 list/read。
 * Windows service 默认 artifacts/logs 目录调整为 `%LOCALAPPDATA%\dbgflow\var`。
 
+已落地 DbgEng 生命周期稳定性与统一运行日志：
+
+* 运行时目录参数收敛为 `--data-dir`；内部固定使用 `<data-dir>\artifacts` 和 `<data-dir>\logs`，不再暴露独立 `--artifact-root` / `--log-dir` CLI 参数。
+* service 安装脚本只传 `%LOCALAPPDATA%\dbgflow\var` 作为 data dir。
+* 新增按日 JSONL 运行日志，记录 service、session 和 DbgEng open / WaitForEvent / execute / close 等关键阶段。
+* 运行日志保留 7 天，仅淘汰 logs，不自动删除 artifacts。
+* DbgEng in-process COM 操作增加进程级串行化，降低并行 open / close 与 DbgEng 回调重入导致的状态污染风险。
+* startup timeout 后记录 late success / late failure；late success 会触发 backend cleanup 并记录结果。
+
 ## 10. 当前待办
 
 ### P0
