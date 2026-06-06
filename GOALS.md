@@ -487,7 +487,7 @@ continue until exception
 * 新增原生 Windows service 运行模式，支持 SCM stop / shutdown 控制并有序停止 HTTP listener。
 * 新增 `scripts/install-service.ps1`：构建 release binary，替换已有服务，复制 exe 到用户 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动 `dbgflow-mcp` 服务。
 * 新增 `scripts/uninstall-service.ps1`：停止并卸载服务；默认保留 artifacts 和 logs，避免误删敏感调试输出。
-* 安装 / 卸载脚本支持非管理员 PowerShell 入口；检测到未提权时会弹出 UAC，并把当前参数转交给提权后的脚本进程。
+* 安装 / 卸载入口支持非管理员启动；检测到未提权时会弹出 UAC，并把当前参数转交给提权后的主程序进程。
 
 已落地 dump 异步打开与易用性修复：
 
@@ -541,7 +541,15 @@ continue until exception
 * `/mcp` 不再要求 `Authorization: Bearer ...`，Codex 等本地 MCP client 只需配置 `http://127.0.0.1:7331/mcp`。
 * 删除 `http-token.txt` 生成、读取和校验逻辑，`--data-dir` 只承载 artifacts 和 logs。
 * 继续保留 loopback-only bind 与 localhost / loopback `Origin` 限制；远程 HTTP 访问仍不支持。
-* Windows service 安装脚本不再输出 token 文件位置，卸载脚本仍默认保留 artifacts 和 logs。
+* Windows service 安装入口不再输出 token 文件位置，卸载入口仍默认保留 artifacts 和 logs。
+
+已将 Windows service 安装 / 卸载能力迁入主程序：
+
+* 新增 `dbgflow-mcp service run`、`dbgflow-mcp service install` 和 `dbgflow-mcp service uninstall` 子命令。
+* 安装子命令保留原脚本能力：非管理员入口 UAC 提权、构建 release binary、替换已有服务、复制 exe 到 `%LOCALAPPDATA%\dbgflow\bin`、授权目录、以 LocalSystem 安装并启动服务、检查 `/healthz`。
+* 卸载子命令停止并删除服务，默认保留 `%LOCALAPPDATA%\dbgflow\var` 下的 artifacts 和 logs；`--remove-install-files` 仅删除受控 install root 下的 `bin`。
+* `scripts/install-service.ps1` 和 `scripts/uninstall-service.ps1` 改为兼容包装入口，不再承载安装 / 卸载业务逻辑。
+* service 运行入口严格收敛为 `dbgflow-mcp service run --data-dir <path>`；不再支持裸 `dbgflow-mcp service --data-dir <path>` 形态。
 
 已重命名公开文本命令入口：
 
@@ -597,7 +605,7 @@ continue until exception
 * [x] 支持 launch process MVP。
 * [x] 支持最小 continue until event：通过 `eval` 精确命令 `g`，进度由 session 状态和 cancellation 控制。
 * [x] 支持本地 Streamable HTTP MCP endpoint。
-* [x] 支持 Windows service 安装 / 卸载脚本。
+* [x] 支持 Windows service 安装 / 卸载子命令。
 * [x] 补齐更多 live attach / launch HTTP E2E ignored 验证场景。
 * [x] 补齐 `transcript.log` 和 `events.jsonl` 审计链路。
 

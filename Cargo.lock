@@ -46,6 +46,7 @@ dependencies = [
  "serde",
  "serde_json",
  "windows-service",
+ "windows-sys",
 ]
 
 [[package]]

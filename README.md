@@ -6,7 +6,7 @@ dbgflow is an early-stage Windows debugging automation MCP server and skills too
 
 The current implementation includes the initial skeleton plus a Windows-only
 DbgEng dump-analysis / process-debugging MVP, a local Streamable HTTP MCP
-endpoint, and Windows service scripts:
+endpoint, and Windows service install / uninstall subcommands:
 
 - backend abstraction
 - session lifecycle management
@@ -20,7 +20,7 @@ endpoint, and Windows service scripts:
 - MCP-facing tool facade
 - Streamable HTTP MCP endpoint at `/mcp` with resource update SSE
 - native Windows service mode
-- PowerShell install / uninstall service scripts
+- native Windows service install / uninstall subcommands
 
 Initial tool names:
 
@@ -109,20 +109,24 @@ artifacts under `<data-dir>\artifacts`. Each session writes
 `outputs\<command_id>.txt`. Runtime logs are retained for 7 days; artifacts are
 not automatically removed.
 
-Install or uninstall the Windows service from PowerShell. If the session is not
-elevated, the scripts prompt for UAC elevation and continue after confirmation:
+Install or uninstall the Windows service through the main program. If the
+process is not elevated, dbgflow prompts for UAC elevation and continues after
+confirmation:
 
 ```text
-.\scripts\install-service.ps1
-.\scripts\uninstall-service.ps1
+cargo run -p dbgflow-mcp -- service install
+cargo run -p dbgflow-mcp -- service uninstall
 ```
 
-The install script builds the release binary, replaces an existing
+The install subcommand builds the release binary, replaces an existing
 `dbgflow-mcp` service if present, copies the executable to
 `%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem with
-`--data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks `/healthz`.
+`service run --data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks
+`/healthz`.
 Service artifacts and logs are written under `%LOCALAPPDATA%\dbgflow\var`.
 Uninstall does not delete artifacts or logs by default.
+The PowerShell scripts under `scripts\` remain as thin compatibility wrappers
+around these subcommands.
 
 Live process DbgEng integration tests are ignored by default because attach and
 launch behavior depends on local debugger permissions and target process state.

@@ -4,11 +4,103 @@ use std::path::PathBuf;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7331";
 pub const SERVICE_NAME: &str = "dbgflow-mcp";
+pub const SERVICE_DISPLAY_NAME: &str = "dbgflow MCP Server";
+pub const SERVICE_DESCRIPTION: &str = "dbgflow Streamable HTTP MCP server";
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceProcessConfig {
+    pub service_name: String,
+    pub app: AppConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceInstallConfig {
+    pub service_name: String,
+    pub display_name: String,
+    pub bind: SocketAddr,
+    pub install_root: PathBuf,
+    pub repo_root: PathBuf,
+}
+
+impl ServiceInstallConfig {
+    pub fn data_dir(&self) -> PathBuf {
+        self.install_root.join("var")
+    }
+
+    pub fn bin_dir(&self) -> PathBuf {
+        self.install_root.join("bin")
+    }
+
+    pub fn installed_exe(&self) -> PathBuf {
+        self.bin_dir().join("dbgflow-mcp.exe")
+    }
+
+    pub fn source_exe(&self) -> PathBuf {
+        self.repo_root
+            .join("target")
+            .join("release")
+            .join("dbgflow-mcp.exe")
+    }
+
+    pub fn normalized_command_args(&self) -> Vec<OsString> {
+        vec![
+            OsString::from("service"),
+            OsString::from("install"),
+            OsString::from("--service-name"),
+            OsString::from(&self.service_name),
+            OsString::from("--display-name"),
+            OsString::from(&self.display_name),
+            OsString::from("--bind"),
+            OsString::from(self.bind.to_string()),
+            OsString::from("--install-root"),
+            self.install_root.as_os_str().to_os_string(),
+            OsString::from("--repo-root"),
+            self.repo_root.as_os_str().to_os_string(),
+        ]
+    }
+
+    pub fn service_launch_arguments(&self) -> Vec<OsString> {
+        vec![
+            OsString::from("service"),
+            OsString::from("run"),
+            OsString::from("--service-name"),
+            OsString::from(&self.service_name),
+            OsString::from("--bind"),
+            OsString::from(self.bind.to_string()),
+            OsString::from("--data-dir"),
+            self.data_dir().as_os_str().to_os_string(),
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceUninstallConfig {
+    pub service_name: String,
+    pub install_root: PathBuf,
+    pub remove_install_files: bool,
+}
+
+impl ServiceUninstallConfig {
+    pub fn normalized_command_args(&self) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("service"),
+            OsString::from("uninstall"),
+            OsString::from("--service-name"),
+            OsString::from(&self.service_name),
+            OsString::from("--install-root"),
+            self.install_root.as_os_str().to_os_string(),
+        ];
+        if self.remove_install_files {
+            args.push(OsString::from("--remove-install-files"));
+        }
+        args
+    }
 }
 
 pub fn parse_options<I>(args: I) -> Result<AppConfig, String>
@@ -52,8 +144,240 @@ where
     Ok(AppConfig { bind, data_dir })
 }
 
+pub fn parse_service_process_options<I>(args: I) -> Result<ServiceProcessConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut service_name = SERVICE_NAME.to_string();
+    let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
+    let mut data_dir = None;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        let arg = arg
+            .into_string()
+            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
+
+        if let Some(value) = arg.strip_prefix("--bind=") {
+            bind = parse_bind(value)?;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--data-dir=") {
+            data_dir = Some(PathBuf::from(value));
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--service-name=") {
+            service_name = parse_non_empty(value, "--service-name")?;
+            continue;
+        }
+
+        match arg.as_str() {
+            "--bind" => {
+                let value = next_value(&mut args, "--bind")?;
+                bind = parse_bind(&value)?;
+            }
+            "--data-dir" => {
+                let value = next_value(&mut args, "--data-dir")?;
+                data_dir = Some(PathBuf::from(value));
+            }
+            "--service-name" => {
+                let value = next_value(&mut args, "--service-name")?;
+                service_name = parse_non_empty(&value, "--service-name")?;
+            }
+            "--help" | "-h" => return Err(help_text().to_string()),
+            other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
+        }
+    }
+
+    let data_dir =
+        data_dir.ok_or_else(|| format!("missing required --data-dir <path>\n\n{}", help_text()))?;
+    Ok(ServiceProcessConfig {
+        service_name,
+        app: AppConfig { bind, data_dir },
+    })
+}
+
+pub fn service_process_options_from_command_line<I>(args: I) -> Result<ServiceProcessConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let _exe = args
+        .next()
+        .ok_or_else(|| "missing executable path".to_string())?;
+    let command = next_command(&mut args, "service")?;
+    if command != "service" {
+        return Err(format!("expected service command, got {command}"));
+    }
+    let service_command = next_command(&mut args, "service run")?;
+    if service_command != "run" {
+        return Err(format!(
+            "expected service run command, got service {service_command}"
+        ));
+    }
+    parse_service_process_options(args)
+}
+
+pub fn parse_service_install_options<I>(args: I) -> Result<ServiceInstallConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut service_name = SERVICE_NAME.to_string();
+    let mut display_name = SERVICE_DISPLAY_NAME.to_string();
+    let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
+    let mut install_root = None;
+    let mut repo_root = None;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        let arg = arg
+            .into_string()
+            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
+
+        if let Some(value) = arg.strip_prefix("--service-name=") {
+            service_name = parse_non_empty(value, "--service-name")?;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--display-name=") {
+            display_name = parse_non_empty(value, "--display-name")?;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--bind=") {
+            bind = parse_bind(value)?;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--install-root=") {
+            install_root = Some(PathBuf::from(value));
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--repo-root=") {
+            repo_root = Some(PathBuf::from(value));
+            continue;
+        }
+
+        match arg.as_str() {
+            "--service-name" => {
+                let value = next_value(&mut args, "--service-name")?;
+                service_name = parse_non_empty(&value, "--service-name")?;
+            }
+            "--display-name" => {
+                let value = next_value(&mut args, "--display-name")?;
+                display_name = parse_non_empty(&value, "--display-name")?;
+            }
+            "--bind" => {
+                let value = next_value(&mut args, "--bind")?;
+                bind = parse_bind(&value)?;
+            }
+            "--install-root" => {
+                let value = next_value(&mut args, "--install-root")?;
+                install_root = Some(PathBuf::from(value));
+            }
+            "--repo-root" => {
+                let value = next_value(&mut args, "--repo-root")?;
+                repo_root = Some(PathBuf::from(value));
+            }
+            "--help" | "-h" => return Err(service_install_help_text().to_string()),
+            other => {
+                return Err(format!(
+                    "unknown option: {other}\n\n{}",
+                    service_install_help_text()
+                ))
+            }
+        }
+    }
+
+    Ok(ServiceInstallConfig {
+        service_name,
+        display_name,
+        bind,
+        install_root: match install_root {
+            Some(path) => path,
+            None => default_install_root()?,
+        },
+        repo_root: match repo_root {
+            Some(path) => path,
+            None => std::env::current_dir().map_err(|error| {
+                format!("resolve current directory for --repo-root default: {error}")
+            })?,
+        },
+    })
+}
+
+pub fn parse_service_uninstall_options<I>(args: I) -> Result<ServiceUninstallConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut service_name = SERVICE_NAME.to_string();
+    let mut install_root = None;
+    let mut remove_install_files = false;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        let arg = arg
+            .into_string()
+            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
+
+        if let Some(value) = arg.strip_prefix("--service-name=") {
+            service_name = parse_non_empty(value, "--service-name")?;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--install-root=") {
+            install_root = Some(PathBuf::from(value));
+            continue;
+        }
+
+        match arg.as_str() {
+            "--service-name" => {
+                let value = next_value(&mut args, "--service-name")?;
+                service_name = parse_non_empty(&value, "--service-name")?;
+            }
+            "--install-root" => {
+                let value = next_value(&mut args, "--install-root")?;
+                install_root = Some(PathBuf::from(value));
+            }
+            "--remove-install-files" => remove_install_files = true,
+            "--help" | "-h" => return Err(service_uninstall_help_text().to_string()),
+            other => {
+                return Err(format!(
+                    "unknown option: {other}\n\n{}",
+                    service_uninstall_help_text()
+                ))
+            }
+        }
+    }
+
+    Ok(ServiceUninstallConfig {
+        service_name,
+        install_root: match install_root {
+            Some(path) => path,
+            None => default_install_root()?,
+        },
+        remove_install_files,
+    })
+}
+
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]     Run local HTTP MCP transport\n  dbgflow-mcp service --data-dir <path> [options]  Run as a Windows service\n  dbgflow-mcp worker session                       Run an internal session worker process\n\nOptions:\n  --bind <addr:port>                             Default: 127.0.0.1:7331\n  --data-dir <path>                              Required. Uses <path>\\artifacts and <path>\\logs"
+    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]        Run local HTTP MCP transport\n  dbgflow-mcp service run --data-dir <path> [options] Run as a Windows service process\n  dbgflow-mcp service install [options]               Install and start the Windows service\n  dbgflow-mcp service uninstall [options]             Stop and uninstall the Windows service\n  dbgflow-mcp worker session                          Run an internal session worker process\n\nRuntime options:\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --data-dir <path>                                   Required. Uses <path>\\artifacts and <path>\\logs\n  --service-name <name>                               Service process name. Default: dbgflow-mcp"
+}
+
+pub fn service_install_help_text() -> &'static str {
+    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --repo-root <path>                                  Default: current directory"
+}
+
+pub fn service_uninstall_help_text() -> &'static str {
+    "Usage:\n  dbgflow-mcp service uninstall [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --remove-install-files                              Remove <install-root>\\bin; artifacts and logs stay under <install-root>\\var"
+}
+
+pub fn remove_install_files_target(install_root: PathBuf) -> Result<PathBuf, String> {
+    let root = normalize_absolute_path(&install_root)?;
+    let bin_dir = normalize_absolute_path(&install_root.join("bin"))?;
+    if !path_starts_with(&bin_dir, &root) {
+        return Err(format!(
+            "refusing to remove path outside install root: {}",
+            bin_dir.display()
+        ));
+    }
+    Ok(bin_dir)
 }
 
 fn next_value<I>(args: &mut I, option: &str) -> Result<String, String>
@@ -64,6 +388,23 @@ where
         .ok_or_else(|| format!("missing value for {option}"))?
         .into_string()
         .map_err(|_| format!("value for {option} must be valid UTF-8"))
+}
+
+fn next_command<I>(args: &mut I, label: &str) -> Result<String, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    args.next()
+        .ok_or_else(|| format!("missing {label} command"))?
+        .into_string()
+        .map_err(|_| format!("{label} command must be valid UTF-8"))
+}
+
+fn parse_non_empty(value: &str, option: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err(format!("{option} must not be empty"));
+    }
+    Ok(value.to_string())
 }
 
 fn parse_bind(value: &str) -> Result<SocketAddr, String> {
@@ -78,9 +419,54 @@ fn parse_bind(value: &str) -> Result<SocketAddr, String> {
     Ok(bind)
 }
 
+fn default_install_root() -> Result<PathBuf, String> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "LOCALAPPDATA is not set; pass --install-root <path>".to_string())?;
+    Ok(PathBuf::from(local_app_data).join("dbgflow"))
+}
+
+fn normalize_absolute_path(path: &std::path::Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolve current directory: {error}"))?
+            .join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_starts_with(path: &std::path::Path, base: &std::path::Path) -> bool {
+    if path.starts_with(base) {
+        return true;
+    }
+
+    let path = path.to_string_lossy().to_lowercase();
+    let base = base.to_string_lossy().to_lowercase();
+    path == base
+        || path
+            .strip_prefix(&base)
+            .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_options, DEFAULT_BIND};
+    use super::{
+        parse_options, parse_service_install_options, parse_service_process_options,
+        parse_service_uninstall_options, remove_install_files_target,
+        service_process_options_from_command_line, DEFAULT_BIND, SERVICE_NAME,
+    };
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -129,5 +515,152 @@ mod tests {
         let log_error = parse_options([OsString::from("--log-dir"), OsString::from("C:\\logs")])
             .expect_err("reject log-dir");
         assert!(log_error.contains("unknown option"));
+    }
+
+    #[test]
+    fn parses_service_process_options_with_service_name() {
+        let config = parse_service_process_options([
+            OsString::from("--service-name"),
+            OsString::from("dbgflow-dev"),
+            OsString::from("--bind"),
+            OsString::from("127.0.0.1:9001"),
+            OsString::from("--data-dir"),
+            OsString::from("C:\\dbgflow\\var"),
+        ])
+        .expect("parse service process options");
+
+        assert_eq!(config.service_name, "dbgflow-dev");
+        assert_eq!(config.app.bind.to_string(), "127.0.0.1:9001");
+        assert_eq!(config.app.data_dir, PathBuf::from("C:\\dbgflow\\var"));
+    }
+
+    #[test]
+    fn parses_service_run_process_options_from_full_command_line() {
+        let config = service_process_options_from_command_line([
+            OsString::from("dbgflow-mcp.exe"),
+            OsString::from("service"),
+            OsString::from("run"),
+            OsString::from("--service-name"),
+            OsString::from("dbgflow-dev"),
+            OsString::from("--bind"),
+            OsString::from("127.0.0.1:9001"),
+            OsString::from("--data-dir"),
+            OsString::from("C:\\dbgflow\\var"),
+        ])
+        .expect("parse service run command line");
+
+        assert_eq!(config.service_name, "dbgflow-dev");
+        assert_eq!(config.app.bind.to_string(), "127.0.0.1:9001");
+        assert_eq!(config.app.data_dir, PathBuf::from("C:\\dbgflow\\var"));
+    }
+
+    #[test]
+    fn rejects_legacy_service_process_command_line_without_run() {
+        let error = service_process_options_from_command_line([
+            OsString::from("dbgflow-mcp.exe"),
+            OsString::from("service"),
+            OsString::from("--data-dir"),
+            OsString::from("C:\\dbgflow\\var"),
+        ])
+        .expect_err("reject legacy service process command line");
+
+        assert!(error.contains("expected service run"));
+    }
+
+    #[test]
+    fn parses_service_install_options() {
+        let config = parse_service_install_options([
+            OsString::from("--service-name"),
+            OsString::from("dbgflow-dev"),
+            OsString::from("--display-name"),
+            OsString::from("dbgflow Dev"),
+            OsString::from("--bind=127.0.0.1:9002"),
+            OsString::from("--install-root"),
+            OsString::from("C:\\dbgflow"),
+            OsString::from("--repo-root"),
+            OsString::from("D:\\Repos\\Project\\dbgflow"),
+        ])
+        .expect("parse service install options");
+
+        assert_eq!(config.service_name, "dbgflow-dev");
+        assert_eq!(config.display_name, "dbgflow Dev");
+        assert_eq!(config.bind.to_string(), "127.0.0.1:9002");
+        assert_eq!(config.install_root, PathBuf::from("C:\\dbgflow"));
+        assert_eq!(
+            config.repo_root,
+            PathBuf::from("D:\\Repos\\Project\\dbgflow")
+        );
+    }
+
+    #[test]
+    fn service_install_launch_arguments_use_service_run_subcommand() {
+        let config = parse_service_install_options([
+            OsString::from("--service-name"),
+            OsString::from("dbgflow-dev"),
+            OsString::from("--install-root=C:\\dbgflow"),
+            OsString::from("--repo-root=D:\\Repos\\Project\\dbgflow"),
+        ])
+        .expect("parse service install options");
+
+        assert_eq!(
+            config.service_launch_arguments(),
+            vec![
+                OsString::from("service"),
+                OsString::from("run"),
+                OsString::from("--service-name"),
+                OsString::from("dbgflow-dev"),
+                OsString::from("--bind"),
+                OsString::from("127.0.0.1:7331"),
+                OsString::from("--data-dir"),
+                OsString::from("C:\\dbgflow\\var"),
+            ]
+        );
+    }
+
+    #[test]
+    fn service_install_rejects_non_loopback_bind() {
+        let error = parse_service_install_options([
+            OsString::from("--bind"),
+            OsString::from("0.0.0.0:7331"),
+            OsString::from("--install-root"),
+            OsString::from("C:\\dbgflow"),
+        ])
+        .expect_err("reject non-loopback bind");
+
+        assert!(error.contains("loopback"));
+    }
+
+    #[test]
+    fn parses_service_uninstall_options() {
+        let config = parse_service_uninstall_options([
+            OsString::from("--service-name"),
+            OsString::from("dbgflow-dev"),
+            OsString::from("--install-root=C:\\dbgflow"),
+            OsString::from("--remove-install-files"),
+        ])
+        .expect("parse service uninstall options");
+
+        assert_eq!(config.service_name, "dbgflow-dev");
+        assert_eq!(config.install_root, PathBuf::from("C:\\dbgflow"));
+        assert!(config.remove_install_files);
+    }
+
+    #[test]
+    fn service_process_uses_default_service_name() {
+        let config = parse_service_process_options([
+            OsString::from("--data-dir"),
+            OsString::from("C:\\dbgflow\\var"),
+        ])
+        .expect("parse service process options");
+
+        assert_eq!(config.service_name, SERVICE_NAME);
+    }
+
+    #[test]
+    fn remove_install_files_target_stays_under_install_root() {
+        let target = remove_install_files_target(PathBuf::from("C:\\dbgflow"))
+            .expect("resolve remove target");
+
+        assert_eq!(target, PathBuf::from("C:\\dbgflow\\bin"));
     }
 }
