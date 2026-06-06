@@ -186,12 +186,12 @@ pub fn install(config: ServiceInstallConfig) -> Result<(), String> {
 
     stop_and_delete_service(&config.service_name, true)?;
     assert_port_available(config.bind)?;
-    build_release_binary(&config.repo_root)?;
 
-    let source_exe = config.source_exe();
+    let source_exe =
+        std::env::current_exe().map_err(|error| format!("resolve current executable: {error}"))?;
     if !source_exe.exists() {
         return Err(format!(
-            "expected release binary was not found: {}",
+            "current executable was not found: {}",
             source_exe.display()
         ));
     }
@@ -499,22 +499,6 @@ fn assert_port_available(bind: SocketAddr) -> Result<(), String> {
     let listener = TcpListener::bind(bind)
         .map_err(|error| format!("bind address {bind} is not available: {error}"))?;
     drop(listener);
-    Ok(())
-}
-
-fn build_release_binary(repo_root: &Path) -> Result<(), String> {
-    println!("Building dbgflow-mcp release binary...");
-    let status = Command::new("cargo")
-        .args(["build", "-p", "dbgflow-mcp", "--release"])
-        .current_dir(repo_root)
-        .status()
-        .map_err(|error| format!("start cargo build in {}: {error}", repo_root.display()))?;
-    if !status.success() {
-        return Err(format!(
-            "cargo build failed with exit code {}",
-            status.code().unwrap_or(1)
-        ));
-    }
     Ok(())
 }
 

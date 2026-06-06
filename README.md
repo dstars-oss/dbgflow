@@ -109,24 +109,20 @@ artifacts under `<data-dir>\artifacts`. Each session writes
 `outputs\<command_id>.txt`. Runtime logs are retained for 7 days; artifacts are
 not automatically removed.
 
-Install or uninstall the Windows service through the main program. If the
-process is not elevated, dbgflow prompts for UAC elevation and continues after
-confirmation:
+Build and install or uninstall the Windows service from the repository scripts:
 
 ```text
-cargo run -p dbgflow-mcp -- service install
-cargo run -p dbgflow-mcp -- service uninstall
+.\scripts\install-service.ps1
+.\scripts\uninstall-service.ps1
 ```
 
-The install subcommand builds the release binary, replaces an existing
-`dbgflow-mcp` service if present, copies the executable to
-`%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem with
-`service run --data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks
-`/healthz`.
+The install script builds `dbgflow-mcp` in release mode and then invokes the
+built `target\release\dbgflow-mcp.exe service install` with the selected
+service parameters. The install subcommand copies its current executable to
+`%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem with `service run
+--data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks `/healthz`.
 Service artifacts and logs are written under `%LOCALAPPDATA%\dbgflow\var`.
 Uninstall does not delete artifacts or logs by default.
-The PowerShell scripts under `scripts\` remain as thin compatibility wrappers
-around these subcommands.
 
 Live process DbgEng integration tests are ignored by default because attach and
 launch behavior depends on local debugger permissions and target process state.

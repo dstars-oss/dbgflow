@@ -25,7 +25,6 @@ pub struct ServiceInstallConfig {
     pub display_name: String,
     pub bind: SocketAddr,
     pub install_root: PathBuf,
-    pub repo_root: PathBuf,
 }
 
 impl ServiceInstallConfig {
@@ -41,13 +40,6 @@ impl ServiceInstallConfig {
         self.bin_dir().join("dbgflow-mcp.exe")
     }
 
-    pub fn source_exe(&self) -> PathBuf {
-        self.repo_root
-            .join("target")
-            .join("release")
-            .join("dbgflow-mcp.exe")
-    }
-
     pub fn normalized_command_args(&self) -> Vec<OsString> {
         vec![
             OsString::from("service"),
@@ -60,8 +52,6 @@ impl ServiceInstallConfig {
             OsString::from(self.bind.to_string()),
             OsString::from("--install-root"),
             self.install_root.as_os_str().to_os_string(),
-            OsString::from("--repo-root"),
-            self.repo_root.as_os_str().to_os_string(),
         ]
     }
 
@@ -226,7 +216,6 @@ where
     let mut display_name = SERVICE_DISPLAY_NAME.to_string();
     let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
     let mut install_root = None;
-    let mut repo_root = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -250,11 +239,6 @@ where
             install_root = Some(PathBuf::from(value));
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--repo-root=") {
-            repo_root = Some(PathBuf::from(value));
-            continue;
-        }
-
         match arg.as_str() {
             "--service-name" => {
                 let value = next_value(&mut args, "--service-name")?;
@@ -271,10 +255,6 @@ where
             "--install-root" => {
                 let value = next_value(&mut args, "--install-root")?;
                 install_root = Some(PathBuf::from(value));
-            }
-            "--repo-root" => {
-                let value = next_value(&mut args, "--repo-root")?;
-                repo_root = Some(PathBuf::from(value));
             }
             "--help" | "-h" => return Err(service_install_help_text().to_string()),
             other => {
@@ -293,12 +273,6 @@ where
         install_root: match install_root {
             Some(path) => path,
             None => default_install_root()?,
-        },
-        repo_root: match repo_root {
-            Some(path) => path,
-            None => std::env::current_dir().map_err(|error| {
-                format!("resolve current directory for --repo-root default: {error}")
-            })?,
         },
     })
 }
@@ -361,7 +335,7 @@ pub fn help_text() -> &'static str {
 }
 
 pub fn service_install_help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --repo-root <path>                                  Default: current directory"
+    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow"
 }
 
 pub fn service_uninstall_help_text() -> &'static str {
@@ -577,8 +551,6 @@ mod tests {
             OsString::from("--bind=127.0.0.1:9002"),
             OsString::from("--install-root"),
             OsString::from("C:\\dbgflow"),
-            OsString::from("--repo-root"),
-            OsString::from("D:\\Repos\\Project\\dbgflow"),
         ])
         .expect("parse service install options");
 
@@ -586,10 +558,10 @@ mod tests {
         assert_eq!(config.display_name, "dbgflow Dev");
         assert_eq!(config.bind.to_string(), "127.0.0.1:9002");
         assert_eq!(config.install_root, PathBuf::from("C:\\dbgflow"));
-        assert_eq!(
-            config.repo_root,
-            PathBuf::from("D:\\Repos\\Project\\dbgflow")
-        );
+        assert!(!config
+            .normalized_command_args()
+            .iter()
+            .any(|arg| arg == "--repo-root"));
     }
 
     #[test]
@@ -598,7 +570,6 @@ mod tests {
             OsString::from("--service-name"),
             OsString::from("dbgflow-dev"),
             OsString::from("--install-root=C:\\dbgflow"),
-            OsString::from("--repo-root=D:\\Repos\\Project\\dbgflow"),
         ])
         .expect("parse service install options");
 
@@ -615,6 +586,17 @@ mod tests {
                 OsString::from("C:\\dbgflow\\var"),
             ]
         );
+    }
+
+    #[test]
+    fn service_install_rejects_removed_repo_root_option() {
+        let error = parse_service_install_options([
+            OsString::from("--install-root=C:\\dbgflow"),
+            OsString::from("--repo-root=D:\\Repos\\Project\\dbgflow"),
+        ])
+        .expect_err("reject repo-root");
+
+        assert!(error.contains("unknown option"));
     }
 
     #[test]

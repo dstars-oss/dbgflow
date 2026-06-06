@@ -546,9 +546,9 @@ continue until exception
 已将 Windows service 安装 / 卸载能力迁入主程序：
 
 * 新增 `dbgflow-mcp service run`、`dbgflow-mcp service install` 和 `dbgflow-mcp service uninstall` 子命令。
-* 安装子命令保留原脚本能力：非管理员入口 UAC 提权、构建 release binary、替换已有服务、复制 exe 到 `%LOCALAPPDATA%\dbgflow\bin`、授权目录、以 LocalSystem 安装并启动服务、检查 `/healthz`。
+* 安装子命令负责非管理员入口 UAC 提权、替换已有服务、复制当前 exe 到 `%LOCALAPPDATA%\dbgflow\bin`、授权目录、以 LocalSystem 安装并启动服务、检查 `/healthz`。
 * 卸载子命令停止并删除服务，默认保留 `%LOCALAPPDATA%\dbgflow\var` 下的 artifacts 和 logs；`--remove-install-files` 仅删除受控 install root 下的 `bin`。
-* `scripts/install-service.ps1` 和 `scripts/uninstall-service.ps1` 改为兼容包装入口，不再承载安装 / 卸载业务逻辑。
+* `scripts/install-service.ps1` 和 `scripts/uninstall-service.ps1` 负责从仓库构建 release binary，然后调用构建出的 `target\release\dbgflow-mcp.exe service install|uninstall` 并传入安装参数；不在主程序内执行 cargo build。
 * service 运行入口严格收敛为 `dbgflow-mcp service run --data-dir <path>`；不再支持裸 `dbgflow-mcp service --data-dir <path>` 形态。
 
 已重命名公开文本命令入口：

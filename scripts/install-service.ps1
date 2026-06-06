@@ -11,12 +11,9 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = Split-Path -Parent $ScriptDir
+$Exe = Join-Path $RepoRoot "target\release\dbgflow-mcp.exe"
 
 $arguments = @(
-    "run"
-    "-p"
-    "dbgflow-mcp"
-    "--"
     "service"
     "install"
     "--service-name"
@@ -27,13 +24,19 @@ $arguments = @(
     $Bind
     "--install-root"
     $InstallRoot
-    "--repo-root"
-    $RepoRoot
 )
 
 Push-Location $RepoRoot
 try {
-    & cargo @arguments
+    & cargo build -p dbgflow-mcp --release
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+    if (-not (Test-Path $Exe)) {
+        throw "Expected release binary was not found: $Exe"
+    }
+
+    & $Exe @arguments
     exit $LASTEXITCODE
 }
 finally {
