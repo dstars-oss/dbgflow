@@ -1,11 +1,12 @@
 use super::{SessionId, SessionState};
-use crate::artifacts::{ArtifactManager, ArtifactRef, CommandArtifactRecord};
+use crate::artifacts::{ArtifactManager, ArtifactRef, CommandArtifactRecord, SessionArtifactEvent};
 use crate::backend::{CreateBackendSession, DebugTarget};
 use crate::logging::{noop_logger, LogEvent, LogLevel, LogSink};
 use crate::policy::CommandPolicy;
 use crate::session::worker::{ProcessWorkerLauncher, SessionWorker, SessionWorkerLauncher};
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -211,6 +212,8 @@ impl SessionManager {
             error: None,
         };
 
+        self.initialize_session_audit(&session)?;
+
         sessions.insert(session.id, session.clone());
         drop(sessions);
 
@@ -265,7 +268,7 @@ impl SessionManager {
     pub fn close_session(&self, session_id: SessionId) -> Result<Session> {
         let operation_lock = self.operation_lock(session_id)?;
         let has_worker = self.worker(session_id).is_some();
-        let (session, should_cancel) = {
+        let (session, should_cancel, close_event) = {
             let mut sessions = self
                 .sessions
                 .lock()
@@ -281,6 +284,7 @@ impl SessionManager {
                 return Ok(session.clone());
             }
 
+            let previous_state = session.state;
             let should_cancel = session.current_operation.is_some();
             session.state = if has_worker || should_cancel {
                 SessionState::Closing
@@ -303,8 +307,32 @@ impl SessionManager {
                     .field("had_worker", has_worker)
                     .field("cancel_requested", should_cancel),
             );
-            (session.clone(), should_cancel)
+            let updated = session.clone();
+            let mut fields = Map::new();
+            fields.insert("had_worker".to_string(), Value::Bool(has_worker));
+            fields.insert("cancel_requested".to_string(), Value::Bool(should_cancel));
+            let event = session_event(
+                "close_session_requested",
+                &updated,
+                Some(previous_state),
+                Some("close_session".to_string()),
+                None,
+                None,
+                None,
+                fields,
+            );
+            (session.clone(), should_cancel, event)
         };
+        self.record_session_event_best_effort(session_id, close_event);
+        self.append_transcript_best_effort(
+            session_id,
+            &format!(
+                "[{}] close_session requested new_state={:?} cancel_requested={}\n",
+                now_unix_ms(),
+                session.state,
+                should_cancel
+            ),
+        );
         self.notify_session_updated(session_id);
 
         if should_cancel {
@@ -385,7 +413,10 @@ impl SessionManager {
     }
 
     pub fn eval(&self, request: EvalSession) -> Result<EvalSessionResult> {
-        self.command_policy.check_command(&request.command)?;
+        if let Err(error) = self.command_policy.check_command(&request.command) {
+            self.audit_rejected_eval(&request, &error);
+            return Err(error);
+        }
         let is_run_control = self.command_policy.is_run_control_command(&request.command);
 
         let operation_lock = self.operation_lock(request.session_id)?;
@@ -459,45 +490,51 @@ impl SessionManager {
         let backend_result = match backend_result {
             Ok(result) => result,
             Err(error) => {
+                let error_text = error.to_string();
                 self.log(
                     LogEvent::new(LogLevel::Error, "session", "eval_failed")
                         .session_id(request.session_id)
                         .operation(command.clone())
                         .duration_ms(duration_ms)
                         .field("command_id", command_id.clone())
-                        .error(error.to_string()),
+                        .error(error_text.clone()),
                 );
-                self.finish_operation(
+                let operation_finished = self.finish_operation(
                     request.session_id,
                     SessionState::Error,
                     OperationStatus::Failed,
                     None,
-                    Some(error.to_string()),
+                    Some(error_text.clone()),
                     None,
                     duration_ms,
                 )?;
+                if operation_finished {
+                    self.write_command_record_best_effort(
+                        request.session_id,
+                        &CommandArtifactRecord {
+                            command_id: command_id.clone(),
+                            command: command.clone(),
+                            status: "Failed".to_string(),
+                            output_path: None,
+                            started_at_unix_ms,
+                            duration_ms: Some(duration_ms),
+                            output_bytes: None,
+                            warnings: Vec::new(),
+                            error: Some(error_text),
+                            backend_session_id: session.backend_session_id.clone(),
+                        },
+                    );
+                }
                 return Err(error);
             }
         };
 
         let output_path = self
             .artifacts
-            .root()
-            .join("sessions")
-            .join(request.session_id.to_string())
-            .join("outputs")
-            .join(format!("{command_id}.txt"));
-        let artifact = match self.artifacts.write_eval_artifacts(
+            .command_output_path(request.session_id, &command_id);
+        let artifact = match self.artifacts.write_eval_output(
             request.session_id,
             &command_id,
-            &CommandArtifactRecord {
-                command_id: command_id.clone(),
-                command: command.clone(),
-                output_path,
-                started_at_unix_ms,
-                duration_ms,
-                output_bytes: backend_result.output.len(),
-            },
             &backend_result.output,
         ) {
             Ok(artifact) => artifact,
@@ -511,7 +548,7 @@ impl SessionManager {
                         .field("output_bytes", backend_result.output.len())
                         .error(error.to_string()),
                 );
-                self.finish_operation(
+                let _ = self.finish_operation(
                     request.session_id,
                     SessionState::Error,
                     OperationStatus::Failed,
@@ -523,7 +560,7 @@ impl SessionManager {
                 return Err(error);
             }
         };
-        self.finish_operation(
+        let operation_finished = self.finish_operation(
             request.session_id,
             if is_run_control {
                 SessionState::Break
@@ -536,6 +573,30 @@ impl SessionManager {
             Some(backend_result.output.len()),
             duration_ms,
         )?;
+        if operation_finished {
+            self.write_command_record_best_effort(
+                request.session_id,
+                &CommandArtifactRecord {
+                    command_id: command_id.clone(),
+                    command: command.clone(),
+                    status: "Finished".to_string(),
+                    output_path: Some(output_path),
+                    started_at_unix_ms,
+                    duration_ms: Some(duration_ms),
+                    output_bytes: Some(backend_result.output.len()),
+                    warnings: backend_result.warnings.clone(),
+                    error: None,
+                    backend_session_id: session.backend_session_id.clone(),
+                },
+            );
+            self.append_transcript_best_effort(
+                request.session_id,
+                &format!(
+                    "\n--- command {} output: {} ---\n{}\n--- end command {} output ---\n",
+                    command_id, command, backend_result.output, command_id
+                ),
+            );
+        }
 
         self.log(
             LogEvent::new(LogLevel::Info, "session", "eval_finished")
@@ -592,12 +653,40 @@ impl SessionManager {
         if session.state.is_terminal() || session.state == SessionState::Closing {
             return Ok(());
         }
+        let previous_state = session.state;
+        let command_id = operation.command_id.clone();
+        let command = operation.command.clone();
         session.state = state;
         session.updated_at_unix_ms = now_unix_ms();
         session.current_operation = Some(operation.command.clone());
         session.last_operation = Some(operation);
         session.error = None;
+        let updated = session.clone();
         drop(sessions);
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("Running".to_string()));
+        self.record_session_event_best_effort(
+            session_id,
+            session_event(
+                "eval_started",
+                &updated,
+                Some(previous_state),
+                Some(command.clone()),
+                Some(command_id.clone()),
+                None,
+                None,
+                fields,
+            ),
+        );
+        self.append_transcript_best_effort(
+            session_id,
+            &format!(
+                "[{}] eval started command_id={} command={}\n",
+                now_unix_ms(),
+                command_id,
+                command
+            ),
+        );
         self.notify_session_updated(session_id);
         Ok(())
     }
@@ -611,7 +700,7 @@ impl SessionManager {
         error: Option<String>,
         output_bytes: Option<usize>,
         duration_ms: u128,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut sessions = self
             .sessions
             .lock()
@@ -620,13 +709,18 @@ impl SessionManager {
             .get_mut(&session_id)
             .ok_or(DbgFlowError::SessionNotFound(session_id))?;
         if session.state.is_terminal() || session.state == SessionState::Closing {
-            return Ok(());
+            return Ok(false);
         }
+        let previous_state = session.state;
+        let mut command_id = None;
+        let mut command = None;
         session.state = state;
         session.updated_at_unix_ms = now_unix_ms();
         session.current_operation = None;
         session.error = error.clone();
         if let Some(operation) = session.last_operation.as_mut() {
+            command_id = Some(operation.command_id.clone());
+            command = Some(operation.command.clone());
             operation.status = status;
             operation.finished_at_unix_ms = Some(now_unix_ms());
             operation.duration_ms = Some(duration_ms);
@@ -634,9 +728,62 @@ impl SessionManager {
             operation.error = error;
             operation.output_bytes = output_bytes;
         }
+        let updated = session.clone();
         drop(sessions);
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String(format!("{status:?}")));
+        if let Some(output_bytes) = output_bytes {
+            fields.insert(
+                "output_bytes".to_string(),
+                Value::Number(serde_json::Number::from(output_bytes as u64)),
+            );
+        }
+        fields.insert(
+            "duration_ms".to_string(),
+            Value::Number(serde_json::Number::from(duration_ms as u64)),
+        );
+        let artifact_path = updated
+            .last_operation
+            .as_ref()
+            .and_then(|operation| operation.artifact.as_ref())
+            .map(|artifact| artifact.path.clone());
+        let error_for_event = updated.error.clone();
+        let event_name = match status {
+            OperationStatus::Finished => "eval_finished",
+            OperationStatus::Canceled => "eval_canceled",
+            OperationStatus::Failed => "eval_failed",
+            OperationStatus::CancelRequested => "eval_cancel_requested",
+            OperationStatus::Running => "eval_running",
+        };
+        self.record_session_event_best_effort(
+            session_id,
+            session_event(
+                event_name,
+                &updated,
+                Some(previous_state),
+                command.clone(),
+                command_id.clone(),
+                artifact_path,
+                error_for_event.clone(),
+                fields,
+            ),
+        );
+        if let (Some(command_id), Some(command)) = (command_id, command) {
+            self.append_transcript_best_effort(
+                session_id,
+                &format!(
+                    "[{}] {} command_id={} command={} duration_ms={} error={}\n",
+                    now_unix_ms(),
+                    event_name,
+                    command_id,
+                    command,
+                    duration_ms,
+                    error_for_event.unwrap_or_default()
+                ),
+            );
+        }
         self.notify_session_updated(session_id);
-        Ok(())
+        Ok(true)
     }
 
     fn notify_session_updated(&self, session_id: SessionId) {
@@ -649,42 +796,254 @@ impl SessionManager {
         self.logger.log(event);
     }
 
+    fn initialize_session_audit(&self, session: &Session) -> Result<()> {
+        self.artifacts.initialize_session_artifacts(session.id)?;
+
+        let mut fields = Map::new();
+        fields.insert(
+            "target".to_string(),
+            serde_json::to_value(&session.target)
+                .unwrap_or_else(|_| Value::String("<serialize error>".to_string())),
+        );
+        self.artifacts.append_event(
+            session.id,
+            &session_event(
+                "session_created",
+                session,
+                None,
+                Some("create_session".to_string()),
+                None,
+                None,
+                None,
+                fields,
+            ),
+        )?;
+        self.artifacts.append_transcript(
+            session.id,
+            &format!(
+                "[{}] session created state={:?} backend={} target={:?}\n",
+                now_unix_ms(),
+                session.state,
+                session.backend,
+                session.target
+            ),
+        )?;
+
+        Ok(())
+    }
+
+    fn audit_rejected_eval(&self, request: &EvalSession, error: &DbgFlowError) {
+        let Ok(session) = self.query_session(request.session_id) else {
+            return;
+        };
+        let command_id = SessionId::new().to_string();
+        let started_at_unix_ms = now_unix_ms();
+        let error = error.to_string();
+        self.write_command_record_best_effort(
+            request.session_id,
+            &CommandArtifactRecord {
+                command_id: command_id.clone(),
+                command: request.command.clone(),
+                status: "Rejected".to_string(),
+                output_path: None,
+                started_at_unix_ms,
+                duration_ms: Some(0),
+                output_bytes: None,
+                warnings: Vec::new(),
+                error: Some(error.clone()),
+                backend_session_id: session.backend_session_id.clone(),
+            },
+        );
+        self.record_session_event_best_effort(
+            request.session_id,
+            session_event(
+                "eval_rejected",
+                &session,
+                Some(session.state),
+                Some(request.command.clone()),
+                Some(command_id.clone()),
+                None,
+                Some(error.clone()),
+                Map::new(),
+            ),
+        );
+        self.append_transcript_best_effort(
+            request.session_id,
+            &format!(
+                "[{}] eval rejected command_id={} command={} error={}\n",
+                now_unix_ms(),
+                command_id,
+                request.command,
+                error
+            ),
+        );
+    }
+
+    fn write_command_record_best_effort(
+        &self,
+        session_id: SessionId,
+        record: &CommandArtifactRecord,
+    ) {
+        if let Err(error) = self.artifacts.append_command_record(session_id, record) {
+            self.log(
+                LogEvent::new(LogLevel::Warn, "session", "command_artifact_record_failed")
+                    .session_id(session_id)
+                    .field("command_id", record.command_id.clone())
+                    .error(error.to_string()),
+            );
+        }
+    }
+
+    fn record_session_event_best_effort(&self, session_id: SessionId, event: SessionArtifactEvent) {
+        if let Err(error) = self.artifacts.append_event(session_id, &event) {
+            self.log(
+                LogEvent::new(LogLevel::Warn, "session", "session_artifact_event_failed")
+                    .session_id(session_id)
+                    .field("event", event.event)
+                    .error(error.to_string()),
+            );
+        }
+    }
+
+    fn append_transcript_best_effort(&self, session_id: SessionId, text: &str) {
+        if let Err(error) = self.artifacts.append_transcript(session_id, text) {
+            self.log(
+                LogEvent::new(
+                    LogLevel::Warn,
+                    "session",
+                    "session_transcript_append_failed",
+                )
+                .session_id(session_id)
+                .error(error.to_string()),
+            );
+        }
+    }
+
     fn finish_worker_close(&self, session_id: SessionId, close_result: Result<()>) {
         let _ = self.remove_worker(session_id);
+        let mut audit_event = None;
+        let mut transcript = None;
+        let mut finalized_session = None;
+        let mut finalized_operation = None;
         if let Ok(mut sessions) = self.sessions.lock() {
             if let Some(session) = sessions.get_mut(&session_id) {
+                let previous_state = session.state;
                 match close_result {
                     Ok(()) => {
                         self.log(
                             LogEvent::new(LogLevel::Info, "session", "worker_close_finished")
                                 .session_id(session_id),
                         );
-                        finalize_canceled_operation(
+                        finalized_operation = finalize_canceled_operation(
                             session,
                             OperationStatus::Canceled,
                             "operation canceled by close_session".to_string(),
                         );
                         session.state = SessionState::Closed;
                         session.error = None;
+                        let updated = session.clone();
+                        let mut fields = Map::new();
+                        fields.insert("status".to_string(), Value::String("Closed".to_string()));
+                        audit_event = Some(session_event(
+                            "worker_close_finished",
+                            &updated,
+                            Some(previous_state),
+                            Some("close_session".to_string()),
+                            None,
+                            None,
+                            None,
+                            fields,
+                        ));
+                        transcript = Some(format!(
+                            "[{}] worker close finished new_state={:?}\n",
+                            now_unix_ms(),
+                            updated.state
+                        ));
+                        finalized_session = Some(updated);
                     }
                     Err(error) => {
+                        let error = error.to_string();
                         self.log(
                             LogEvent::new(LogLevel::Error, "session", "worker_close_failed")
                                 .session_id(session_id)
-                                .error(error.to_string()),
+                                .error(error.clone()),
                         );
-                        finalize_canceled_operation(
+                        finalized_operation = finalize_canceled_operation(
                             session,
                             OperationStatus::Failed,
-                            error.to_string(),
+                            error.clone(),
                         );
                         session.state = SessionState::Error;
-                        session.error = Some(error.to_string());
+                        session.error = Some(error.clone());
+                        let updated = session.clone();
+                        let mut fields = Map::new();
+                        fields.insert("status".to_string(), Value::String("Error".to_string()));
+                        audit_event = Some(session_event(
+                            "worker_close_failed",
+                            &updated,
+                            Some(previous_state),
+                            Some("close_session".to_string()),
+                            None,
+                            None,
+                            Some(error.clone()),
+                            fields,
+                        ));
+                        transcript = Some(format!(
+                            "[{}] worker close failed new_state={:?} error={}\n",
+                            now_unix_ms(),
+                            updated.state,
+                            error
+                        ));
+                        finalized_session = Some(updated);
                     }
                 }
                 session.updated_at_unix_ms = now_unix_ms();
                 session.current_operation = None;
             }
+        }
+        if let Some(event) = audit_event {
+            self.record_session_event_best_effort(session_id, event);
+        }
+        if let Some(transcript) = transcript {
+            self.append_transcript_best_effort(session_id, &transcript);
+        }
+        if let (Some(session), Some(operation)) = (finalized_session, finalized_operation) {
+            self.write_command_record_best_effort(
+                session_id,
+                &command_record_from_operation(&operation, session.backend_session_id.clone()),
+            );
+            self.record_session_event_best_effort(
+                session_id,
+                operation_artifact_event(
+                    &session,
+                    Some(SessionState::Closing),
+                    &operation,
+                    match operation.status {
+                        OperationStatus::Canceled => "eval_canceled",
+                        OperationStatus::Failed => "eval_failed",
+                        OperationStatus::Finished => "eval_finished",
+                        OperationStatus::CancelRequested => "eval_cancel_requested",
+                        OperationStatus::Running => "eval_running",
+                    },
+                ),
+            );
+            self.append_transcript_best_effort(
+                session_id,
+                &format!(
+                    "[{}] {} command_id={} command={} error={}\n",
+                    now_unix_ms(),
+                    match operation.status {
+                        OperationStatus::Canceled => "eval_canceled",
+                        OperationStatus::Failed => "eval_failed",
+                        OperationStatus::Finished => "eval_finished",
+                        OperationStatus::CancelRequested => "eval_cancel_requested",
+                        OperationStatus::Running => "eval_running",
+                    },
+                    operation.command_id,
+                    operation.command,
+                    operation.error.unwrap_or_default()
+                ),
+            );
         }
         self.notify_session_updated(session_id);
     }
@@ -766,6 +1125,7 @@ impl SessionManager {
                             should_close_worker = true;
                             closing_state = Some(session.state);
                         } else {
+                            let previous_state = session.state;
                             session.backend = worker_session.backend;
                             session.backend_session_id =
                                 Some(worker_session.backend_session_id.clone());
@@ -774,7 +1134,36 @@ impl SessionManager {
                             session.warnings = worker_session.warnings;
                             session.current_operation = None;
                             session.error = None;
+                            let updated = session.clone();
+                            let mut fields = Map::new();
+                            fields.insert(
+                                "duration_ms".to_string(),
+                                Value::Number(serde_json::Number::from(duration_ms as u64)),
+                            );
+                            let audit_event = session_event(
+                                "worker_startup_finished",
+                                &updated,
+                                Some(previous_state),
+                                Some("create_session".to_string()),
+                                None,
+                                None,
+                                None,
+                                fields,
+                            );
+                            let transcript = format!(
+                                "[{}] worker startup finished backend={} backend_session_id={} new_state={:?} duration_ms={}\n",
+                                now_unix_ms(),
+                                updated.backend,
+                                updated
+                                    .backend_session_id
+                                    .as_deref()
+                                    .unwrap_or(""),
+                                updated.state,
+                                duration_ms
+                            );
                             drop(sessions);
+                            self.record_session_event_best_effort(session_id, audit_event);
+                            self.append_transcript_best_effort(session_id, &transcript);
                             self.notify_session_updated(session_id);
                             if let Some(worker) = self.worker(session_id) {
                                 self.spawn_worker_monitor(session_id, worker);
@@ -799,28 +1188,81 @@ impl SessionManager {
                 if let Some(worker) = self.remove_worker(session_id) {
                     let _ = worker.kill("startup_failed");
                 }
+                let error = error.to_string();
                 self.log(
                     LogEvent::new(LogLevel::Error, "session", "worker_startup_failed")
                         .session_id(session_id)
                         .operation("create_session")
                         .duration_ms(duration_ms)
-                        .error(error.to_string()),
+                        .error(error.clone()),
                 );
                 if let Ok(mut sessions) = self.sessions.lock() {
                     if let Some(session) = sessions.get_mut(&session_id) {
                         if session.state == SessionState::Closing {
+                            let previous_state = session.state;
                             session.state = SessionState::Closed;
                             session.updated_at_unix_ms = now_unix_ms();
                             session.current_operation = None;
                             session.error = None;
+                            let updated = session.clone();
+                            let mut fields = Map::new();
+                            fields.insert(
+                                "duration_ms".to_string(),
+                                Value::Number(serde_json::Number::from(duration_ms as u64)),
+                            );
+                            let audit_event = session_event(
+                                "worker_startup_failed_after_close",
+                                &updated,
+                                Some(previous_state),
+                                Some("create_session".to_string()),
+                                None,
+                                None,
+                                Some(error.clone()),
+                                fields,
+                            );
+                            let transcript = format!(
+                                "[{}] worker startup failed after close new_state={:?} error={} duration_ms={}\n",
+                                now_unix_ms(),
+                                updated.state,
+                                error,
+                                duration_ms
+                            );
                             drop(sessions);
+                            self.record_session_event_best_effort(session_id, audit_event);
+                            self.append_transcript_best_effort(session_id, &transcript);
                             self.notify_session_updated(session_id);
                         } else if !session.state.is_terminal() {
+                            let previous_state = session.state;
                             session.state = SessionState::Error;
                             session.updated_at_unix_ms = now_unix_ms();
                             session.current_operation = None;
-                            session.error = Some(error.to_string());
+                            session.error = Some(error.clone());
+                            let updated = session.clone();
+                            let mut fields = Map::new();
+                            fields.insert(
+                                "duration_ms".to_string(),
+                                Value::Number(serde_json::Number::from(duration_ms as u64)),
+                            );
+                            let audit_event = session_event(
+                                "worker_startup_failed",
+                                &updated,
+                                Some(previous_state),
+                                Some("create_session".to_string()),
+                                None,
+                                None,
+                                Some(error.clone()),
+                                fields,
+                            );
+                            let transcript = format!(
+                                "[{}] worker startup failed new_state={:?} error={} duration_ms={}\n",
+                                now_unix_ms(),
+                                updated.state,
+                                error,
+                                duration_ms
+                            );
                             drop(sessions);
+                            self.record_session_event_best_effort(session_id, audit_event);
+                            self.append_transcript_best_effort(session_id, &transcript);
                             self.notify_session_updated(session_id);
                         }
                     }
@@ -842,6 +1284,7 @@ impl SessionManager {
         let workers = Arc::downgrade(&self.workers);
         let event_subscribers = Arc::downgrade(&self.event_subscribers);
         let logger = self.logger.clone();
+        let artifacts = self.artifacts.clone();
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(250));
             let exited = match worker.has_exited() {
@@ -854,6 +1297,7 @@ impl SessionManager {
                         &workers,
                         &event_subscribers,
                         &logger,
+                        &artifacts,
                     );
                     return;
                 }
@@ -868,6 +1312,7 @@ impl SessionManager {
                 &workers,
                 &event_subscribers,
                 &logger,
+                &artifacts,
             );
             return;
         });
@@ -898,7 +1343,11 @@ fn state_for_target(target: &DebugTarget) -> SessionState {
     }
 }
 
-fn finalize_canceled_operation(session: &mut Session, status: OperationStatus, error: String) {
+fn finalize_canceled_operation(
+    session: &mut Session,
+    status: OperationStatus,
+    error: String,
+) -> Option<OperationSummary> {
     let now = now_unix_ms();
     if let Some(operation) = session.last_operation.as_mut() {
         if matches!(
@@ -909,8 +1358,10 @@ fn finalize_canceled_operation(session: &mut Session, status: OperationStatus, e
             operation.finished_at_unix_ms = Some(now);
             operation.duration_ms = Some(now.saturating_sub(operation.started_at_unix_ms));
             operation.error = Some(error);
+            return Some(operation.clone());
         }
     }
+    None
 }
 
 fn mark_worker_unavailable(
@@ -920,21 +1371,42 @@ fn mark_worker_unavailable(
     workers: &Weak<WorkerRegistry>,
     event_subscribers: &Weak<Mutex<Vec<mpsc::Sender<SessionId>>>>,
     logger: &Arc<dyn LogSink>,
+    artifacts: &ArtifactManager,
 ) {
     let Some(sessions) = sessions.upgrade() else {
         return;
     };
     let mut should_notify = false;
+    let mut audit_event = None;
+    let mut transcript = None;
     if let Ok(mut sessions) = sessions.lock() {
         if let Some(session) = sessions.get_mut(&session_id) {
             if session.state == SessionState::Closing || session.state.is_terminal() {
                 return;
             }
+            let previous_state = session.state;
             finalize_canceled_operation(session, OperationStatus::Failed, error.clone());
             session.state = SessionState::Error;
             session.updated_at_unix_ms = now_unix_ms();
             session.current_operation = None;
             session.error = Some(error.clone());
+            let updated = session.clone();
+            audit_event = Some(session_event(
+                "worker_exited_unexpectedly",
+                &updated,
+                Some(previous_state),
+                None,
+                None,
+                None,
+                Some(error.clone()),
+                Map::new(),
+            ));
+            transcript = Some(format!(
+                "[{}] worker unavailable new_state={:?} error={}\n",
+                now_unix_ms(),
+                updated.state,
+                error
+            ));
             should_notify = true;
         }
     }
@@ -947,6 +1419,28 @@ fn mark_worker_unavailable(
                 .session_id(session_id)
                 .error(error),
         );
+        if let Some(event) = audit_event {
+            if let Err(error) = artifacts.append_event(session_id, &event) {
+                logger.log(
+                    LogEvent::new(LogLevel::Warn, "session", "session_artifact_event_failed")
+                        .session_id(session_id)
+                        .error(error.to_string()),
+                );
+            }
+        }
+        if let Some(transcript) = transcript {
+            if let Err(error) = artifacts.append_transcript(session_id, &transcript) {
+                logger.log(
+                    LogEvent::new(
+                        LogLevel::Warn,
+                        "session",
+                        "session_transcript_append_failed",
+                    )
+                    .session_id(session_id)
+                    .error(error.to_string()),
+                );
+            }
+        }
         if let Some(event_subscribers) = event_subscribers.upgrade() {
             if let Ok(mut subscribers) = event_subscribers.lock() {
                 subscribers.retain(|subscriber| subscriber.send(session_id).is_ok());
@@ -960,6 +1454,101 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+fn session_event(
+    event: impl Into<String>,
+    session: &Session,
+    previous_state: Option<SessionState>,
+    operation: Option<String>,
+    command_id: Option<String>,
+    artifact_path: Option<PathBuf>,
+    error: Option<String>,
+    fields: Map<String, Value>,
+) -> SessionArtifactEvent {
+    SessionArtifactEvent {
+        timestamp_unix_ms: now_unix_ms(),
+        event: event.into(),
+        session_id: session.id.to_string(),
+        previous_state: previous_state.map(|state| format!("{state:?}")),
+        new_state: Some(format!("{:?}", session.state)),
+        backend: Some(session.backend.clone()),
+        backend_session_id: session.backend_session_id.clone(),
+        operation,
+        command_id,
+        artifact_path,
+        error,
+        fields,
+    }
+}
+
+fn operation_artifact_event(
+    session: &Session,
+    previous_state: Option<SessionState>,
+    operation: &OperationSummary,
+    event: &'static str,
+) -> SessionArtifactEvent {
+    let mut fields = Map::new();
+    fields.insert(
+        "status".to_string(),
+        Value::String(operation_status_label(operation.status).to_string()),
+    );
+    if let Some(duration_ms) = operation.duration_ms {
+        fields.insert(
+            "duration_ms".to_string(),
+            Value::Number(serde_json::Number::from(duration_ms as u64)),
+        );
+    }
+    if let Some(output_bytes) = operation.output_bytes {
+        fields.insert(
+            "output_bytes".to_string(),
+            Value::Number(serde_json::Number::from(output_bytes as u64)),
+        );
+    }
+    session_event(
+        event,
+        session,
+        previous_state,
+        Some(operation.command.clone()),
+        Some(operation.command_id.clone()),
+        operation
+            .artifact
+            .as_ref()
+            .map(|artifact| artifact.path.clone()),
+        operation.error.clone(),
+        fields,
+    )
+}
+
+fn command_record_from_operation(
+    operation: &OperationSummary,
+    backend_session_id: Option<String>,
+) -> CommandArtifactRecord {
+    CommandArtifactRecord {
+        command_id: operation.command_id.clone(),
+        command: operation.command.clone(),
+        status: operation_status_label(operation.status).to_string(),
+        output_path: operation
+            .artifact
+            .as_ref()
+            .map(|artifact| artifact.path.clone()),
+        started_at_unix_ms: operation.started_at_unix_ms,
+        duration_ms: operation.duration_ms,
+        output_bytes: operation.output_bytes,
+        warnings: Vec::new(),
+        error: operation.error.clone(),
+        backend_session_id,
+    }
+}
+
+fn operation_status_label(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::Running => "Running",
+        OperationStatus::CancelRequested => "CancelRequested",
+        OperationStatus::Canceled => "Canceled",
+        OperationStatus::Finished => "Finished",
+        OperationStatus::Failed => "Failed",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

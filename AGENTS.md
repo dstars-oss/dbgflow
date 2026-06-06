@@ -11,9 +11,9 @@ dbgflow 是面向 Windows 调试自动化的 MCP server / skills 工具链。
 核心职责：
 
 * 管理调试 session 生命周期。
-* 对外暴露安全、结构化的调试工具接口。
+* 对外暴露安全、可审计的调试工具接口。
 * 对内适配 Windows 调试后端。
-* 支持受控文本调试命令、结构化调试 API 和未来高级调试语义。
+* 支持受控文本调试命令和未来高级调试语义。
 * 管理调试日志、输出和 artifacts。
 
 本项目不是 shell wrapper，也不是无限制本地命令执行器。
@@ -36,7 +36,7 @@ MCP Tool Layer
 * 调试后端必须通过 `DebugBackend` 抽象接入。
 * backend 选择属于内部实现细节，不作为常规公开 tool 暴露。
 * tool handler 保持薄层，业务逻辑放入 session / backend / policy / artifacts 等核心层。
-* 新增能力优先扩展抽象层和结构化工具，不在 tool handler 中堆积逻辑。
+* 新增能力优先扩展抽象层和核心层，不在 tool handler 中堆积逻辑。
 
 ## 3. Tool API 原则
 
@@ -52,14 +52,13 @@ close_session
 
 `create_session` 采用 get-or-create 语义：同一 target 已存在 active session 时返回现有详情，否则创建新 session 并返回相同详情结构。
 
-后续 tool 应优先表达调试目标或调试动作，例如：
+后续 tool 应优先表达调试目标、会话控制或受控配置动作，例如：
 
 ```text
 open_dump
-analyze
-get_stack
-list_modules
+set_symbols
 continue_until_event
+break_execution
 ```
 
 谨慎开放文本命令接口，例如：
@@ -70,7 +69,7 @@ eval
 
 文本命令接口必须经过 policy 检查。不得默认提供无限制 debugger command、shell、脚本或文件访问能力。
 
-工具返回应尽量结构化，包含 session 状态、结果、warnings 和 artifact 引用。除原始输出查看接口外，不要只返回不可解析的大段文本。
+工具返回应包含 session 状态、结果、warnings 和 artifact 引用。`eval` 可以返回调试器原始输出，但必须同时写入 artifact 并记录审计信息。
 
 ## 4. Session 规则
 
@@ -131,12 +130,12 @@ Error
 
 要求：
 
-* 默认使用 allowlist。
+* 当前默认使用 denylist policy，后续可按能力收紧为 allowlist。
 * 对危险命令使用 denylist。
 * 区分查询命令与运行控制命令。
 * 记录原始命令、输出、状态变化和错误。
 * 对输出大小设置限制。
-* 完整输出写入 artifact，工具响应只返回摘要、截断输出和 artifact 引用。
+* 完整输出写入 artifact；当前 `eval` 响应返回完整输出和 artifact 引用。
 
 允许命令优先是查询类，例如：
 
@@ -270,6 +269,6 @@ cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir D:\Repos\Proje
 * 把本项目变成通用 shell runner。
 * 将 dump、trace 或 transcript 当成普通非敏感文件。
 * 在没有状态机的情况下实现复杂运行控制。
-* 用不稳定文本解析结果冒充可靠结构化数据。
+* 用不稳定文本解析结果冒充可靠事实。
 * 静默吞掉调试器错误。
 * 自动删除用户 dump、trace 或日志文件。

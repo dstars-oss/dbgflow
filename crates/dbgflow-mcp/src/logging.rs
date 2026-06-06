@@ -77,7 +77,7 @@ fn is_managed_log_file(path: &Path) -> bool {
     (name.starts_with(LOG_PREFIX) && name.ends_with(LOG_SUFFIX)) || name == "service.log"
 }
 
-fn log_file_name(timestamp_unix_ms: u128) -> String {
+fn log_file_name(timestamp_unix_ms: u64) -> String {
     let days = (timestamp_unix_ms / 1000 / 86_400) as i64;
     let (year, month, day) = civil_from_days(days);
     format!("{LOG_PREFIX}{year:04}-{month:02}-{day:02}{LOG_SUFFIX}")

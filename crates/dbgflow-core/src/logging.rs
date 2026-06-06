@@ -12,14 +12,14 @@ pub enum LogLevel {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEvent {
-    pub timestamp_unix_ms: u128,
+    pub timestamp_unix_ms: u64,
     pub level: LogLevel,
     pub component: String,
     pub event: String,
     pub session_id: Option<String>,
     pub backend_session_id: Option<String>,
     pub operation: Option<String>,
-    pub duration_ms: Option<u128>,
+    pub duration_ms: Option<u64>,
     pub message: Option<String>,
     pub error: Option<String>,
     pub fields: Map<String, Value>,
@@ -58,7 +58,7 @@ impl LogEvent {
     }
 
     pub fn duration_ms(mut self, duration_ms: u128) -> Self {
-        self.duration_ms = Some(duration_ms);
+        self.duration_ms = Some(u128_to_u64(duration_ms));
         self
     }
 
@@ -95,9 +95,13 @@ pub fn noop_logger() -> Arc<dyn LogSink> {
     Arc::new(NoopLogSink)
 }
 
-fn now_unix_ms() -> u128 {
+fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| u128_to_u64(duration.as_millis()))
         .unwrap_or_default()
+}
+
+fn u128_to_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
 }

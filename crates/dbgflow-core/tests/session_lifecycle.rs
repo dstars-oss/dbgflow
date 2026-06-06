@@ -5,6 +5,7 @@ use dbgflow_core::session::{
     CreateSession, EvalSession, OperationStatus, SessionId, SessionManager, SessionState,
 };
 use dbgflow_core::{DbgFlowError, Result};
+use serde_json::Value;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -188,11 +189,45 @@ fn session_eval_writes_output_artifact() {
     );
     let output = fs::read_to_string(result.artifact.path).expect("read output artifact");
     assert!(output.contains("fake worker executed: k"));
+
+    let session_dir = root.join("sessions").join(session.id.to_string());
+    let transcript =
+        fs::read_to_string(session_dir.join("transcript.log")).expect("read transcript");
+    assert!(transcript.contains("session created"));
+    assert!(transcript.contains("worker startup finished"));
+    assert!(transcript.contains("eval started"));
+    assert!(transcript.contains("fake worker executed: k"));
+    assert!(transcript.contains("eval_finished"));
+
+    let events = read_jsonl(&session_dir.join("events.jsonl"));
+    assert!(events
+        .iter()
+        .any(|event| event["event"] == "session_created"));
+    assert!(events
+        .iter()
+        .any(|event| event["event"] == "worker_startup_finished"));
+    assert!(events.iter().any(|event| event["event"] == "eval_started"));
+    assert!(events.iter().any(|event| event["event"] == "eval_finished"));
+
+    let commands = read_jsonl(&session_dir.join("commands.jsonl"));
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["command"], "k");
+    assert_eq!(commands[0]["status"], "Finished");
+    assert!(commands[0]["output_path"].as_str().is_some());
+    assert_eq!(
+        commands[0]["output_bytes"].as_u64(),
+        Some(result.output.len() as u64)
+    );
+    assert!(commands[0]["backend_session_id"].as_str().is_some());
 }
 
 #[test]
 fn eval_rejects_denied_command() {
-    let manager = test_manager("deny-command", WorkerBehavior::Normal);
+    let root = test_artifact_root("deny-command");
+    let manager = SessionManager::with_worker_launcher(
+        Arc::new(TestWorkerLauncher::new(WorkerBehavior::Normal)),
+        &root,
+    );
     let session = manager
         .create_session(CreateSession {
             target: test_dump_target("deny-command-target"),
@@ -209,6 +244,22 @@ fn eval_rejects_denied_command() {
         .expect_err("deny shell");
 
     assert!(error.to_string().contains("command denied"));
+
+    let session_dir = root.join("sessions").join(session.id.to_string());
+    let commands = read_jsonl(&session_dir.join("commands.jsonl"));
+    assert!(commands.iter().any(|command| {
+        command["command"] == ".shell dir"
+            && command["status"] == "Rejected"
+            && command["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("command denied"))
+    }));
+    let events = read_jsonl(&session_dir.join("events.jsonl"));
+    assert!(events.iter().any(|event| event["event"] == "eval_rejected"));
+    let transcript =
+        fs::read_to_string(session_dir.join("transcript.log")).expect("read transcript");
+    assert!(transcript.contains("eval rejected"));
+    assert!(transcript.contains(".shell dir"));
 }
 
 #[test]
@@ -259,12 +310,13 @@ fn eval_sets_observable_operation_state() {
 fn close_session_kills_running_worker_before_waiting_for_operation_lock() {
     let state = Arc::new((Mutex::new(BlockingState::default()), Condvar::new()));
     let kill_count = Arc::new(AtomicUsize::new(0));
-    let manager = test_manager(
-        "close-running",
-        WorkerBehavior::BlockingExecute {
+    let root = test_artifact_root("close-running");
+    let manager = SessionManager::with_worker_launcher(
+        Arc::new(TestWorkerLauncher::new(WorkerBehavior::BlockingExecute {
             state: state.clone(),
             kill_count: kill_count.clone(),
-        },
+        })),
+        &root,
     );
     let session = manager
         .create_session(CreateSession {
@@ -304,6 +356,18 @@ fn close_session_kills_running_worker_before_waiting_for_operation_lock() {
         .expect("eval thread")
         .expect_err("eval canceled");
     assert!(eval_error.to_string().contains("canceled"));
+
+    let session_dir = root.join("sessions").join(session_id.to_string());
+    let commands = read_jsonl(&session_dir.join("commands.jsonl"));
+    assert!(commands.iter().any(|command| {
+        command["command"] == "k"
+            && command["status"] == "Canceled"
+            && command["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("close_session"))
+    }));
+    let events = read_jsonl(&session_dir.join("events.jsonl"));
+    assert!(events.iter().any(|event| event["event"] == "eval_canceled"));
 }
 
 #[test]
@@ -450,6 +514,15 @@ fn test_dump_target(name: &str) -> DebugTarget {
     let path = root.join("input.dmp");
     fs::write(&path, b"not a real dump").expect("write fake dump");
     DebugTarget::Dump { path }
+}
+
+fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse jsonl line"))
+        .collect()
 }
 
 fn wait_for_break(

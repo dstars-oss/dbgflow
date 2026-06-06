@@ -13,6 +13,7 @@ endpoint, and Windows service scripts:
 - per-session debug worker subprocess isolation
 - command policy
 - artifact manager
+- per-session transcript, event, command, and output artifacts
 - DbgEng backend for dump targets
 - DbgEng backend for process attach and launch targets
 - denylist-protected `eval` command support
@@ -64,7 +65,8 @@ only in a trusted local environment to allow controlled process launch. Launch
 uses a suspended Win32 process creation path and attaches DbgEng before resuming
 the target. The executable must be an existing path; shell invocation, custom
 current directories, and custom environments are not part of this MVP.
-Command output and logs are still written under the controlled artifact root.
+Command output, transcripts, command records, event records, and logs are still
+written under controlled runtime directories.
 `eval` no longer uses an allowlist, but dangerous commands such as shell
 execution, script loading, extension loading, dump writing, and memory writing
 remain denied by policy. Run-control commands update session state separately
@@ -102,8 +104,10 @@ in full and also written to session artifacts; the latest command artifact is
 also referenced from the session's `last_operation`.
 
 Runtime logs are written as daily JSONL files under `<data-dir>\logs`, and
-artifacts under `<data-dir>\artifacts`. Runtime logs are retained for 7 days;
-artifacts are not automatically removed.
+artifacts under `<data-dir>\artifacts`. Each session writes
+`sessions\<session_id>\transcript.log`, `events.jsonl`, `commands.jsonl`, and
+`outputs\<command_id>.txt`. Runtime logs are retained for 7 days; artifacts are
+not automatically removed.
 
 Install or uninstall the Windows service from PowerShell. If the session is not
 elevated, the scripts prompt for UAC elevation and continue after confirmation:
@@ -122,4 +126,6 @@ Uninstall does not delete artifacts or logs by default.
 
 Live process DbgEng integration tests are ignored by default because attach and
 launch behavior depends on local debugger permissions and target process state.
-Run them explicitly when validating live process support.
+Run them explicitly when validating live process support. The live HTTP E2E
+tests start `dbgflow-mcp http`, call `/mcp`, and cover the worker subprocess
+path for attach and launch.
