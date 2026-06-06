@@ -438,6 +438,9 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "create_session")
             .expect("create_session tool");
+        assert!(create_session["inputSchema"]["properties"]
+            .get("startup_timeout_ms")
+            .is_none());
         let target_schema = &create_session["inputSchema"]["properties"]["target"]["oneOf"];
         assert!(target_schema
             .as_array()
@@ -452,6 +455,13 @@ mod tests {
         assert!(tools.iter().any(|tool| {
             tool["name"] == "execute" && tool["inputSchema"]["required"][0] == "session_id"
         }));
+        let execute = tools
+            .iter()
+            .find(|tool| tool["name"] == "execute")
+            .expect("execute tool");
+        assert!(execute["inputSchema"]["properties"]
+            .get("timeout_ms")
+            .is_none());
         assert!(tools.iter().any(|tool| tool["name"] == "get_session"));
         assert!(tools.iter().any(|tool| tool["name"] == "set_symbols"));
     }

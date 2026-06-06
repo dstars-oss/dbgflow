@@ -39,4 +39,11 @@ impl SessionState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Closed | Self::Error)
     }
+
+    pub fn is_reusable(self) -> bool {
+        matches!(
+            self,
+            Self::Created | Self::Starting | Self::Ready | Self::Break | Self::Running
+        )
+    }
 }

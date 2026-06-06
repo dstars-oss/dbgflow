@@ -2,7 +2,7 @@
 pub mod dbgeng;
 pub mod mock;
 
-use crate::Result;
+use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -60,7 +60,6 @@ pub enum DebugTarget {
 pub struct ExecuteBackendRequest {
     pub backend_session_id: String,
     pub command: String,
-    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,5 +72,15 @@ pub trait DebugBackend: Send + Sync {
     fn info(&self) -> BackendInfo;
     fn create_session(&self, request: CreateBackendSession) -> Result<BackendSession>;
     fn execute(&self, request: ExecuteBackendRequest) -> Result<ExecuteBackendResult>;
+    fn cancel_startup(&self, _correlation_id: &str) -> Result<()> {
+        Err(DbgFlowError::Backend(
+            "backend does not support startup cancellation".to_string(),
+        ))
+    }
+    fn cancel_session(&self, _backend_session_id: &str) -> Result<()> {
+        Err(DbgFlowError::Backend(
+            "backend does not support session cancellation".to_string(),
+        ))
+    }
     fn close_session(&self, backend_session_id: &str) -> Result<()>;
 }

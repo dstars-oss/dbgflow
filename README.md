@@ -67,6 +67,14 @@ execution, script loading, extension loading, dump writing, and memory writing
 remain denied by policy. Run-control commands update session state separately
 from ordinary queries.
 
+`execute` is synchronous and does not expose per-command timeout knobs. While a
+command is running, the session exposes `current_operation` plus a
+`last_operation` summary with status, timing, artifact, error, and output-size
+fields. Clients can observe progress with `get_session`, `resources/read`, or
+the HTTP resource update stream. Legacy timeout fields are accepted for
+compatibility, ignored, and logged as warnings. `close_session` requests backend
+cancellation before closing a session that is currently executing a command.
+
 Run the MCP server over stdio:
 
 ```text
@@ -94,7 +102,8 @@ including `notifications/resources/updated` for session state changes. `GET
 The server supports `initialize`, `notifications/initialized`, `ping`,
 `tools/list`, `tools/call`, `resources/list`, and `resources/read`. Tool
 results are returned as JSON text content. Debugger command output is returned
-in full and also written to session artifacts.
+in full and also written to session artifacts; the latest command artifact is
+also referenced from the session's `last_operation`.
 
 By default, the MCP server writes artifacts under the workspace-level
 `artifacts/` directory. Set `DBGFLOW_ARTIFACT_ROOT` to override that location

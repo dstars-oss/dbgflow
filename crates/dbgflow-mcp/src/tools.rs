@@ -99,11 +99,6 @@ impl ToolService {
                                     "additionalProperties": false
                                 }
                             ]
-                        },
-                        "startup_timeout_ms": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Optional backend startup/open-target timeout in milliseconds. Symbol loading commands use execute.timeout_ms instead."
                         }
                     },
                     "additionalProperties": false
@@ -161,11 +156,6 @@ impl ToolService {
                         "command": {
                             "type": "string",
                             "description": "Debugger command. Dangerous commands and command separators are denied by policy."
-                        },
-                        "timeout_ms": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Optional command timeout in milliseconds."
                         }
                     },
                     "required": ["session_id", "command"],
@@ -191,11 +181,6 @@ impl ToolService {
                         "append": {
                             "type": "boolean",
                             "description": "Append to the current symbol path instead of replacing it."
-                        },
-                        "timeout_ms": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Optional command timeout in milliseconds."
                         }
                     },
                     "required": ["session_id", "paths"],

@@ -17,7 +17,7 @@ use windows::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugClient, IDebugClient4, IDebugClient5, IDebugControl4, IDebugOutputCallbacksWide,
     IDebugOutputCallbacksWide_Impl, DEBUG_ATTACH_DEFAULT, DEBUG_END_PASSIVE, DEBUG_EXECUTE_DEFAULT,
-    DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_STATUS_GO,
+    DEBUG_INTERRUPT_EXIT, DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_STATUS_GO,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
@@ -33,7 +33,8 @@ mod resolver;
 
 pub use resolver::{resolve_dbgeng, DbgEngLocation, DbgEngSource};
 
-const DEFAULT_WAIT_TIMEOUT_MS: u32 = 120_000;
+const INFINITE_WAIT_MS: u32 = u32::MAX;
+const CLOSE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const S_OK: HRESULT = HRESULT(0);
 const S_FALSE: HRESULT = HRESULT(1);
 const E_UNEXPECTED: HRESULT = HRESULT(0x8000FFFFu32 as i32);
@@ -41,6 +42,7 @@ const E_UNEXPECTED: HRESULT = HRESULT(0x8000FFFFu32 as i32);
 pub struct DbgEngBackend {
     next_id: AtomicU64,
     sessions: Mutex<HashMap<String, WorkerHandle>>,
+    pending_startups: Mutex<HashMap<String, Arc<StartupCancellation>>>,
     logger: Arc<dyn LogSink>,
 }
 
@@ -53,6 +55,7 @@ impl DbgEngBackend {
         Self {
             next_id: AtomicU64::new(0),
             sessions: Mutex::new(HashMap::new()),
+            pending_startups: Mutex::new(HashMap::new()),
             logger,
         }
     }
@@ -92,6 +95,12 @@ impl DebugBackend for DbgEngBackend {
         let worker_id = id.clone();
         let logger = self.logger.clone();
         let correlation_id = request.correlation_id.clone();
+        let startup_key = correlation_id.clone().unwrap_or_else(|| id.clone());
+        let startup_cancel = Arc::new(StartupCancellation::default());
+        self.pending_startups
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("dbgeng startup map poisoned".to_string()))?
+            .insert(startup_key.clone(), startup_cancel.clone());
         let join = thread::spawn(move || {
             worker_main(
                 worker_id,
@@ -100,12 +109,19 @@ impl DebugBackend for DbgEngBackend {
                 logger,
                 rx,
                 init_tx,
+                startup_cancel,
             )
         });
 
-        let warnings = init_rx.recv().map_err(|_| {
-            DbgFlowError::Backend("dbgeng worker exited during startup".to_string())
-        })??;
+        let init_result = init_rx
+            .recv()
+            .map_err(|_| DbgFlowError::Backend("dbgeng worker exited during startup".to_string()));
+        let _ = self
+            .pending_startups
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("dbgeng startup map poisoned".to_string()))?
+            .remove(&startup_key);
+        let init = init_result??;
 
         self.sessions
             .lock()
@@ -115,10 +131,14 @@ impl DebugBackend for DbgEngBackend {
                 WorkerHandle {
                     tx,
                     join: Some(join),
+                    interrupt: init.interrupt,
                 },
             );
 
-        Ok(BackendSession { id, warnings })
+        Ok(BackendSession {
+            id,
+            warnings: init.warnings,
+        })
     }
 
     fn execute(&self, request: ExecuteBackendRequest) -> Result<ExecuteBackendResult> {
@@ -138,14 +158,40 @@ impl DebugBackend for DbgEngBackend {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         tx.send(WorkerCommand::Execute {
             command: request.command,
-            timeout_ms: request.timeout_ms,
             reply: reply_tx,
         })
         .map_err(|_| DbgFlowError::Backend("dbgeng worker is not available".to_string()))?;
 
         reply_rx
-            .recv_timeout(reply_timeout(request.timeout_ms))
-            .map_err(|_| DbgFlowError::Backend("dbgeng execute timed out".to_string()))?
+            .recv()
+            .map_err(|_| DbgFlowError::Backend("dbgeng worker is not available".to_string()))?
+    }
+
+    fn cancel_session(&self, backend_session_id: &str) -> Result<()> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("dbgeng session map poisoned".to_string()))?;
+        let interrupt = sessions
+            .get(backend_session_id)
+            .map(|handle| &handle.interrupt)
+            .ok_or_else(|| {
+                DbgFlowError::Backend(format!("dbgeng session not found: {backend_session_id}"))
+            })?;
+        interrupt.interrupt()
+    }
+
+    fn cancel_startup(&self, correlation_id: &str) -> Result<()> {
+        let pending = self
+            .pending_startups
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("dbgeng startup map poisoned".to_string()))?
+            .get(correlation_id)
+            .cloned()
+            .ok_or_else(|| {
+                DbgFlowError::Backend(format!("dbgeng startup not found: {correlation_id}"))
+            })?;
+        pending.cancel()
     }
 
     fn close_session(&self, backend_session_id: &str) -> Result<()> {
@@ -175,7 +221,7 @@ impl DebugBackend for DbgEngBackend {
             ));
         }
 
-        let result = match reply_rx.recv_timeout(Duration::from_secs(10)) {
+        let result = match reply_rx.recv_timeout(CLOSE_REPLY_TIMEOUT) {
             Ok(result) => result,
             Err(_) => {
                 self.logger.log(
@@ -183,6 +229,7 @@ impl DebugBackend for DbgEngBackend {
                         .backend_session_id(backend_session_id.to_string())
                         .error("dbgeng close timed out"),
                 );
+                let _ = self.remove_worker_handle(backend_session_id);
                 return Err(DbgFlowError::Backend("dbgeng close timed out".to_string()));
             }
         };
@@ -212,12 +259,178 @@ impl DbgEngBackend {
 struct WorkerHandle {
     tx: mpsc::Sender<WorkerCommand>,
     join: Option<thread::JoinHandle<()>>,
+    interrupt: DbgEngInterrupt,
+}
+
+struct WorkerInit {
+    warnings: Vec<String>,
+    interrupt: DbgEngInterrupt,
+}
+
+struct DbgEngInterrupt {
+    control: SendableDebugControl,
+    logger: Arc<dyn LogSink>,
+    correlation_id: Option<String>,
+    backend_session_id: String,
+}
+
+impl Clone for DbgEngInterrupt {
+    fn clone(&self) -> Self {
+        Self {
+            control: self.control.clone(),
+            logger: self.logger.clone(),
+            correlation_id: self.correlation_id.clone(),
+            backend_session_id: self.backend_session_id.clone(),
+        }
+    }
+}
+
+impl DbgEngInterrupt {
+    fn interrupt(&self) -> Result<()> {
+        self.logger.log(
+            dbgeng_event(
+                LogLevel::Info,
+                "interrupt_requested",
+                &self.correlation_id,
+                Some(&self.backend_session_id),
+            )
+            .field("interrupt_flag", "DEBUG_INTERRUPT_EXIT"),
+        );
+        unsafe {
+            self.control
+                .set_interrupt(DEBUG_INTERRUPT_EXIT)
+                .map_err(|error| {
+                    self.logger.log(
+                        dbgeng_event(
+                            LogLevel::Error,
+                            "interrupt_failed",
+                            &self.correlation_id,
+                            Some(&self.backend_session_id),
+                        )
+                        .field("interrupt_flag", "DEBUG_INTERRUPT_EXIT")
+                        .error(error.to_string()),
+                    );
+                    DbgFlowError::Backend(format!(
+                        "SetInterrupt(DEBUG_INTERRUPT_EXIT) failed: {error}"
+                    ))
+                })?;
+        }
+        self.logger.log(
+            dbgeng_event(
+                LogLevel::Info,
+                "interrupt_finished",
+                &self.correlation_id,
+                Some(&self.backend_session_id),
+            )
+            .field("interrupt_result", "requested"),
+        );
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct StartupCancellation {
+    state: Mutex<StartupCancellationState>,
+}
+
+#[derive(Default)]
+struct StartupCancellationState {
+    cancel_requested: bool,
+    interrupt: Option<DbgEngInterrupt>,
+}
+
+impl StartupCancellation {
+    fn cancel(&self) -> Result<()> {
+        let interrupt = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| DbgFlowError::Backend("dbgeng startup cancel lock poisoned".into()))?;
+            state.cancel_requested = true;
+            state.interrupt.clone()
+        };
+        if let Some(interrupt) = interrupt {
+            interrupt.interrupt()?;
+        }
+        Ok(())
+    }
+
+    fn install_interrupt(&self, interrupt: DbgEngInterrupt) -> Result<()> {
+        let cancel_requested = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| DbgFlowError::Backend("dbgeng startup cancel lock poisoned".into()))?;
+            state.interrupt = Some(interrupt.clone());
+            state.cancel_requested
+        };
+        if cancel_requested {
+            interrupt.interrupt()?;
+            return Err(DbgFlowError::Backend("dbgeng startup canceled".to_string()));
+        }
+        Ok(())
+    }
+
+    fn check_canceled(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("dbgeng startup cancel lock poisoned".into()))?;
+        if state.cancel_requested {
+            return Err(DbgFlowError::Backend("dbgeng startup canceled".to_string()));
+        }
+        Ok(())
+    }
+}
+
+struct SendableDebugControl {
+    raw: usize,
+}
+
+// dbgeng documents IDebugControl::SetInterrupt as callable from any thread. This
+// wrapper owns one AddRef'd COM pointer and only exposes that interrupt call.
+unsafe impl Send for SendableDebugControl {}
+unsafe impl Sync for SendableDebugControl {}
+
+impl SendableDebugControl {
+    fn new(control: &IDebugControl4) -> Self {
+        Self {
+            raw: control.clone().into_raw() as usize,
+        }
+    }
+
+    unsafe fn set_interrupt(&self, flags: u32) -> windows::core::Result<()> {
+        let raw = self.raw as *mut c_void;
+        let control = IDebugControl4::from_raw_borrowed(&raw).expect("stored dbgeng control");
+        control.SetInterrupt(flags)
+    }
+}
+
+impl Clone for SendableDebugControl {
+    fn clone(&self) -> Self {
+        let raw = self.raw as *mut c_void;
+        let control = unsafe {
+            IDebugControl4::from_raw_borrowed(&raw)
+                .expect("stored dbgeng control")
+                .clone()
+        };
+        Self {
+            raw: control.into_raw() as usize,
+        }
+    }
+}
+
+impl Drop for SendableDebugControl {
+    fn drop(&mut self) {
+        unsafe {
+            drop(IDebugControl4::from_raw(self.raw as *mut c_void));
+        }
+    }
 }
 
 enum WorkerCommand {
     Execute {
         command: String,
-        timeout_ms: u64,
         reply: mpsc::SyncSender<Result<ExecuteBackendResult>>,
     },
     Close {
@@ -231,27 +444,28 @@ fn worker_main(
     correlation_id: Option<String>,
     logger: Arc<dyn LogSink>,
     rx: mpsc::Receiver<WorkerCommand>,
-    init_tx: mpsc::SyncSender<Result<Vec<String>>>,
+    init_tx: mpsc::SyncSender<Result<WorkerInit>>,
+    startup_cancel: Arc<StartupCancellation>,
 ) {
-    let mut session = match DbgEngSession::open_target(&id, correlation_id, &target, logger) {
-        Ok(session) => {
-            let _ = init_tx.send(Ok(session.warnings.clone()));
-            session
-        }
-        Err(error) => {
-            let _ = init_tx.send(Err(error));
-            return;
-        }
-    };
+    let mut session =
+        match DbgEngSession::open_target(&id, correlation_id, &target, logger, startup_cancel) {
+            Ok(session) => {
+                let _ = init_tx.send(Ok(WorkerInit {
+                    warnings: session.warnings.clone(),
+                    interrupt: session.interrupt_handle(),
+                }));
+                session
+            }
+            Err(error) => {
+                let _ = init_tx.send(Err(error));
+                return;
+            }
+        };
 
     while let Ok(command) = rx.recv() {
         match command {
-            WorkerCommand::Execute {
-                command,
-                timeout_ms,
-                reply,
-            } => {
-                let _ = reply.send(session.execute(&command, timeout_ms));
+            WorkerCommand::Execute { command, reply } => {
+                let _ = reply.send(session.execute(&command));
             }
             WorkerCommand::Close { reply } => {
                 let result = session.close();
@@ -283,8 +497,10 @@ impl DbgEngSession {
         correlation_id: Option<String>,
         target: &DebugTarget,
         logger: Arc<dyn LogSink>,
+        startup_cancel: Arc<StartupCancellation>,
     ) -> Result<Self> {
         let startup_started = Instant::now();
+        startup_cancel.check_canceled()?;
         logger.log(
             dbgeng_event(
                 LogLevel::Info,
@@ -344,6 +560,12 @@ impl DbgEngSession {
         let control: IDebugControl4 = client.cast().map_err(|error| {
             DbgFlowError::Backend(format!("query IDebugControl4 failed: {error}"))
         })?;
+        startup_cancel.install_interrupt(DbgEngInterrupt {
+            control: SendableDebugControl::new(&control),
+            logger: logger.clone(),
+            correlation_id: correlation_id.clone(),
+            backend_session_id: backend_session_id.to_string(),
+        })?;
         logger.log(
             dbgeng_event(
                 LogLevel::Info,
@@ -362,57 +584,58 @@ impl DbgEngSession {
 
         let mut launched_process = None;
 
-        unsafe {
-            let callback_started = Instant::now();
-            client5
-                .SetOutputCallbacksWide(&callbacks)
-                .map_err(|error| {
-                    DbgFlowError::Backend(format!("SetOutputCallbacksWide failed: {error}"))
-                })?;
-            logger.log(
-                dbgeng_event(
-                    LogLevel::Info,
-                    "set_output_callbacks_finished",
-                    &correlation_id,
-                    Some(backend_session_id),
-                )
-                .duration_ms(callback_started.elapsed().as_millis()),
-            );
+        let target_result = (|| -> Result<()> {
+            unsafe {
+                let callback_started = Instant::now();
+                client5
+                    .SetOutputCallbacksWide(&callbacks)
+                    .map_err(|error| {
+                        DbgFlowError::Backend(format!("SetOutputCallbacksWide failed: {error}"))
+                    })?;
+                logger.log(
+                    dbgeng_event(
+                        LogLevel::Info,
+                        "set_output_callbacks_finished",
+                        &correlation_id,
+                        Some(backend_session_id),
+                    )
+                    .duration_ms(callback_started.elapsed().as_millis()),
+                );
 
-            match target {
-                DebugTarget::Dump { path } => {
-                    let wide_path = to_wide_null(path);
-                    let open_started = Instant::now();
-                    client4
-                        .OpenDumpFileWide(PCWSTR(wide_path.as_ptr()), 0)
-                        .map_err(|error| {
-                            logger.log(
-                                dbgeng_event(
-                                    LogLevel::Error,
-                                    "open_dump_file_failed",
-                                    &correlation_id,
-                                    Some(backend_session_id),
-                                )
-                                .duration_ms(open_started.elapsed().as_millis())
-                                .error(error.to_string())
-                                .field("path", path.display().to_string()),
-                            );
-                            DbgFlowError::Backend(format!("OpenDumpFileWide failed: {error}"))
-                        })?;
-                    logger.log(
-                        dbgeng_event(
-                            LogLevel::Info,
-                            "open_dump_file_finished",
-                            &correlation_id,
-                            Some(backend_session_id),
-                        )
-                        .duration_ms(open_started.elapsed().as_millis())
-                        .field("path", path.display().to_string()),
-                    );
-                    let wait_started = Instant::now();
-                    control
-                        .WaitForEvent(0, DEFAULT_WAIT_TIMEOUT_MS)
-                        .map_err(|error| {
+                match target {
+                    DebugTarget::Dump { path } => {
+                        startup_cancel.check_canceled()?;
+                        let wide_path = to_wide_null(path);
+                        let open_started = Instant::now();
+                        client4
+                            .OpenDumpFileWide(PCWSTR(wide_path.as_ptr()), 0)
+                            .map_err(|error| {
+                                logger.log(
+                                    dbgeng_event(
+                                        LogLevel::Error,
+                                        "open_dump_file_failed",
+                                        &correlation_id,
+                                        Some(backend_session_id),
+                                    )
+                                    .duration_ms(open_started.elapsed().as_millis())
+                                    .error(error.to_string())
+                                    .field("path", path.display().to_string()),
+                                );
+                                DbgFlowError::Backend(format!("OpenDumpFileWide failed: {error}"))
+                            })?;
+                        logger.log(
+                            dbgeng_event(
+                                LogLevel::Info,
+                                "open_dump_file_finished",
+                                &correlation_id,
+                                Some(backend_session_id),
+                            )
+                            .duration_ms(open_started.elapsed().as_millis())
+                            .field("path", path.display().to_string()),
+                        );
+                        startup_cancel.check_canceled()?;
+                        let wait_started = Instant::now();
+                        control.WaitForEvent(0, INFINITE_WAIT_MS).map_err(|error| {
                             logger.log(
                                 dbgeng_event(
                                     LogLevel::Error,
@@ -422,51 +645,66 @@ impl DbgEngSession {
                                 )
                                 .duration_ms(wait_started.elapsed().as_millis())
                                 .error(error.to_string())
-                                .field("timeout_ms", DEFAULT_WAIT_TIMEOUT_MS),
+                                .field("wait_mode", "infinite"),
                             );
                             DbgFlowError::Backend(format!("WaitForEvent failed: {error}"))
                         })?;
-                    logger.log(
-                        dbgeng_event(
-                            LogLevel::Info,
-                            "wait_for_event_finished",
-                            &correlation_id,
-                            Some(backend_session_id),
-                        )
-                        .duration_ms(wait_started.elapsed().as_millis())
-                        .field("timeout_ms", DEFAULT_WAIT_TIMEOUT_MS),
-                    );
-                }
-                DebugTarget::Attach { pid } => {
-                    attach_process(&client4, *pid)?;
-                    break_process(*pid)?;
-                    control
-                        .WaitForEvent(0, DEFAULT_WAIT_TIMEOUT_MS)
-                        .map_err(|error| {
+                        logger.log(
+                            dbgeng_event(
+                                LogLevel::Info,
+                                "wait_for_event_finished",
+                                &correlation_id,
+                                Some(backend_session_id),
+                            )
+                            .duration_ms(wait_started.elapsed().as_millis())
+                            .field("wait_mode", "infinite"),
+                        );
+                    }
+                    DebugTarget::Attach { pid } => {
+                        startup_cancel.check_canceled()?;
+                        attach_process(&client4, *pid)?;
+                        break_process(*pid)?;
+                        startup_cancel.check_canceled()?;
+                        control.WaitForEvent(0, INFINITE_WAIT_MS).map_err(|error| {
                             DbgFlowError::Backend(format!(
                                 "WaitForEvent after attach failed: {error}"
                             ))
                         })?;
-                }
-                DebugTarget::Launch { executable, args } => {
-                    let mut launched = create_suspended_process(executable, args)?;
-                    attach_process(&client4, launched.pid)?;
-                    launched.resume()?;
-                    control
-                        .WaitForEvent(0, DEFAULT_WAIT_TIMEOUT_MS)
-                        .map_err(|error| {
+                    }
+                    DebugTarget::Launch { executable, args } => {
+                        startup_cancel.check_canceled()?;
+                        let mut launched = create_suspended_process(executable, args)?;
+                        attach_process(&client4, launched.pid)?;
+                        launched.resume()?;
+                        launched_process = Some(launched);
+                        startup_cancel.check_canceled()?;
+                        control.WaitForEvent(0, INFINITE_WAIT_MS).map_err(|error| {
                             DbgFlowError::Backend(format!(
                                 "WaitForEvent after launch failed: {error}"
                             ))
                         })?;
-                    launched_process = Some(launched);
-                }
-                DebugTarget::Mock => {
-                    return Err(DbgFlowError::Backend(
-                        "DbgEngSession does not support mock targets".to_string(),
-                    ));
+                    }
+                    DebugTarget::Mock => {
+                        return Err(DbgFlowError::Backend(
+                            "DbgEngSession does not support mock targets".to_string(),
+                        ));
+                    }
                 }
             }
+            Ok(())
+        })();
+
+        if let Err(error) = target_result {
+            cleanup_open_target_failure(
+                &client,
+                &client5,
+                &logger,
+                &correlation_id,
+                backend_session_id,
+                &mut launched_process,
+                &error,
+            );
+            return Err(error);
         }
 
         logger.log(
@@ -495,7 +733,16 @@ impl DbgEngSession {
         })
     }
 
-    fn execute(&mut self, command: &str, timeout_ms: u64) -> Result<ExecuteBackendResult> {
+    fn interrupt_handle(&self) -> DbgEngInterrupt {
+        DbgEngInterrupt {
+            control: SendableDebugControl::new(&self.control),
+            logger: self.logger.clone(),
+            correlation_id: self.correlation_id.clone(),
+            backend_session_id: self.backend_session_id.clone(),
+        }
+    }
+
+    fn execute(&mut self, command: &str) -> Result<ExecuteBackendResult> {
         let command_text = command.to_string();
         let _dbgeng_guard = global_dbgeng_lock().lock().map_err(|_| {
             DbgFlowError::Backend("global dbgeng operation lock poisoned".to_string())
@@ -508,8 +755,7 @@ impl DbgEngSession {
                 &self.correlation_id,
                 Some(&self.backend_session_id),
             )
-            .operation(command_text.clone())
-            .field("timeout_ms", timeout_ms),
+            .operation(command_text.clone()),
         );
         {
             let mut output = self
@@ -530,7 +776,7 @@ impl DbgEngSession {
                         ))
                     })?;
             }
-            warnings.extend(wait_for_go_event(&self.control, timeout_ms)?);
+            warnings.extend(wait_for_go_event(&self.control)?);
 
             let output = self
                 .output
@@ -743,14 +989,6 @@ fn to_wide_null(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-fn wait_timeout(timeout_ms: u64) -> u32 {
-    timeout_ms.min(u32::MAX as u64) as u32
-}
-
-fn reply_timeout(timeout_ms: u64) -> Duration {
-    Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5))
-}
-
 fn break_process(pid: u32) -> Result<()> {
     let access =
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE;
@@ -779,20 +1017,16 @@ fn attach_process(client: &IDebugClient4, pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_go_event(control: &IDebugControl4, timeout_ms: u64) -> Result<Vec<String>> {
+fn wait_for_go_event(control: &IDebugControl4) -> Result<Vec<String>> {
     let hr = unsafe {
-        (Interface::vtable(control).WaitForEvent)(
-            Interface::as_raw(control),
-            0,
-            wait_timeout(timeout_ms),
-        )
+        (Interface::vtable(control).WaitForEvent)(Interface::as_raw(control), 0, INFINITE_WAIT_MS)
     };
     if hr == S_OK {
         return Ok(Vec::new());
     }
     if hr == S_FALSE {
         return Err(DbgFlowError::Backend(
-            "WaitForEvent after g timed out".to_string(),
+            "WaitForEvent after g returned without an event".to_string(),
         ));
     }
     if hr == E_UNEXPECTED {
@@ -805,11 +1039,89 @@ fn wait_for_go_event(control: &IDebugControl4, timeout_ms: u64) -> Result<Vec<St
     )))
 }
 
+fn cleanup_open_target_failure(
+    client: &IDebugClient,
+    client5: &IDebugClient5,
+    logger: &Arc<dyn LogSink>,
+    correlation_id: &Option<String>,
+    backend_session_id: &str,
+    launched_process: &mut Option<LaunchedProcess>,
+    error: &DbgFlowError,
+) {
+    logger.log(
+        dbgeng_event(
+            LogLevel::Warn,
+            "open_target_cleanup_started",
+            correlation_id,
+            Some(backend_session_id),
+        )
+        .error(error.to_string()),
+    );
+
+    if let Some(process) = launched_process.as_mut() {
+        match process.terminate() {
+            Ok(()) => logger.log(dbgeng_event(
+                LogLevel::Info,
+                "open_target_launch_terminated",
+                correlation_id,
+                Some(backend_session_id),
+            )),
+            Err(error) => logger.log(
+                dbgeng_event(
+                    LogLevel::Error,
+                    "open_target_launch_terminate_failed",
+                    correlation_id,
+                    Some(backend_session_id),
+                )
+                .error(error.to_string()),
+            ),
+        }
+    }
+
+    unsafe {
+        match client.EndSession(DEBUG_END_PASSIVE) {
+            Ok(()) => logger.log(dbgeng_event(
+                LogLevel::Info,
+                "open_target_cleanup_end_session_finished",
+                correlation_id,
+                Some(backend_session_id),
+            )),
+            Err(error) => logger.log(
+                dbgeng_event(
+                    LogLevel::Warn,
+                    "open_target_cleanup_end_session_failed",
+                    correlation_id,
+                    Some(backend_session_id),
+                )
+                .error(error.to_string()),
+            ),
+        }
+        match client5.SetOutputCallbacksWide(None) {
+            Ok(()) => logger.log(dbgeng_event(
+                LogLevel::Info,
+                "open_target_cleanup_callbacks_cleared",
+                correlation_id,
+                Some(backend_session_id),
+            )),
+            Err(error) => logger.log(
+                dbgeng_event(
+                    LogLevel::Warn,
+                    "open_target_cleanup_callbacks_failed",
+                    correlation_id,
+                    Some(backend_session_id),
+                )
+                .error(error.to_string()),
+            ),
+        }
+    }
+}
+
 struct LaunchedProcess {
     process: HANDLE,
     thread: HANDLE,
     pid: u32,
     resumed: bool,
+    terminated: bool,
 }
 
 impl LaunchedProcess {
@@ -821,11 +1133,18 @@ impl LaunchedProcess {
         self.resumed = true;
         Ok(())
     }
+
+    fn terminate(&mut self) -> Result<()> {
+        unsafe { TerminateProcess(self.process, 1) }
+            .map_err(|error| DbgFlowError::Backend(format!("TerminateProcess failed: {error}")))?;
+        self.terminated = true;
+        Ok(())
+    }
 }
 
 impl Drop for LaunchedProcess {
     fn drop(&mut self) {
-        if !self.resumed {
+        if !self.resumed && !self.terminated {
             let _ = unsafe { TerminateProcess(self.process, 1) };
         }
         let _ = unsafe { CloseHandle(self.thread) };
@@ -864,6 +1183,7 @@ fn create_suspended_process(executable: &Path, args: &[String]) -> Result<Launch
         thread: process_info.hThread,
         pid: process_info.dwProcessId,
         resumed: false,
+        terminated: false,
     })
 }
 

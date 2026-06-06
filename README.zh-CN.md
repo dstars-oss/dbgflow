@@ -53,6 +53,8 @@ Target 示例：
 
 Dump target 可以指向任意已存在的本地 dump 文件，只要扩展名受支持。Launch target 默认关闭；仅在可信本地环境中设置 `DBGFLOW_ENABLE_LAUNCH=1` 后才允许受控启动进程。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出和日志仍写入受控 artifact root。`execute` 不再使用 allowlist，但 `.shell`、脚本加载、扩展加载、dump 写出和内存写出等危险命令仍会被 policy 拒绝。运行控制命令会单独更新 session 状态。
 
+`execute` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
+
 通过 stdio 启动 MCP server：
 
 ```text
@@ -75,6 +77,7 @@ cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir C:\dbgflow\var
 HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response；`GET /mcp` 打开 server-sent event stream，用于发送 MCP notifications，包括 session 状态变化对应的 `notifications/resources/updated`。`GET /healthz` 返回简单健康检查响应。
 
 当前 server 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`、`resources/list` 和 `resources/read`。Tool 结果以 JSON text content 返回；调试命令输出会完整返回，并同时写入 session artifacts。
+最新命令 artifact 也会在 session 的 `last_operation` 中返回引用。
 
 默认情况下，MCP server 会将 artifacts 写入 workspace 级 `artifacts/` 目录；未使用 `--data-dir` 时可通过 `DBGFLOW_ARTIFACT_ROOT` 覆盖该位置。
 

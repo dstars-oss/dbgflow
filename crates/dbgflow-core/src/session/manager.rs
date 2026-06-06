@@ -11,12 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_EXECUTE_TIMEOUT_MS: u64 = 120_000;
-const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 120_000;
+const CLOSE_OPERATION_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSession {
@@ -44,7 +43,30 @@ pub struct Session {
     pub updated_at_unix_ms: u128,
     pub warnings: Vec<String>,
     pub current_operation: Option<String>,
+    pub last_operation: Option<OperationSummary>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationSummary {
+    pub command_id: String,
+    pub command: String,
+    pub status: OperationStatus,
+    pub started_at_unix_ms: u128,
+    pub finished_at_unix_ms: Option<u128>,
+    pub duration_ms: Option<u128>,
+    pub artifact: Option<ArtifactRef>,
+    pub error: Option<String>,
+    pub output_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationStatus {
+    Running,
+    CancelRequested,
+    Canceled,
+    Finished,
+    Failed,
 }
 
 #[derive(Clone)]
@@ -145,7 +167,7 @@ impl SessionManager {
 
         if let Some(existing) = sessions
             .values()
-            .find(|session| session.target == request.target && !session.state.is_terminal())
+            .find(|session| session.target == request.target && session.state.is_reusable())
             .cloned()
         {
             return Ok(existing);
@@ -162,6 +184,7 @@ impl SessionManager {
             updated_at_unix_ms: now,
             warnings: Vec::new(),
             current_operation: Some("create_session".to_string()),
+            last_operation: None,
             error: None,
         };
 
@@ -180,15 +203,20 @@ impl SessionManager {
                 .field("backend", session.backend.clone())
                 .field("target", &session.target),
         );
+        if let Some(startup_timeout_ms) = request.startup_timeout_ms {
+            self.log(
+                LogEvent::new(
+                    LogLevel::Warn,
+                    "session",
+                    "deprecated_startup_timeout_ignored",
+                )
+                .session_id(session.id)
+                .operation("create_session")
+                .field("startup_timeout_ms", startup_timeout_ms),
+            );
+        }
 
-        self.spawn_backend_startup(
-            session.id,
-            backend,
-            request.target,
-            request
-                .startup_timeout_ms
-                .unwrap_or(DEFAULT_STARTUP_TIMEOUT_MS),
-        );
+        self.spawn_backend_startup(session.id, backend, request.target);
         self.notify_session_updated(session.id);
 
         Ok(session)
@@ -213,7 +241,7 @@ impl SessionManager {
 
     pub fn close_session(&self, session_id: SessionId) -> Result<Session> {
         let operation_lock = self.operation_lock(session_id)?;
-        let (session, backend_name, backend_session_id) = {
+        let (session, backend_name, backend_session_id, should_cancel, should_cancel_startup) = {
             let mut sessions = self
                 .sessions
                 .lock()
@@ -229,32 +257,107 @@ impl SessionManager {
                 return Ok(session.clone());
             }
 
-            session.state = if session.backend_session_id.is_some() {
+            let had_backend_session = session.backend_session_id.is_some();
+            let should_cancel =
+                session.current_operation.is_some() && session.backend_session_id.is_some();
+            let should_cancel_startup =
+                session.current_operation.is_some() && session.backend_session_id.is_none();
+            session.state = if had_backend_session || should_cancel_startup {
                 SessionState::Closing
             } else {
                 SessionState::Closed
             };
             session.updated_at_unix_ms = now_unix_ms();
             session.current_operation = None;
+            if should_cancel {
+                if let Some(operation) = session.last_operation.as_mut() {
+                    if operation.status == OperationStatus::Running {
+                        operation.status = OperationStatus::CancelRequested;
+                    }
+                }
+            }
             self.log(
                 LogEvent::new(LogLevel::Info, "session", "close_session_requested")
                     .session_id(session_id)
                     .field("backend", session.backend.clone())
-                    .field("had_backend_session", session.backend_session_id.is_some()),
+                    .field("had_backend_session", had_backend_session)
+                    .field("cancel_requested", should_cancel)
+                    .field("startup_cancel_requested", should_cancel_startup),
             );
             (
                 session.clone(),
                 session.backend.clone(),
                 session.backend_session_id.clone(),
+                should_cancel,
+                should_cancel_startup,
             )
         };
         self.notify_session_updated(session_id);
 
-        if let Some(backend_session_id) = backend_session_id {
-            if let Some(backend) = self.backends.get(&backend_name).cloned() {
+        if let Some(backend) = self.backends.get(&backend_name).cloned() {
+            if let Some(backend_session_id) = backend_session_id {
+                if should_cancel {
+                    self.log(
+                        LogEvent::new(LogLevel::Info, "session", "backend_cancel_requested")
+                            .session_id(session_id)
+                            .backend_session_id(backend_session_id.clone())
+                            .field("backend", backend_name.clone()),
+                    );
+                    match backend.cancel_session(&backend_session_id) {
+                        Ok(()) => self.log(
+                            LogEvent::new(LogLevel::Info, "session", "backend_cancel_finished")
+                                .session_id(session_id)
+                                .backend_session_id(backend_session_id.clone())
+                                .field("backend", backend_name.clone()),
+                        ),
+                        Err(error) => self.log(
+                            LogEvent::new(LogLevel::Warn, "session", "backend_cancel_failed")
+                                .session_id(session_id)
+                                .backend_session_id(backend_session_id.clone())
+                                .field("backend", backend_name.clone())
+                                .error(error.to_string()),
+                        ),
+                    }
+                }
                 let manager = self.clone();
                 thread::spawn(move || {
-                    let _operation_guard = operation_lock.lock();
+                    let lock_started = Instant::now();
+                    let _operation_guard = loop {
+                        match operation_lock.try_lock() {
+                            Ok(guard) => break guard,
+                            Err(TryLockError::WouldBlock)
+                                if lock_started.elapsed() >= CLOSE_OPERATION_WAIT_TIMEOUT =>
+                            {
+                                let error = DbgFlowError::Backend(
+                                    "session operation did not finish after close cancellation"
+                                        .to_string(),
+                                );
+                                manager.log(
+                                    LogEvent::new(
+                                        LogLevel::Error,
+                                        "session",
+                                        "backend_close_wait_timed_out",
+                                    )
+                                    .session_id(session_id)
+                                    .backend_session_id(backend_session_id.clone())
+                                    .field("backend", backend_name.clone())
+                                    .error(error.to_string()),
+                                );
+                                manager.finish_backend_close(session_id, Err(error));
+                                return;
+                            }
+                            Err(TryLockError::WouldBlock) => {
+                                thread::sleep(Duration::from_millis(50));
+                            }
+                            Err(TryLockError::Poisoned(_)) => {
+                                let error = DbgFlowError::Backend(
+                                    "session operation lock poisoned".to_string(),
+                                );
+                                manager.finish_backend_close(session_id, Err(error));
+                                return;
+                            }
+                        }
+                    };
                     manager.log(
                         LogEvent::new(LogLevel::Info, "session", "backend_close_started")
                             .session_id(session_id)
@@ -264,6 +367,29 @@ impl SessionManager {
                     let close_result = backend.close_session(&backend_session_id);
                     manager.finish_backend_close(session_id, close_result);
                 });
+            } else if should_cancel_startup {
+                self.log(
+                    LogEvent::new(
+                        LogLevel::Info,
+                        "session",
+                        "backend_startup_cancel_requested",
+                    )
+                    .session_id(session_id)
+                    .field("backend", backend_name.clone()),
+                );
+                match backend.cancel_startup(&session_id.to_string()) {
+                    Ok(()) => self.log(
+                        LogEvent::new(LogLevel::Info, "session", "backend_startup_cancel_finished")
+                            .session_id(session_id)
+                            .field("backend", backend_name),
+                    ),
+                    Err(error) => self.log(
+                        LogEvent::new(LogLevel::Warn, "session", "backend_startup_cancel_failed")
+                            .session_id(session_id)
+                            .field("backend", backend_name)
+                            .error(error.to_string()),
+                    ),
+                }
             }
         }
 
@@ -292,15 +418,6 @@ impl SessionManager {
         let backend_session_id = session.backend_session_id.clone().ok_or_else(|| {
             DbgFlowError::Backend("session backend is not initialized".to_string())
         })?;
-        if is_run_control {
-            self.set_session_state(
-                request.session_id,
-                SessionState::Running,
-                Some(request.command.clone()),
-                None,
-            )?;
-        }
-
         let backend = self
             .backends
             .get(&session.backend)
@@ -310,6 +427,39 @@ impl SessionManager {
         let started = Instant::now();
         let command_id = SessionId::new().to_string();
         let command = request.command.clone();
+        self.start_operation(
+            request.session_id,
+            if is_run_control {
+                SessionState::Running
+            } else {
+                session.state
+            },
+            OperationSummary {
+                command_id: command_id.clone(),
+                command: command.clone(),
+                status: OperationStatus::Running,
+                started_at_unix_ms,
+                finished_at_unix_ms: None,
+                duration_ms: None,
+                artifact: None,
+                error: None,
+                output_bytes: None,
+            },
+        )?;
+        if let Some(timeout_ms) = request.timeout_ms {
+            self.log(
+                LogEvent::new(
+                    LogLevel::Warn,
+                    "session",
+                    "deprecated_execute_timeout_ignored",
+                )
+                .session_id(request.session_id)
+                .backend_session_id(backend_session_id.clone())
+                .operation(command.clone())
+                .field("command_id", command_id.clone())
+                .field("timeout_ms", timeout_ms),
+            );
+        }
         self.log(
             LogEvent::new(LogLevel::Info, "session", "execute_started")
                 .session_id(request.session_id)
@@ -321,7 +471,6 @@ impl SessionManager {
         let backend_result = backend.execute(ExecuteBackendRequest {
             backend_session_id,
             command: command.clone(),
-            timeout_ms: request.timeout_ms.unwrap_or(DEFAULT_EXECUTE_TIMEOUT_MS),
         });
         let duration_ms = started.elapsed().as_millis();
 
@@ -333,20 +482,21 @@ impl SessionManager {
                         .session_id(request.session_id)
                         .operation(command.clone())
                         .duration_ms(duration_ms)
+                        .field("command_id", command_id.clone())
                         .error(error.to_string()),
                 );
-                self.set_session_state(
+                self.finish_operation(
                     request.session_id,
                     SessionState::Error,
+                    OperationStatus::Failed,
                     None,
                     Some(error.to_string()),
+                    None,
+                    duration_ms,
                 )?;
                 return Err(error);
             }
         };
-        if is_run_control {
-            self.set_session_state(request.session_id, SessionState::Break, None, None)?;
-        }
 
         let output_path = self
             .artifacts
@@ -355,7 +505,7 @@ impl SessionManager {
             .join(request.session_id.to_string())
             .join("outputs")
             .join(format!("{command_id}.txt"));
-        let artifact = self.artifacts.write_execute_artifacts(
+        let artifact = match self.artifacts.write_execute_artifacts(
             request.session_id,
             &command_id,
             &CommandArtifactRecord {
@@ -367,6 +517,42 @@ impl SessionManager {
                 output_bytes: backend_result.output.len(),
             },
             &backend_result.output,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                self.log(
+                    LogEvent::new(LogLevel::Error, "session", "execute_artifact_failed")
+                        .session_id(request.session_id)
+                        .operation(command.clone())
+                        .duration_ms(duration_ms)
+                        .field("command_id", command_id.clone())
+                        .field("output_bytes", backend_result.output.len())
+                        .error(error.to_string()),
+                );
+                self.finish_operation(
+                    request.session_id,
+                    SessionState::Error,
+                    OperationStatus::Failed,
+                    None,
+                    Some(error.to_string()),
+                    Some(backend_result.output.len()),
+                    duration_ms,
+                )?;
+                return Err(error);
+            }
+        };
+        self.finish_operation(
+            request.session_id,
+            if is_run_control {
+                SessionState::Break
+            } else {
+                session.state
+            },
+            OperationStatus::Finished,
+            Some(artifact.clone()),
+            None,
+            Some(backend_result.output.len()),
+            duration_ms,
         )?;
 
         self.log(
@@ -396,12 +582,11 @@ impl SessionManager {
             .ok_or(DbgFlowError::SessionNotFound(session_id))
     }
 
-    fn set_session_state(
+    fn start_operation(
         &self,
         session_id: SessionId,
         state: SessionState,
-        current_operation: Option<String>,
-        error: Option<String>,
+        operation: OperationSummary,
     ) -> Result<()> {
         let mut sessions = self
             .sessions
@@ -410,16 +595,52 @@ impl SessionManager {
         let session = sessions
             .get_mut(&session_id)
             .ok_or(DbgFlowError::SessionNotFound(session_id))?;
-        if session.state.is_terminal() {
-            return Ok(());
-        }
-        if session.state == SessionState::Closing {
+        if session.state.is_terminal() || session.state == SessionState::Closing {
             return Ok(());
         }
         session.state = state;
         session.updated_at_unix_ms = now_unix_ms();
-        session.current_operation = current_operation;
-        session.error = error;
+        session.current_operation = Some(operation.command.clone());
+        session.last_operation = Some(operation);
+        session.error = None;
+        drop(sessions);
+        self.notify_session_updated(session_id);
+        Ok(())
+    }
+
+    fn finish_operation(
+        &self,
+        session_id: SessionId,
+        state: SessionState,
+        status: OperationStatus,
+        artifact: Option<ArtifactRef>,
+        error: Option<String>,
+        output_bytes: Option<usize>,
+        duration_ms: u128,
+    ) -> Result<()> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("session manager lock poisoned".to_string()))?;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or(DbgFlowError::SessionNotFound(session_id))?;
+        if session.state.is_terminal() || session.state == SessionState::Closing {
+            return Ok(());
+        }
+        session.state = state;
+        session.updated_at_unix_ms = now_unix_ms();
+        session.current_operation = None;
+        session.error = error.clone();
+        if let Some(operation) = session.last_operation.as_mut() {
+            operation.status = status;
+            operation.finished_at_unix_ms = Some(now_unix_ms());
+            operation.duration_ms = Some(duration_ms);
+            operation.artifact = artifact;
+            operation.error = error;
+            operation.output_bytes = output_bytes;
+        }
+        drop(sessions);
         self.notify_session_updated(session_id);
         Ok(())
     }
@@ -443,6 +664,11 @@ impl SessionManager {
                             LogEvent::new(LogLevel::Info, "session", "backend_close_finished")
                                 .session_id(session_id),
                         );
+                        finalize_canceled_operation(
+                            session,
+                            OperationStatus::Canceled,
+                            "operation canceled by close_session".to_string(),
+                        );
                         session.state = SessionState::Closed;
                         session.error = None;
                     }
@@ -451,6 +677,11 @@ impl SessionManager {
                             LogEvent::new(LogLevel::Error, "session", "backend_close_failed")
                                 .session_id(session_id)
                                 .error(error.to_string()),
+                        );
+                        finalize_canceled_operation(
+                            session,
+                            OperationStatus::Failed,
+                            error.to_string(),
                         );
                         session.state = SessionState::Error;
                         session.error = Some(error.to_string());
@@ -468,104 +699,24 @@ impl SessionManager {
         session_id: SessionId,
         backend: Arc<dyn DebugBackend>,
         target: DebugTarget,
-        startup_timeout_ms: u64,
     ) {
         let manager = self.clone();
         thread::spawn(move || {
-            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-            let backend_for_startup = backend.clone();
             let startup_started = Instant::now();
             manager.log(
                 LogEvent::new(LogLevel::Info, "session", "backend_startup_thread_spawned")
                     .session_id(session_id)
                     .operation("create_session"),
             );
-            thread::spawn(move || {
-                let result = backend_for_startup.create_session(CreateBackendSession {
-                    target: target.clone(),
-                    correlation_id: Some(session_id.to_string()),
-                });
-                let _ = reply_tx.send(result);
+            let startup_result = backend.create_session(CreateBackendSession {
+                target,
+                correlation_id: Some(session_id.to_string()),
             });
-
-            match reply_rx.recv_timeout(Duration::from_millis(startup_timeout_ms)) {
-                Ok(startup_result) => manager.finish_backend_startup(
-                    session_id,
-                    startup_result,
-                    startup_started.elapsed().as_millis(),
-                ),
-                Err(_) => {
-                    let timeout_error = DbgFlowError::Backend(format!(
-                        "backend startup timed out after {startup_timeout_ms}ms"
-                    ));
-                    manager.log(
-                        LogEvent::new(LogLevel::Error, "session", "backend_startup_timed_out")
-                            .session_id(session_id)
-                            .operation("create_session")
-                            .duration_ms(startup_started.elapsed().as_millis())
-                            .error(timeout_error.to_string())
-                            .field("startup_timeout_ms", startup_timeout_ms),
-                    );
-                    manager.finish_backend_startup(
-                        session_id,
-                        Err(timeout_error),
-                        startup_started.elapsed().as_millis(),
-                    );
-                    let cleanup_manager = manager.clone();
-                    thread::spawn(move || match reply_rx.recv() {
-                        Ok(Ok(backend_session)) => {
-                            cleanup_manager.log(
-                                LogEvent::new(
-                                    LogLevel::Warn,
-                                    "session",
-                                    "backend_startup_late_success_cleanup_started",
-                                )
-                                .session_id(session_id)
-                                .backend_session_id(backend_session.id.clone()),
-                            );
-                            let close_result = backend.close_session(&backend_session.id);
-                            match close_result {
-                                Ok(()) => cleanup_manager.log(
-                                    LogEvent::new(
-                                        LogLevel::Info,
-                                        "session",
-                                        "backend_startup_late_success_cleanup_finished",
-                                    )
-                                    .session_id(session_id)
-                                    .backend_session_id(backend_session.id),
-                                ),
-                                Err(error) => cleanup_manager.log(
-                                    LogEvent::new(
-                                        LogLevel::Error,
-                                        "session",
-                                        "backend_startup_late_success_cleanup_failed",
-                                    )
-                                    .session_id(session_id)
-                                    .backend_session_id(backend_session.id)
-                                    .error(error.to_string()),
-                                ),
-                            }
-                        }
-                        Ok(Err(error)) => cleanup_manager.log(
-                            LogEvent::new(
-                                LogLevel::Warn,
-                                "session",
-                                "backend_startup_late_failure",
-                            )
-                            .session_id(session_id)
-                            .error(error.to_string()),
-                        ),
-                        Err(_) => cleanup_manager.log(
-                            LogEvent::new(
-                                LogLevel::Warn,
-                                "session",
-                                "backend_startup_late_worker_disconnected",
-                            )
-                            .session_id(session_id),
-                        ),
-                    });
-                }
-            }
+            manager.finish_backend_startup(
+                session_id,
+                startup_result,
+                startup_started.elapsed().as_millis(),
+            );
         });
     }
 
@@ -605,13 +756,17 @@ impl SessionManager {
                 }
 
                 if should_close_backend {
-                    if let Some(backend_name) = self.sessions.lock().ok().and_then(|sessions| {
+                    let close_after_startup = self.sessions.lock().ok().and_then(|sessions| {
                         sessions
                             .get(&session_id)
-                            .map(|session| session.backend.clone())
-                    }) {
+                            .map(|session| (session.backend.clone(), session.state))
+                    });
+                    if let Some((backend_name, state)) = close_after_startup {
                         if let Some(backend) = self.backends.get(&backend_name) {
-                            let _ = backend.close_session(&backend_session.id);
+                            let close_result = backend.close_session(&backend_session.id);
+                            if state == SessionState::Closing {
+                                self.finish_backend_close(session_id, close_result);
+                            }
                         }
                     }
                 }
@@ -626,7 +781,14 @@ impl SessionManager {
                 );
                 if let Ok(mut sessions) = self.sessions.lock() {
                     if let Some(session) = sessions.get_mut(&session_id) {
-                        if !session.state.is_terminal() {
+                        if session.state == SessionState::Closing {
+                            session.state = SessionState::Closed;
+                            session.updated_at_unix_ms = now_unix_ms();
+                            session.current_operation = None;
+                            session.error = None;
+                            drop(sessions);
+                            self.notify_session_updated(session_id);
+                        } else if !session.state.is_terminal() {
                             session.state = SessionState::Error;
                             session.updated_at_unix_ms = now_unix_ms();
                             session.current_operation = None;
@@ -666,6 +828,21 @@ fn state_for_target(target: &DebugTarget) -> SessionState {
         DebugTarget::Mock => SessionState::Ready,
         DebugTarget::Dump { .. } | DebugTarget::Attach { .. } | DebugTarget::Launch { .. } => {
             SessionState::Break
+        }
+    }
+}
+
+fn finalize_canceled_operation(session: &mut Session, status: OperationStatus, error: String) {
+    let now = now_unix_ms();
+    if let Some(operation) = session.last_operation.as_mut() {
+        if matches!(
+            operation.status,
+            OperationStatus::Running | OperationStatus::CancelRequested
+        ) {
+            operation.status = status;
+            operation.finished_at_unix_ms = Some(now);
+            operation.duration_ms = Some(now.saturating_sub(operation.started_at_unix_ms));
+            operation.error = Some(error);
         }
     }
 }
