@@ -233,6 +233,14 @@ cargo test
 
 若无法运行检查，应说明原因和已完成的替代验证。
 
+本项目交互式 MCP 入口使用本地 HTTP transport，开发时从仓库根目录传入受控数据目录：
+
+```text
+cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir D:\Repos\Project\dbgflow\var
+```
+
+从仓库根目录运行时，也可使用等价的 `--data-dir .\var`。`var/` 用于本地开发 artifacts 和 logs，已加入 `.gitignore`。HTTP transport 仅用于本机调试，必须绑定 loopback 地址；`/mcp` 不需要 bearer token 认证。不要使用无 `--data-dir` 的 HTTP 运行方式；stdio MCP transport 不作为公开运行入口。内部 session worker 使用标准子命令 `dbgflow-mcp worker session`，仅由主进程启动。
+
 ## 10. 文档维护
 
 `AGENTS.md` 只记录协作规则、架构边界和安全要求。

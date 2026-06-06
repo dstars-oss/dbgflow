@@ -1,8 +1,16 @@
 use dbgflow_mcp::http::{run_http, HttpConfig};
-use dbgflow_mcp::mcp::{default_server, run_stdio, server_with_data_dir};
+use dbgflow_mcp::mcp::server_with_data_dir;
 use dbgflow_mcp::runtime::{help_text, parse_options};
 use std::io::{self, BufReader};
 use std::sync::mpsc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandMode {
+    Http,
+    Service,
+    WorkerSession,
+    Help,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -14,8 +22,31 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut args = std::env::args_os();
     let _exe = args.next();
+    match parse_command_mode(&mut args)? {
+        CommandMode::WorkerSession => {
+            run_session_worker().map_err(|error| format!("session worker error: {error}"))
+        }
+        CommandMode::Http => {
+            let config = parse_options(args)?;
+            let (_shutdown_tx, shutdown_rx) = mpsc::channel();
+            let server = server_with_data_dir(config.data_dir)?;
+            run_http(server, HttpConfig { bind: config.bind }, shutdown_rx)
+                .map_err(|error| error.to_string())
+        }
+        CommandMode::Service => run_service(args),
+        CommandMode::Help => {
+            println!("{}", help_text());
+            Ok(())
+        }
+    }
+}
+
+fn parse_command_mode<I>(args: &mut I) -> Result<CommandMode, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
     let Some(command) = args.next() else {
-        return run_stdio_server().map_err(|error| error.to_string());
+        return Err(format!("missing command\n\n{}", help_text()));
     };
     let command = command
         .into_string()
@@ -23,32 +54,25 @@ fn run() -> Result<(), String> {
 
     match command.as_str() {
         dbgflow_core::session::worker::SESSION_WORKER_COMMAND => {
-            run_session_worker().map_err(|error| format!("session worker error: {error}"))
-        }
-        "http" => {
-            let config = parse_options(args)?;
-            let (_shutdown_tx, shutdown_rx) = mpsc::channel();
-            let server = match config.data_dir {
-                Some(data_dir) => server_with_data_dir(data_dir)?,
-                None => default_server(),
+            let Some(kind) = args.next() else {
+                return Err("missing worker kind".to_string());
             };
-            run_http(server, HttpConfig { bind: config.bind }, shutdown_rx)
-                .map_err(|error| error.to_string())
+            let kind = kind
+                .into_string()
+                .map_err(|_| "worker kind must be valid UTF-8".to_string())?;
+            if kind != dbgflow_core::session::worker::SESSION_WORKER_KIND_SESSION {
+                return Err(format!("unknown worker kind: {kind}"));
+            }
+            if args.next().is_some() {
+                return Err("worker session does not accept extra arguments".to_string());
+            }
+            Ok(CommandMode::WorkerSession)
         }
-        "service" => run_service(args),
-        "--help" | "-h" | "help" => {
-            println!("{}", help_text());
-            Ok(())
-        }
+        "http" => Ok(CommandMode::Http),
+        "service" => Ok(CommandMode::Service),
+        "--help" | "-h" | "help" => Ok(CommandMode::Help),
         other => Err(format!("unknown command: {other}\n\n{}", help_text())),
     }
-}
-
-fn run_stdio_server() -> io::Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-
-    run_stdio(default_server(), BufReader::new(stdin.lock()), stdout)
 }
 
 fn run_session_worker() -> io::Result<()> {
@@ -67,4 +91,44 @@ fn run_service(_args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), St
 #[cfg(not(windows))]
 fn run_service(_args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
     Err("Windows service mode is only supported on Windows".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_command_mode, CommandMode};
+    use std::ffi::OsString;
+
+    #[test]
+    fn parses_public_http_command() {
+        let mut args = [OsString::from("http")].into_iter();
+        assert_eq!(parse_command_mode(&mut args), Ok(CommandMode::Http));
+    }
+
+    #[test]
+    fn parses_internal_worker_session_command() {
+        let mut args = [OsString::from("worker"), OsString::from("session")].into_iter();
+        assert_eq!(
+            parse_command_mode(&mut args),
+            Ok(CommandMode::WorkerSession)
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_hidden_worker_command() {
+        let mut args = [OsString::from("__dbgflow-session-worker")].into_iter();
+        let error = parse_command_mode(&mut args).expect_err("reject hidden command");
+        assert!(error.contains("unknown command"));
+    }
+
+    #[test]
+    fn rejects_worker_session_extra_arguments() {
+        let mut args = [
+            OsString::from("worker"),
+            OsString::from("session"),
+            OsString::from("extra"),
+        ]
+        .into_iter();
+        let error = parse_command_mode(&mut args).expect_err("reject extra argument");
+        assert!(error.contains("extra"));
+    }
 }

@@ -193,7 +193,7 @@ close_session
 
 验收标准：
 
-* MCP client 能发现工具。
+* HTTP MCP client 能发现工具。
 * 能创建 mock session。
 * 能关闭 mock session。
 * 有基础日志。
@@ -495,13 +495,13 @@ continue until exception
 
 已补齐第一阶段 MCP server 入口：
 
-* `dbgflow-mcp` 从启动信息打印改为 stdio JSON-RPC MCP server。
+* `dbgflow-mcp` 从启动信息打印演进为本地 HTTP JSON-RPC MCP server。
 * 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list` 和 `tools/call`。
 * `create_session`、`get_session`、`list_sessions`、`close_session`、`execute`、`set_symbols` 暴露 MCP `inputSchema`。
 * `create_session` 的 MCP 参数采用 `{ "target": { "kind": "mock" } }` / `{ "target": { "kind": "dump", "path": "..." } }` 形态，再转换到 core 层 `DebugTarget`。
 * Tool 调用结果以 JSON text content 返回；后端错误作为 MCP tool error 返回。
 * MCP server 增加 JSON-RPC envelope 校验、protocolVersion 协商、unknown tool / invalid arguments 的 protocol error 分类。
-* MCP server 默认 artifact root 固定为 workspace 级 `artifacts/`，并支持 `DBGFLOW_ARTIFACT_ROOT` 覆盖。
+* HTTP MCP server 通过必填 `--data-dir` 固定 artifacts 和 logs 位置。
 
 已落地最小进程调试 MVP：
 
@@ -516,10 +516,11 @@ continue until exception
 
 已落地本地 HTTP / Windows service MVP：
 
-* `dbgflow-mcp` 保留无参数 stdio MCP transport，并新增 `http` 子命令。
+* `dbgflow-mcp` 使用 `http` 子命令作为公开 MCP transport。
 * 新增本地 Streamable HTTP MCP endpoint：`POST /mcp` 复用现有 JSON-RPC MCP handler，`GET /healthz` 提供健康检查。
 * HTTP `POST /mcp` 返回 `application/json`，`GET /mcp` 提供服务端 SSE stream。
-* HTTP 默认绑定 `127.0.0.1:7331`，非空 `Origin` 仅允许 localhost / loopback，第一版不提供远程访问或认证。
+* HTTP 默认绑定 `127.0.0.1:7331`，非空 `Origin` 仅允许 localhost / loopback。
+* HTTP transport 仅允许 loopback bind，非空 `Origin` 仅允许 localhost / loopback；`/mcp` 不要求 bearer token 认证。
 * 新增原生 Windows service 运行模式，支持 SCM stop / shutdown 控制并有序停止 HTTP listener。
 * 新增 `scripts/install-service.ps1`：构建 release binary，替换已有服务，复制 exe 到用户 `%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 安装并启动 `dbgflow-mcp` 服务。
 * 新增 `scripts/uninstall-service.ps1`：停止并卸载服务；默认保留 artifacts 和 logs，避免误删敏感调试输出。
@@ -558,11 +559,26 @@ continue until exception
 已落地每 session 子进程隔离架构：
 
 * `SessionManager` 不再持有真实 backend map，而是维护 `session_id -> SessionWorker`。
-* 默认真实 session 通过隐藏 worker 子命令启动独立 worker 子进程；worker 内部再选择 DbgEng backend。
+* 默认真实 session 通过内部 `worker session` 子命令启动独立 worker 子进程；worker 内部再选择 DbgEng backend。
 * 主进程统一执行 target validation、command policy、session 状态管理、artifact 写入和运行日志记录。
 * `close_session` 可终止卡住的 worker 子进程，避免 DbgEng 阻塞拖住 MCP 主进程或其他 session。
 * MCP schema 移除 mock target，`create_session` 必须显式传入 dump / attach / launch target。
+
+已收敛公开运行入口：
+
+* 删除公开 stdio MCP transport；内部 `worker session` 子命令仅用于 session worker 通信。
+* `dbgflow-mcp http` 必须传 `--data-dir`，开发默认使用仓库内 `.\var`。
+* 本地 HTTP transport 不使用 bearer token 认证；安全边界依赖 loopback-only bind、localhost `Origin` 限制和 command/path policy。
 * 删除 `MockBackend`，单元测试改用测试专用 `SessionWorkerLauncher` / fake worker。
+
+### 2026-06-07
+
+已移除本地 HTTP bearer token 认证：
+
+* `/mcp` 不再要求 `Authorization: Bearer ...`，Codex 等本地 MCP client 只需配置 `http://127.0.0.1:7331/mcp`。
+* 删除 `http-token.txt` 生成、读取和校验逻辑，`--data-dir` 只承载 artifacts 和 logs。
+* 继续保留 loopback-only bind 与 localhost / loopback `Origin` 限制；远程 HTTP 访问仍不支持。
+* Windows service 安装脚本不再输出 token 文件位置，卸载脚本仍默认保留 artifacts 和 logs。
 
 ## 10. 当前待办
 
@@ -601,7 +617,7 @@ continue until exception
 
 ### P3
 
-* [ ] 支持 HTTP token / auth 策略。
+* [x] 明确本地 HTTP 不使用 token / auth，依赖 loopback-only bind、Origin 限制和 policy 层。
 * [x] 支持 Streamable HTTP SSE stream。
 * [ ] 支持 extension allowlist。
 * [ ] 支持 TTD recording。

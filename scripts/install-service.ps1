@@ -114,7 +114,7 @@ function Assert-PortAvailable {
 
     $endpoint = Parse-BindAddress -BindAddress $BindAddress
     if (-not [Net.IPAddress]::IsLoopback($endpoint.Address)) {
-        throw "Bind address must be loopback because HTTP transport has no authentication: $BindAddress"
+        throw "Bind address must be loopback; dbgflow does not support remote HTTP access: $BindAddress"
     }
 
     $listener = $null

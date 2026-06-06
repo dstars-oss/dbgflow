@@ -31,10 +31,7 @@ fn service_main(_arguments: Vec<OsString>) {
 fn run_service() -> Result<(), String> {
     let args = std::env::args_os().skip(2);
     let config = parse_options(args)?;
-    let data_dir = config
-        .data_dir
-        .clone()
-        .ok_or_else(|| "service mode requires --data-dir".to_string())?;
+    let data_dir = config.data_dir.clone();
     let logger: Arc<dyn LogSink> = Arc::new(
         FileLogSink::new(data_dir.join("logs"), 7)
             .map_err(|error| format!("initialize log directory: {error}"))?,

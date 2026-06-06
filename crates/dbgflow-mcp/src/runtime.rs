@@ -8,23 +8,15 @@ pub const SERVICE_NAME: &str = "dbgflow-mcp";
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind: SocketAddr,
-    pub data_dir: Option<PathBuf>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            bind: DEFAULT_BIND.parse().expect("valid default bind address"),
-            data_dir: None,
-        }
-    }
+    pub data_dir: PathBuf,
 }
 
 pub fn parse_options<I>(args: I) -> Result<AppConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut config = AppConfig::default();
+    let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
+    let mut data_dir = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -33,33 +25,35 @@ where
             .map_err(|_| "arguments must be valid UTF-8".to_string())?;
 
         if let Some(value) = arg.strip_prefix("--bind=") {
-            config.bind = parse_bind(value)?;
+            bind = parse_bind(value)?;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--data-dir=") {
-            config.data_dir = Some(PathBuf::from(value));
+            data_dir = Some(PathBuf::from(value));
             continue;
         }
 
         match arg.as_str() {
             "--bind" => {
                 let value = next_value(&mut args, "--bind")?;
-                config.bind = parse_bind(&value)?;
+                bind = parse_bind(&value)?;
             }
             "--data-dir" => {
                 let value = next_value(&mut args, "--data-dir")?;
-                config.data_dir = Some(PathBuf::from(value));
+                data_dir = Some(PathBuf::from(value));
             }
             "--help" | "-h" => return Err(help_text().to_string()),
             other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
         }
     }
 
-    Ok(config)
+    let data_dir =
+        data_dir.ok_or_else(|| format!("missing required --data-dir <path>\n\n{}", help_text()))?;
+    Ok(AppConfig { bind, data_dir })
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp                         Run stdio MCP transport\n  dbgflow-mcp http [options]           Run Streamable HTTP MCP transport\n  dbgflow-mcp service [options]        Run as a Windows service\n\nOptions:\n  --bind <addr:port>                   Default: 127.0.0.1:7331\n  --data-dir <path>                    Data directory; uses <path>\\artifacts and <path>\\logs"
+    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]     Run local HTTP MCP transport\n  dbgflow-mcp service --data-dir <path> [options]  Run as a Windows service\n  dbgflow-mcp worker session                       Run an internal session worker process\n\nOptions:\n  --bind <addr:port>                             Default: 127.0.0.1:7331\n  --data-dir <path>                              Required. Uses <path>\\artifacts and <path>\\logs"
 }
 
 fn next_value<I>(args: &mut I, option: &str) -> Result<String, String>
@@ -78,7 +72,7 @@ fn parse_bind(value: &str) -> Result<SocketAddr, String> {
         .map_err(|error| format!("invalid bind address {value}: {error}"))?;
     if !bind.ip().is_loopback() {
         return Err(format!(
-            "bind address must be loopback because HTTP transport has no authentication: {value}"
+            "bind address must be loopback; dbgflow does not support remote HTTP access: {value}"
         ));
     }
     Ok(bind)
@@ -100,13 +94,21 @@ mod tests {
         .expect("parse options");
 
         assert_eq!(config.bind.to_string(), "127.0.0.1:9000");
-        assert_eq!(config.data_dir, Some(PathBuf::from("C:\\dbgflow\\var")));
+        assert_eq!(config.data_dir, PathBuf::from("C:\\dbgflow\\var"));
     }
 
     #[test]
-    fn uses_default_bind() {
-        let config = parse_options([]).expect("parse empty options");
+    fn uses_default_bind_with_required_data_dir() {
+        let config = parse_options([OsString::from("--data-dir"), OsString::from(".\\var")])
+            .expect("parse options");
         assert_eq!(config.bind.to_string(), DEFAULT_BIND);
+        assert_eq!(config.data_dir, PathBuf::from(".\\var"));
+    }
+
+    #[test]
+    fn rejects_missing_data_dir() {
+        let error = parse_options([]).expect_err("reject missing data dir");
+        assert!(error.contains("--data-dir"));
     }
 
     #[test]

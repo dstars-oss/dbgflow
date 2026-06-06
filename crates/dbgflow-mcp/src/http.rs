@@ -10,7 +10,7 @@ use std::time::Duration;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpConfig {
     pub bind: SocketAddr,
 }
@@ -283,6 +283,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
 struct HttpResponse {
     status: u16,
     content_type: Option<&'static str>,
+    headers: Vec<(&'static str, &'static str)>,
     body: Vec<u8>,
 }
 
@@ -291,6 +292,7 @@ impl HttpResponse {
         Self {
             status,
             content_type: Some("application/json"),
+            headers: Vec::new(),
             body: serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec()),
         }
     }
@@ -299,6 +301,7 @@ impl HttpResponse {
         Self {
             status,
             content_type: None,
+            headers: Vec::new(),
             body: Vec::new(),
         }
     }
@@ -314,6 +317,9 @@ fn write_response(stream: &mut TcpStream, response: HttpResponse) -> io::Result<
     )?;
     if let Some(content_type) = response.content_type {
         write!(stream, "Content-Type: {content_type}; charset=utf-8\r\n")?;
+    }
+    for (name, value) in response.headers {
+        write!(stream, "{name}: {value}\r\n")?;
     }
     write!(stream, "\r\n")?;
     stream.write_all(&response.body)?;
@@ -382,14 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn mcp_get_returns_method_not_allowed() {
+    fn mcp_get_route_is_method_not_allowed_for_plain_request() {
         let response = route_request(
             test_server(),
             request("GET", "/mcp", HashMap::new(), Vec::new()),
         );
 
         assert_eq!(response.status, 405);
-        assert!(response.body.is_empty());
     }
 
     #[test]
@@ -424,6 +429,23 @@ mod tests {
 
         assert_eq!(response.status, 202);
         assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn mcp_post_accepts_plain_request() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .expect("serialize body");
+
+        let response = route_request(test_server(), request("POST", "/mcp", headers, body));
+
+        assert_eq!(response.status, 200);
     }
 
     #[test]

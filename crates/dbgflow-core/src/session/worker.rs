@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const SESSION_WORKER_COMMAND: &str = "__dbgflow-session-worker";
+pub const SESSION_WORKER_COMMAND: &str = "worker";
+pub const SESSION_WORKER_KIND_SESSION: &str = "session";
 
 const CLOSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -125,6 +126,7 @@ impl ProcessSessionWorker {
     fn spawn(session_id: SessionId, executable: PathBuf, logger: Arc<dyn LogSink>) -> Result<Self> {
         let mut child = Command::new(&executable)
             .arg(SESSION_WORKER_COMMAND)
+            .arg(SESSION_WORKER_KIND_SESSION)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

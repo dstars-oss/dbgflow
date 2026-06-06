@@ -5,8 +5,7 @@ use dbgflow_core::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher
 use dbgflow_core::session::SessionId;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -14,7 +13,6 @@ const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2024-11-05", "2025-03-26", DEFAULT_PROTOCOL_VERSION];
-const ARTIFACT_ROOT_ENV: &str = "DBGFLOW_ARTIFACT_ROOT";
 
 #[derive(Clone)]
 pub struct McpServer {
@@ -182,63 +180,6 @@ impl McpServer {
     }
 }
 
-pub fn run_stdio<R, W>(server: McpServer, input: R, mut output: W) -> std::io::Result<()>
-where
-    R: BufRead,
-    W: Write + Send,
-{
-    let output = std::sync::Mutex::new(&mut output);
-    let (error_tx, error_rx) = mpsc::channel();
-
-    std::thread::scope(|scope| -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let server = server.clone();
-            let output = &output;
-            let error_tx = error_tx.clone();
-            scope.spawn(move || {
-                let response = match serde_json::from_str::<Value>(&line) {
-                    Ok(message) => server.handle_message(message),
-                    Err(error) => Some(error_response(
-                        Value::Null,
-                        -32700,
-                        &format!("parse error: {error}"),
-                    )),
-                };
-
-                if let Some(response) = response {
-                    let write_result = (|| -> std::io::Result<()> {
-                        let mut output = output.lock().map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "stdio output lock poisoned",
-                            )
-                        })?;
-                        serde_json::to_writer(&mut **output, &response)?;
-                        writeln!(&mut **output)?;
-                        output.flush()
-                    })();
-                    if let Err(error) = write_result {
-                        let _ = error_tx.send(error.to_string());
-                    }
-                }
-            });
-        }
-        Ok(())
-    })?;
-    drop(error_tx);
-
-    if let Ok(error) = error_rx.try_recv() {
-        Err(std::io::Error::new(std::io::ErrorKind::Other, error))
-    } else {
-        Ok(())
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct CallToolParams {
     name: String,
@@ -321,19 +262,6 @@ fn parse_session_resource_uri(uri: &str) -> std::result::Result<SessionId, Serve
         .map_err(|error| ServerError::new(-32602, format!("invalid session id in uri: {error}")))
 }
 
-pub fn default_server() -> McpServer {
-    server_with_artifact_root(default_artifact_root())
-}
-
-pub fn server_with_artifact_root(artifact_root: impl Into<PathBuf>) -> McpServer {
-    McpServer::new(ToolService::new(
-        dbgflow_core::session::SessionManager::with_worker_launcher(
-            default_process_worker_launcher(),
-            artifact_root,
-        ),
-    ))
-}
-
 pub fn server_with_data_dir(
     data_dir: impl Into<PathBuf>,
 ) -> std::result::Result<McpServer, String> {
@@ -359,31 +287,6 @@ pub fn server_with_data_dir_and_logger(
     ))
 }
 
-pub fn default_artifact_root() -> PathBuf {
-    if let Some(path) = std::env::var_os(ARTIFACT_ROOT_ENV) {
-        return make_absolute(PathBuf::from(path));
-    }
-
-    workspace_root().join("artifacts")
-}
-
-fn workspace_root() -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| manifest_dir.to_path_buf())
-}
-
-fn make_absolute(path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path
-    } else {
-        workspace_root().join(path)
-    }
-}
-
 fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {
     let executable = std::env::current_exe()
         .or_else(|_| {
@@ -402,18 +305,17 @@ fn is_valid_request_id(id: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_artifact_root, run_stdio, McpServer};
+    use super::McpServer;
     use crate::tools::ToolService;
-    use dbgflow_core::backend::{CreateBackendSession, DebugTarget, ExecuteBackendResult};
+    use dbgflow_core::backend::{CreateBackendSession, ExecuteBackendResult};
     use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
-    use dbgflow_core::session::{CreateSession, SessionId, SessionManager, SessionState};
+    use dbgflow_core::session::{SessionId, SessionManager};
     use dbgflow_core::Result;
     use serde_json::{json, Value};
     use std::fs;
-    use std::io::Cursor;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Mutex};
 
     static NEXT_TEST_ARTIFACT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -728,96 +630,6 @@ mod tests {
         assert_eq!(response["error"]["code"], -32600);
     }
 
-    #[test]
-    fn default_artifact_root_is_workspace_scoped() {
-        let root = default_artifact_root();
-        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root")
-            .join("artifacts");
-
-        assert!(root.is_absolute());
-        assert_eq!(root, expected);
-    }
-
-    #[test]
-    fn stdio_runner_writes_line_delimited_responses() {
-        let server = test_server();
-        let input = Cursor::new(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-"#,
-        );
-        let mut output = Vec::new();
-
-        run_stdio(server, input, &mut output).expect("run stdio");
-
-        let line = String::from_utf8(output).expect("utf8 output");
-        let response: Value = serde_json::from_str(line.trim()).expect("json response");
-        assert_eq!(response["id"], 1);
-        assert_eq!(response["result"]["serverInfo"]["name"], "dbgflow");
-    }
-
-    #[test]
-    fn stdio_runner_can_close_blocked_execute() {
-        let launcher = Arc::new(BlockingWorkerLauncher::default());
-        let manager = SessionManager::with_worker_launcher(
-            launcher,
-            test_artifact_root("stdio-close-blocked-execute"),
-        );
-        let session = manager
-            .create_session(CreateSession {
-                target: DebugTarget::Dump {
-                    path: test_dump_path("stdio-close-blocked-execute-target"),
-                },
-                startup_timeout_ms: None,
-            })
-            .expect("create session");
-        wait_for_manager_break(&manager, session.id);
-        let server = McpServer::new(ToolService::new(manager));
-        let session_id = session.id.to_string();
-        let execute = json!({
-            "jsonrpc": "2.0",
-            "id": "execute",
-            "method": "tools/call",
-            "params": {
-                "name": "execute",
-                "arguments": {
-                    "session_id": session_id,
-                    "command": "k"
-                }
-            }
-        });
-        let close = json!({
-            "jsonrpc": "2.0",
-            "id": "close",
-            "method": "tools/call",
-            "params": {
-                "name": "close_session",
-                "arguments": {
-                    "session_id": session_id
-                }
-            }
-        });
-        let input = Cursor::new(format!("{execute}\n{close}\n"));
-        let mut output = Vec::new();
-
-        run_stdio(server, input, &mut output).expect("run stdio");
-
-        let output = String::from_utf8(output).expect("utf8 output");
-        let responses = output
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("json response"))
-            .collect::<Vec<_>>();
-        assert_eq!(responses.len(), 2);
-        assert!(responses.iter().any(|response| response["id"] == "close"));
-        let execute_response = responses
-            .iter()
-            .find(|response| response["id"] == "execute")
-            .expect("execute response");
-        assert_eq!(execute_response["result"]["isError"], true);
-    }
-
     fn test_server() -> McpServer {
         McpServer::new(ToolService::new(SessionManager::with_worker_launcher(
             Arc::new(TestWorkerLauncher::default()),
@@ -873,21 +685,6 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "session did not break: {session}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    fn wait_for_manager_break(manager: &SessionManager, session_id: SessionId) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let session = manager.query_session(session_id).expect("query session");
-            if session.state == SessionState::Break {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "session did not break: {session:?}"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -951,70 +748,5 @@ mod tests {
             }
             Ok(())
         }
-    }
-
-    #[derive(Default)]
-    struct BlockingWorkerLauncher {
-        state: Arc<(Mutex<BlockingWorkerState>, Condvar)>,
-    }
-
-    impl SessionWorkerLauncher for BlockingWorkerLauncher {
-        fn spawn(
-            &self,
-            _session_id: SessionId,
-            _logger: Arc<dyn dbgflow_core::logging::LogSink>,
-        ) -> Result<Arc<dyn SessionWorker>> {
-            Ok(Arc::new(BlockingWorker {
-                state: self.state.clone(),
-            }))
-        }
-    }
-
-    struct BlockingWorker {
-        state: Arc<(Mutex<BlockingWorkerState>, Condvar)>,
-    }
-
-    impl SessionWorker for BlockingWorker {
-        fn create_session(&self, _request: CreateBackendSession) -> Result<WorkerSession> {
-            Ok(WorkerSession {
-                backend: "fake".to_string(),
-                backend_session_id: "blocking-worker".to_string(),
-                warnings: Vec::new(),
-            })
-        }
-
-        fn execute(&self, _command: String) -> Result<ExecuteBackendResult> {
-            let (lock, cvar) = &*self.state;
-            let mut state = lock.lock().expect("blocking state lock");
-            state.executing = true;
-            cvar.notify_all();
-            while !state.canceled {
-                state = cvar.wait(state).expect("blocking state wait");
-            }
-            Err(dbgflow_core::DbgFlowError::Backend("canceled".to_string()))
-        }
-
-        fn has_exited(&self) -> Result<bool> {
-            let (lock, _) = &*self.state;
-            Ok(lock.lock().expect("blocking state lock").canceled)
-        }
-
-        fn close(&self) -> Result<()> {
-            self.kill("close")
-        }
-
-        fn kill(&self, _reason: &str) -> Result<()> {
-            let (lock, cvar) = &*self.state;
-            let mut state = lock.lock().expect("blocking state lock");
-            state.canceled = true;
-            cvar.notify_all();
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct BlockingWorkerState {
-        executing: bool,
-        canceled: bool,
     }
 }

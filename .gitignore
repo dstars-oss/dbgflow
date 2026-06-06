@@ -1,4 +1,5 @@
 target/
+var/
 artifacts/*
 !artifacts/.gitkeep
 *.pdb
