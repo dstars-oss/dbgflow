@@ -408,13 +408,13 @@ mod tests {
             .iter()
             .any(|target| target["properties"]["kind"]["const"] == "launch"));
         assert!(tools.iter().any(|tool| {
-            tool["name"] == "execute" && tool["inputSchema"]["required"][0] == "session_id"
+            tool["name"] == "eval" && tool["inputSchema"]["required"][0] == "session_id"
         }));
-        let execute = tools
+        let eval = tools
             .iter()
-            .find(|tool| tool["name"] == "execute")
-            .expect("execute tool");
-        assert!(execute["inputSchema"]["properties"]
+            .find(|tool| tool["name"] == "eval")
+            .expect("eval tool");
+        assert!(eval["inputSchema"]["properties"]
             .get("timeout_ms")
             .is_none());
         assert!(tools.iter().any(|tool| tool["name"] == "get_session"));
@@ -422,9 +422,9 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_can_create_and_execute_dump_session() {
+    fn tools_call_can_create_and_eval_dump_session() {
         let server = test_server();
-        let dump_path = test_dump_path("mcp-create-execute");
+        let dump_path = test_dump_path("mcp-create-eval");
         let create_response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
@@ -443,23 +443,23 @@ mod tests {
         let session_id = session["id"].as_str().expect("session id");
         wait_for_break(&server, session_id);
 
-        let execute_response = server
+        let eval_response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "execute",
+                    "name": "eval",
                     "arguments": {
                         "session_id": session_id,
                         "command": "k"
                     }
                 }
             }))
-            .expect("execute response");
+            .expect("eval response");
 
-        let execute = tool_text_json(&execute_response);
-        assert!(execute["output"]
+        let eval = tool_text_json(&eval_response);
+        assert!(eval["output"]
             .as_str()
             .expect("output")
             .contains("fake worker executed: k"));
@@ -496,7 +496,7 @@ mod tests {
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "execute",
+                    "name": "eval",
                     "arguments": {
                         "session_id": 123,
                         "command": "k"
@@ -582,7 +582,7 @@ mod tests {
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "execute",
+                    "name": "eval",
                     "arguments": {
                         "session_id": session_id,
                         "command": ".shell dir"

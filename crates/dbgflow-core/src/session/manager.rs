@@ -384,7 +384,7 @@ impl SessionManager {
         Ok(session)
     }
 
-    pub fn execute(&self, request: ExecuteSession) -> Result<ExecuteSessionResult> {
+    pub fn eval(&self, request: EvalSession) -> Result<EvalSessionResult> {
         self.command_policy.check_command(&request.command)?;
         let is_run_control = self.command_policy.is_run_control_command(&request.command);
 
@@ -432,25 +432,21 @@ impl SessionManager {
         )?;
         if let Some(timeout_ms) = request.timeout_ms {
             self.log(
-                LogEvent::new(
-                    LogLevel::Warn,
-                    "session",
-                    "deprecated_execute_timeout_ignored",
-                )
-                .session_id(request.session_id)
-                .backend_session_id(
-                    session
-                        .backend_session_id
-                        .clone()
-                        .unwrap_or_else(|| "worker".to_string()),
-                )
-                .operation(command.clone())
-                .field("command_id", command_id.clone())
-                .field("timeout_ms", timeout_ms),
+                LogEvent::new(LogLevel::Warn, "session", "deprecated_eval_timeout_ignored")
+                    .session_id(request.session_id)
+                    .backend_session_id(
+                        session
+                            .backend_session_id
+                            .clone()
+                            .unwrap_or_else(|| "worker".to_string()),
+                    )
+                    .operation(command.clone())
+                    .field("command_id", command_id.clone())
+                    .field("timeout_ms", timeout_ms),
             );
         }
         self.log(
-            LogEvent::new(LogLevel::Info, "session", "execute_started")
+            LogEvent::new(LogLevel::Info, "session", "eval_started")
                 .session_id(request.session_id)
                 .operation(command.clone())
                 .field("command_id", command_id.clone())
@@ -464,7 +460,7 @@ impl SessionManager {
             Ok(result) => result,
             Err(error) => {
                 self.log(
-                    LogEvent::new(LogLevel::Error, "session", "execute_failed")
+                    LogEvent::new(LogLevel::Error, "session", "eval_failed")
                         .session_id(request.session_id)
                         .operation(command.clone())
                         .duration_ms(duration_ms)
@@ -491,7 +487,7 @@ impl SessionManager {
             .join(request.session_id.to_string())
             .join("outputs")
             .join(format!("{command_id}.txt"));
-        let artifact = match self.artifacts.write_execute_artifacts(
+        let artifact = match self.artifacts.write_eval_artifacts(
             request.session_id,
             &command_id,
             &CommandArtifactRecord {
@@ -507,7 +503,7 @@ impl SessionManager {
             Ok(artifact) => artifact,
             Err(error) => {
                 self.log(
-                    LogEvent::new(LogLevel::Error, "session", "execute_artifact_failed")
+                    LogEvent::new(LogLevel::Error, "session", "eval_artifact_failed")
                         .session_id(request.session_id)
                         .operation(command.clone())
                         .duration_ms(duration_ms)
@@ -542,7 +538,7 @@ impl SessionManager {
         )?;
 
         self.log(
-            LogEvent::new(LogLevel::Info, "session", "execute_finished")
+            LogEvent::new(LogLevel::Info, "session", "eval_finished")
                 .session_id(request.session_id)
                 .operation(command)
                 .duration_ms(duration_ms)
@@ -550,7 +546,7 @@ impl SessionManager {
                 .field("output_bytes", backend_result.output.len()),
         );
 
-        Ok(ExecuteSessionResult {
+        Ok(EvalSessionResult {
             session: self.query_session(request.session_id)?,
             output: backend_result.output,
             artifact,
@@ -967,14 +963,14 @@ fn now_unix_ms() -> u128 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecuteSession {
+pub struct EvalSession {
     pub session_id: SessionId,
     pub command: String,
     pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecuteSessionResult {
+pub struct EvalSessionResult {
     pub session: Session,
     pub output: String,
     pub artifact: ArtifactRef,

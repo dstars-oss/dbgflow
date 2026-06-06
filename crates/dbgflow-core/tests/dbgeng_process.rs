@@ -5,7 +5,7 @@ use dbgflow_core::backend::{
     CreateBackendSession, DebugBackend, DebugTarget, ExecuteBackendResult,
 };
 use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
-use dbgflow_core::session::{CreateSession, ExecuteSession, SessionManager, SessionState};
+use dbgflow_core::session::{CreateSession, EvalSession, SessionManager, SessionState};
 use dbgflow_core::Result;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -33,7 +33,7 @@ fn dbgeng_can_attach_to_process_and_query_modules() {
     assert_eq!(session.state, SessionState::Break);
 
     let result = manager
-        .execute(ExecuteSession {
+        .eval(EvalSession {
             session_id: session.id,
             command: "lm".to_string(),
             timeout_ms: Some(120_000),
@@ -72,7 +72,7 @@ fn dbgeng_can_launch_process_and_continue_to_exit() {
     assert_eq!(session.state, SessionState::Break);
 
     let result = manager
-        .execute(ExecuteSession {
+        .eval(EvalSession {
             session_id: session.id,
             command: "g".to_string(),
             timeout_ms: Some(15_000),

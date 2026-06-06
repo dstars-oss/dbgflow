@@ -65,7 +65,7 @@ continue_until_event
 谨慎开放文本命令接口，例如：
 
 ```text
-execute
+eval
 ```
 
 文本命令接口必须经过 policy 检查。不得默认提供无限制 debugger command、shell、脚本或文件访问能力。

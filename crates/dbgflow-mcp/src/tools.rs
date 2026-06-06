@@ -1,6 +1,6 @@
 use dbgflow_core::backend::DebugTarget;
 use dbgflow_core::session::{
-    CreateSession, ExecuteSession, ExecuteSessionResult, Session, SessionId, SessionManager,
+    CreateSession, EvalSession, EvalSessionResult, Session, SessionId, SessionManager,
 };
 use dbgflow_core::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ pub const CREATE_SESSION: &str = "create_session";
 pub const GET_SESSION: &str = "get_session";
 pub const LIST_SESSIONS: &str = "list_sessions";
 pub const CLOSE_SESSION: &str = "close_session";
-pub const EXECUTE: &str = "execute";
+pub const EVAL: &str = "eval";
 pub const SET_SYMBOLS: &str = "set_symbols";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,8 +137,8 @@ impl ToolService {
                 }),
             },
             ToolDescriptor {
-                name: EXECUTE,
-                description: "Execute a debugger command in a session. Dangerous commands are denied by policy.",
+                name: EVAL,
+                description: "Evaluate a debugger command in a session. Dangerous commands are denied by policy.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -202,15 +202,15 @@ impl ToolService {
         self.sessions.close_session(session_id)
     }
 
-    pub fn execute(&self, request: ExecuteRequest) -> Result<ExecuteSessionResult> {
-        self.sessions.execute(ExecuteSession {
+    pub fn eval(&self, request: EvalRequest) -> Result<EvalSessionResult> {
+        self.sessions.eval(EvalSession {
             session_id: request.session_id,
             command: request.command,
             timeout_ms: request.timeout_ms,
         })
     }
 
-    pub fn set_symbols(&self, request: SetSymbolsRequest) -> Result<ExecuteSessionResult> {
+    pub fn set_symbols(&self, request: SetSymbolsRequest) -> Result<EvalSessionResult> {
         let mut validated = Vec::with_capacity(request.paths.len());
         for path in request.paths {
             let path_text = path.to_string_lossy();
@@ -247,7 +247,7 @@ impl ToolService {
             } else {
                 format!(".sympath {}", path.display())
             };
-            result = Some(self.execute(ExecuteRequest {
+            result = Some(self.eval(EvalRequest {
                 session_id: request.session_id,
                 command,
                 timeout_ms: request.timeout_ms,
@@ -287,8 +287,8 @@ impl ToolService {
                     .map_err(ToolCallError::execution)
                     .and_then(to_value)
             }
-            EXECUTE => self
-                .execute(decode_arguments(arguments)?)
+            EVAL => self
+                .eval(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             SET_SYMBOLS => self
@@ -335,7 +335,7 @@ pub struct CreateSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecuteRequest {
+pub struct EvalRequest {
     pub session_id: SessionId,
     pub command: String,
     pub timeout_ms: Option<u64>,

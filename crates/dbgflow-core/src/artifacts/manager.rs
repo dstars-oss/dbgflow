@@ -24,7 +24,7 @@ impl ArtifactManager {
         Ok(dir)
     }
 
-    pub fn write_execute_artifacts(
+    pub fn write_eval_artifacts(
         &self,
         session_id: SessionId,
         command_id: &str,

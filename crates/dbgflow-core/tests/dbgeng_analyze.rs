@@ -5,7 +5,7 @@ use dbgflow_core::backend::{
     CreateBackendSession, DebugBackend, DebugTarget, ExecuteBackendResult,
 };
 use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
-use dbgflow_core::session::{CreateSession, ExecuteSession, SessionManager, SessionState};
+use dbgflow_core::session::{CreateSession, EvalSession, SessionManager, SessionState};
 use dbgflow_core::Result;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,12 +60,12 @@ fn dbgeng_can_run_analyze_v_on_generated_dump() {
     assert_eq!(session.state, SessionState::Break);
 
     let result = manager
-        .execute(ExecuteSession {
+        .eval(EvalSession {
             session_id: session.id,
             command: "!analyze -v".to_string(),
             timeout_ms: Some(120_000),
         })
-        .expect("execute !analyze -v");
+        .expect("eval !analyze -v");
 
     let output = std::fs::read_to_string(&result.artifact.path).expect("read analyze output");
     let output_upper = output.to_ascii_uppercase();

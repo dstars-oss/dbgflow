@@ -2,7 +2,7 @@ use dbgflow_core::backend::{CreateBackendSession, DebugTarget, ExecuteBackendRes
 use dbgflow_core::logging::{LogEvent, LogSink};
 use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
 use dbgflow_core::session::{
-    CreateSession, ExecuteSession, OperationStatus, SessionId, SessionManager, SessionState,
+    CreateSession, EvalSession, OperationStatus, SessionId, SessionManager, SessionState,
 };
 use dbgflow_core::{DbgFlowError, Result};
 use std::fs;
@@ -153,7 +153,7 @@ fn close_starting_session_kills_worker_after_startup_finishes() {
 }
 
 #[test]
-fn session_execute_writes_output_artifact() {
+fn session_eval_writes_output_artifact() {
     let root = test_artifact_root("execute-artifact");
     let manager = SessionManager::with_worker_launcher(
         Arc::new(TestWorkerLauncher::new(WorkerBehavior::Normal)),
@@ -168,7 +168,7 @@ fn session_execute_writes_output_artifact() {
         .expect("create session");
     let session = wait_for_break(&manager, session.id);
     let result = manager
-        .execute(ExecuteSession {
+        .eval(EvalSession {
             session_id: session.id,
             command: "k".to_string(),
             timeout_ms: None,
@@ -191,7 +191,7 @@ fn session_execute_writes_output_artifact() {
 }
 
 #[test]
-fn execute_rejects_denied_command() {
+fn eval_rejects_denied_command() {
     let manager = test_manager("deny-command", WorkerBehavior::Normal);
     let session = manager
         .create_session(CreateSession {
@@ -201,7 +201,7 @@ fn execute_rejects_denied_command() {
         .expect("create session");
 
     let error = manager
-        .execute(ExecuteSession {
+        .eval(EvalSession {
             session_id: session.id,
             command: ".shell dir".to_string(),
             timeout_ms: None,
@@ -212,7 +212,7 @@ fn execute_rejects_denied_command() {
 }
 
 #[test]
-fn execute_sets_observable_operation_state() {
+fn eval_sets_observable_operation_state() {
     let manager = test_manager(
         "observable-execute",
         WorkerBehavior::SlowExecute(Duration::from_millis(250)),
@@ -226,15 +226,15 @@ fn execute_sets_observable_operation_state() {
     let session = wait_for_break(&manager, session.id);
     let session_id = session.id;
 
-    let execute_manager = manager.clone();
-    let execute = std::thread::spawn(move || {
-        execute_manager
-            .execute(ExecuteSession {
+    let eval_manager = manager.clone();
+    let eval = std::thread::spawn(move || {
+        eval_manager
+            .eval(EvalSession {
                 session_id,
                 command: "!analyze -v".to_string(),
                 timeout_ms: Some(1),
             })
-            .expect("execute slow command")
+            .expect("eval slow command")
     });
 
     let running = wait_for_current_operation(&manager, session_id);
@@ -243,7 +243,7 @@ fn execute_sets_observable_operation_state() {
     assert_eq!(last.command, "!analyze -v");
     assert_eq!(last.status, OperationStatus::Running);
 
-    let result = execute.join().expect("execute thread");
+    let result = eval.join().expect("eval thread");
     assert_eq!(result.session.state, SessionState::Break);
     let last = result
         .session
@@ -275,9 +275,9 @@ fn close_session_kills_running_worker_before_waiting_for_operation_lock() {
     let session = wait_for_break(&manager, session.id);
     let session_id = session.id;
 
-    let execute_manager = manager.clone();
-    let execute = std::thread::spawn(move || {
-        execute_manager.execute(ExecuteSession {
+    let eval_manager = manager.clone();
+    let eval = std::thread::spawn(move || {
+        eval_manager.eval(EvalSession {
             session_id,
             command: "k".to_string(),
             timeout_ms: None,
@@ -299,11 +299,11 @@ fn close_session_kills_running_worker_before_waiting_for_operation_lock() {
         .is_some_and(|error| error.contains("close_session")));
     assert_eq!(kill_count.load(Ordering::SeqCst), 1);
 
-    let execute_error = execute
+    let eval_error = eval
         .join()
-        .expect("execute thread")
-        .expect_err("execute canceled");
-    assert!(execute_error.to_string().contains("canceled"));
+        .expect("eval thread")
+        .expect_err("eval canceled");
+    assert!(eval_error.to_string().contains("canceled"));
 }
 
 #[test]
@@ -415,7 +415,7 @@ fn deprecated_timeout_fields_are_ignored_and_logged() {
 
     let session = wait_for_break(&manager, session.id);
     manager
-        .execute(ExecuteSession {
+        .eval(EvalSession {
             session_id: session.id,
             command: "k".to_string(),
             timeout_ms: Some(1),
@@ -428,7 +428,7 @@ fn deprecated_timeout_fields_are_ignored_and_logged() {
         .any(|event| event.event == "deprecated_startup_timeout_ignored"));
     assert!(events
         .iter()
-        .any(|event| event.event == "deprecated_execute_timeout_ignored"));
+        .any(|event| event.event == "deprecated_eval_timeout_ignored"));
 }
 
 fn test_manager(name: &str, behavior: WorkerBehavior) -> SessionManager {

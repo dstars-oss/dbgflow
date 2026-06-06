@@ -15,7 +15,7 @@ endpoint, and Windows service scripts:
 - artifact manager
 - DbgEng backend for dump targets
 - DbgEng backend for process attach and launch targets
-- denylist-protected `execute` command support
+- denylist-protected `eval` command support
 - MCP-facing tool facade
 - Streamable HTTP MCP endpoint at `/mcp` with resource update SSE
 - native Windows service mode
@@ -27,7 +27,7 @@ Initial tool names:
 - `get_session`
 - `list_sessions`
 - `close_session`
-- `execute`
+- `eval`
 - `set_symbols`
 
 `create_session` uses get-or-create semantics and returns quickly with a
@@ -65,12 +65,12 @@ uses a suspended Win32 process creation path and attaches DbgEng before resuming
 the target. The executable must be an existing path; shell invocation, custom
 current directories, and custom environments are not part of this MVP.
 Command output and logs are still written under the controlled artifact root.
-`execute` no longer uses an allowlist, but dangerous commands such as shell
+`eval` no longer uses an allowlist, but dangerous commands such as shell
 execution, script loading, extension loading, dump writing, and memory writing
 remain denied by policy. Run-control commands update session state separately
 from ordinary queries.
 
-`execute` is synchronous and does not expose per-command timeout knobs. While a
+`eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a
 `last_operation` summary with status, timing, artifact, error, and output-size
 fields. Clients can observe progress with `get_session`, `resources/read`, or

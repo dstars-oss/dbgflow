@@ -219,7 +219,7 @@ close_session
 
 目标：
 
-* 支持 `execute`。
+* 支持 `eval`。
 * 支持 command policy。
 * 支持输出捕获。
 * 支持执行状态观测和 cancellation。
@@ -366,7 +366,7 @@ continue until exception
 
 决定：
 
-即使采用 DbgEngBackend，也保留 `execute` 能力。
+即使采用 DbgEngBackend，也保留 `eval` 能力。
 
 原因：
 
@@ -488,8 +488,8 @@ continue until exception
 * 实现 `dbgeng.dll` resolver，查找顺序为 WinDbg / WinDbg Preview 应用商店版、Windows SDK Debuggers、System32 fallback。
 * 通过动态加载 `dbgeng.dll` 和 `DebugCreate` 创建 DbgEng client。
 * 支持 `DebugTarget::Dump`，打开 dump 后调用 `WaitForEvent` 进入可分析状态。
-* 支持受控 `execute`，当前采用 denylist-only policy，默认允许诊断命令并拒绝危险命令。
-* `execute` 输出写入 session artifact，响应返回完整输出和 artifact 引用。
+* 支持受控 `eval`，当前采用 denylist-only policy，默认允许诊断命令并拒绝危险命令。
+* `eval` 输出写入 session artifact，响应返回完整输出和 artifact 引用。
 * 添加生成 crash dump fixture 的 Windows integration test，已跑通 `!analyze -v`。
 * Dump target 允许指向任意已存在的本地 dump 文件，路径会先校验和规范化；输出和日志仍写入受控 artifact root。
 
@@ -497,7 +497,7 @@ continue until exception
 
 * `dbgflow-mcp` 从启动信息打印演进为本地 HTTP JSON-RPC MCP server。
 * 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list` 和 `tools/call`。
-* `create_session`、`get_session`、`list_sessions`、`close_session`、`execute`、`set_symbols` 暴露 MCP `inputSchema`。
+* `create_session`、`get_session`、`list_sessions`、`close_session`、`eval`、`set_symbols` 暴露 MCP `inputSchema`。
 * `create_session` 的 MCP 参数采用 `{ "target": { "kind": "mock" } }` / `{ "target": { "kind": "dump", "path": "..." } }` 形态，再转换到 core 层 `DebugTarget`。
 * Tool 调用结果以 JSON text content 返回；后端错误作为 MCP tool error 返回。
 * MCP server 增加 JSON-RPC envelope 校验、protocolVersion 协商、unknown tool / invalid arguments 的 protocol error 分类。
@@ -508,7 +508,7 @@ continue until exception
 * `DebugTarget` 扩展支持 `Attach { pid }` 和 `Launch { executable, args }`。
 * MCP `create_session` target schema 支持 `attach` 和 `launch`，不新增公开 tool。
 * `DbgEngBackend` 支持通过 `AttachProcess` attach PID；launch 默认关闭，需要 `DBGFLOW_ENABLE_LAUNCH=1` 显式启用，并采用 suspended Win32 process creation、DbgEng attach 后再 resume 的最小实现。
-* `execute` 继续作为唯一调试命令入口，并开放精确 `g` 作为最小运行控制命令。
+* `eval` 继续作为唯一调试命令入口，并开放精确 `g` 作为最小运行控制命令。
 * `g` 在后端通过 `SetExecutionStatus(DEBUG_STATUS_GO) + WaitForEvent` 执行。
 * 进程调试集成测试已添加，但默认 ignored；当前本机显式运行 attach / launch 测试已通过。
 
@@ -552,7 +552,7 @@ continue until exception
 
 * MCP tool schema 不再暴露 `startup_timeout_ms` / `timeout_ms`；旧请求字段仍兼容接收，但会被忽略并记录 warning。
 * `create_session` 不再使用 backend startup timeout；后端打开 target 期间保持 `Starting`，由 `get_session` / resource update SSE 观察完成状态。
-* `execute` 不再使用 backend reply timeout；长命令执行期间写入 `current_operation`，完成后在 `last_operation` 中记录 status、duration、artifact、error 和 output bytes。
+* `eval` 不再使用 backend reply timeout；长命令执行期间写入 `current_operation`，完成后在 `last_operation` 中记录 status、duration、artifact、error 和 output bytes。
 * `close_session` 在存在当前操作时会先调用 backend cancellation；DbgEng backend 通过 `IDebugControl::SetInterrupt(DEBUG_INTERRUPT_EXIT)` 请求中断，再等待 worker 完成关闭。
 * DbgEng `g` / open target 的 `WaitForEvent` 改为无限等待，由 session 状态查询和 cancellation 承担长操作控制。
 
@@ -579,6 +579,12 @@ continue until exception
 * 删除 `http-token.txt` 生成、读取和校验逻辑，`--data-dir` 只承载 artifacts 和 logs。
 * 继续保留 loopback-only bind 与 localhost / loopback `Origin` 限制；远程 HTTP 访问仍不支持。
 * Windows service 安装脚本不再输出 token 文件位置，卸载脚本仍默认保留 artifacts 和 logs。
+
+已重命名公开文本命令入口：
+
+* session-facing API 从 `execute` 改为 `eval`。
+* MCP tool 名称从 `execute` 改为 `eval`，输入 schema 和返回结构保持不变。
+* backend / DbgEng 内部仍保留 `execute` 作为底层调试器命令执行语义。
 
 ## 10. 当前待办
 
@@ -608,7 +614,7 @@ continue until exception
 
 * [x] 支持 attach process MVP。
 * [x] 支持 launch process MVP。
-* [x] 支持最小 continue until event：通过 `execute` 精确命令 `g`，进度由 session 状态和 cancellation 控制。
+* [x] 支持最小 continue until event：通过 `eval` 精确命令 `g`，进度由 session 状态和 cancellation 控制。
 * [x] 支持本地 Streamable HTTP MCP endpoint。
 * [x] 支持 Windows service 安装 / 卸载脚本。
 * [ ] 支持结构化 stack parser 或 DbgEng stack API。
