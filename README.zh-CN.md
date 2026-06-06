@@ -7,8 +7,8 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 当前实现包含初始工程骨架、Windows-only 的 DbgEng dump 分析 / 进程调试 MVP、stdio MCP server、本地 Streamable HTTP MCP endpoint，以及 Windows service 脚本：
 
 - backend 抽象
-- mock backend
 - session 生命周期管理
+- 每个调试 session 独立 worker 子进程隔离
 - command policy
 - artifact manager
 - 面向 dump target 的 DbgEng backend
@@ -30,12 +30,14 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - `set_symbols`
 
 `create_session` 采用 get-or-create 语义，并会快速返回 `Starting` session；后端打开 target 在后台完成。调用方可以通过 `get_session`、`list_sessions` 或 HTTP resource update stream 观察状态转为 `Ready`、`Break`、`Closed` 或 `Error`。
+`target` 现在是必填参数；MCP tool schema 不再暴露 mock target。
 
 当前 backend 选择属于内部实现细节，不作为公开 tool 暴露。调用方只需要描述要调试的 target，后续由内部机制选择合适的 backend。
 
 在 Windows 上，DbgEng session 会按 WinDbg / WinDbg Preview 应用包、Windows SDK Debuggers、System32 fallback 的顺序解析 `dbgeng.dll`。
 
 DbgEng target 当前支持 dump 文件、按 PID attach 进程，以及按 executable path + args launch 进程。
+每个真实调试 session 会运行在独立 worker 子进程中；主 MCP 进程负责消息分发、session 状态、policy、artifacts、logs 和 worker 生命周期控制。
 
 Target 示例：
 
@@ -54,6 +56,7 @@ Target 示例：
 Dump target 可以指向任意已存在的本地 dump 文件，只要扩展名受支持。Launch target 默认关闭；仅在可信本地环境中设置 `DBGFLOW_ENABLE_LAUNCH=1` 后才允许受控启动进程。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出和日志仍写入受控 artifact root。`execute` 不再使用 allowlist，但 `.shell`、脚本加载、扩展加载、dump 写出和内存写出等危险命令仍会被 policy 拒绝。运行控制命令会单独更新 session 状态。
 
 `execute` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
+如果 worker 卡住，主进程可以终止该 session 对应的 worker 子进程，不会拖垮其他 session 或 MCP server。
 
 通过 stdio 启动 MCP server：
 

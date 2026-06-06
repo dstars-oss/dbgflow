@@ -1,6 +1,5 @@
 #[cfg(windows)]
 pub mod dbgeng;
-pub mod mock;
 
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,6 @@ pub struct BackendInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendKind {
-    Mock,
     DbgEng,
     Ttd,
 }
@@ -43,7 +41,6 @@ pub struct CreateBackendSession {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DebugTarget {
-    Mock,
     Dump {
         path: PathBuf,
     },

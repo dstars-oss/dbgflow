@@ -1,6 +1,7 @@
 use crate::logging::FileLogSink;
 use crate::tools::{ToolCallError, ToolService};
 use dbgflow_core::logging::LogSink;
+use dbgflow_core::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
 use dbgflow_core::session::SessionId;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -184,31 +185,58 @@ impl McpServer {
 pub fn run_stdio<R, W>(server: McpServer, input: R, mut output: W) -> std::io::Result<()>
 where
     R: BufRead,
-    W: Write,
+    W: Write + Send,
 {
-    for line in input.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
+    let output = std::sync::Mutex::new(&mut output);
+    let (error_tx, error_rx) = mpsc::channel();
 
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => server.handle_message(message),
-            Err(error) => Some(error_response(
-                Value::Null,
-                -32700,
-                &format!("parse error: {error}"),
-            )),
-        };
+    std::thread::scope(|scope| -> std::io::Result<()> {
+        for line in input.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
 
-        if let Some(response) = response {
-            serde_json::to_writer(&mut output, &response)?;
-            writeln!(output)?;
-            output.flush()?;
+            let server = server.clone();
+            let output = &output;
+            let error_tx = error_tx.clone();
+            scope.spawn(move || {
+                let response = match serde_json::from_str::<Value>(&line) {
+                    Ok(message) => server.handle_message(message),
+                    Err(error) => Some(error_response(
+                        Value::Null,
+                        -32700,
+                        &format!("parse error: {error}"),
+                    )),
+                };
+
+                if let Some(response) = response {
+                    let write_result = (|| -> std::io::Result<()> {
+                        let mut output = output.lock().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "stdio output lock poisoned",
+                            )
+                        })?;
+                        serde_json::to_writer(&mut **output, &response)?;
+                        writeln!(&mut **output)?;
+                        output.flush()
+                    })();
+                    if let Err(error) = write_result {
+                        let _ = error_tx.send(error.to_string());
+                    }
+                }
+            });
         }
+        Ok(())
+    })?;
+    drop(error_tx);
+
+    if let Ok(error) = error_rx.try_recv() {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, error))
+    } else {
+        Ok(())
     }
-
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +327,10 @@ pub fn default_server() -> McpServer {
 
 pub fn server_with_artifact_root(artifact_root: impl Into<PathBuf>) -> McpServer {
     McpServer::new(ToolService::new(
-        dbgflow_core::session::SessionManager::with_default_backends_at(artifact_root),
+        dbgflow_core::session::SessionManager::with_worker_launcher(
+            default_process_worker_launcher(),
+            artifact_root,
+        ),
     ))
 }
 
@@ -320,7 +351,8 @@ pub fn server_with_data_dir_and_logger(
 ) -> McpServer {
     let data_dir = data_dir.into();
     McpServer::new(ToolService::new(
-        dbgflow_core::session::SessionManager::with_default_backends_at_and_logger(
+        dbgflow_core::session::SessionManager::with_worker_launcher_and_logger(
+            default_process_worker_launcher(),
             data_dir.join("artifacts"),
             logger,
         ),
@@ -352,6 +384,18 @@ fn make_absolute(path: PathBuf) -> PathBuf {
     }
 }
 
+fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {
+    let executable = std::env::current_exe()
+        .or_else(|_| {
+            std::env::args_os()
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current exe"))
+        })
+        .unwrap_or_else(|_| PathBuf::from("dbgflow-mcp"));
+    Arc::new(ProcessWorkerLauncher::with_executable(executable))
+}
+
 fn is_valid_request_id(id: &Value) -> bool {
     id.is_string() || id.is_number() || id.is_null()
 }
@@ -360,13 +404,16 @@ fn is_valid_request_id(id: &Value) -> bool {
 mod tests {
     use super::{default_artifact_root, run_stdio, McpServer};
     use crate::tools::ToolService;
-    use dbgflow_core::backend::mock::MockBackend;
-    use dbgflow_core::session::SessionManager;
+    use dbgflow_core::backend::{CreateBackendSession, DebugTarget, ExecuteBackendResult};
+    use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
+    use dbgflow_core::session::{CreateSession, SessionId, SessionManager, SessionState};
+    use dbgflow_core::Result;
     use serde_json::{json, Value};
+    use std::fs;
     use std::io::Cursor;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
 
     static NEXT_TEST_ARTIFACT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -442,6 +489,12 @@ mod tests {
             .get("startup_timeout_ms")
             .is_none());
         let target_schema = &create_session["inputSchema"]["properties"]["target"]["oneOf"];
+        assert_eq!(create_session["inputSchema"]["required"][0], "target");
+        assert!(!target_schema
+            .as_array()
+            .expect("target variants")
+            .iter()
+            .any(|target| target["properties"]["kind"]["const"] == "mock"));
         assert!(target_schema
             .as_array()
             .expect("target variants")
@@ -467,8 +520,9 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_can_create_and_execute_mock_session() {
+    fn tools_call_can_create_and_execute_dump_session() {
         let server = test_server();
+        let dump_path = test_dump_path("mcp-create-execute");
         let create_response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
@@ -477,7 +531,7 @@ mod tests {
                 "params": {
                     "name": "create_session",
                     "arguments": {
-                        "target": { "kind": "mock" }
+                        "target": { "kind": "dump", "path": dump_path }
                     }
                 }
             }))
@@ -485,7 +539,7 @@ mod tests {
 
         let session = tool_text_json(&create_response);
         let session_id = session["id"].as_str().expect("session id");
-        wait_for_ready(&server, session_id);
+        wait_for_break(&server, session_id);
 
         let execute_response = server
             .handle_message(json!({
@@ -506,7 +560,7 @@ mod tests {
         assert!(execute["output"]
             .as_str()
             .expect("output")
-            .contains("mock executed: k"));
+            .contains("fake worker executed: k"));
     }
 
     #[test]
@@ -557,8 +611,55 @@ mod tests {
     }
 
     #[test]
+    fn tools_call_rejects_create_session_without_target() {
+        let server = test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_session",
+                    "arguments": {}
+                }
+            }))
+            .expect("response");
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("invalid tool arguments"));
+    }
+
+    #[test]
+    fn tools_call_rejects_mock_target_at_runtime() {
+        let server = test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_session",
+                    "arguments": {
+                        "target": { "kind": "mock" }
+                    }
+                }
+            }))
+            .expect("response");
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("invalid tool arguments"));
+    }
+
+    #[test]
     fn tools_call_returns_tool_error_for_execution_failure() {
         let server = test_server();
+        let dump_path = test_dump_path("mcp-policy");
         let create_response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
@@ -566,7 +667,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "create_session",
-                    "arguments": { "target": { "kind": "mock" } }
+                    "arguments": { "target": { "kind": "dump", "path": dump_path } }
                 }
             }))
             .expect("create response");
@@ -657,17 +758,89 @@ mod tests {
         assert_eq!(response["result"]["serverInfo"]["name"], "dbgflow");
     }
 
+    #[test]
+    fn stdio_runner_can_close_blocked_execute() {
+        let launcher = Arc::new(BlockingWorkerLauncher::default());
+        let manager = SessionManager::with_worker_launcher(
+            launcher,
+            test_artifact_root("stdio-close-blocked-execute"),
+        );
+        let session = manager
+            .create_session(CreateSession {
+                target: DebugTarget::Dump {
+                    path: test_dump_path("stdio-close-blocked-execute-target"),
+                },
+                startup_timeout_ms: None,
+            })
+            .expect("create session");
+        wait_for_manager_break(&manager, session.id);
+        let server = McpServer::new(ToolService::new(manager));
+        let session_id = session.id.to_string();
+        let execute = json!({
+            "jsonrpc": "2.0",
+            "id": "execute",
+            "method": "tools/call",
+            "params": {
+                "name": "execute",
+                "arguments": {
+                    "session_id": session_id,
+                    "command": "k"
+                }
+            }
+        });
+        let close = json!({
+            "jsonrpc": "2.0",
+            "id": "close",
+            "method": "tools/call",
+            "params": {
+                "name": "close_session",
+                "arguments": {
+                    "session_id": session_id
+                }
+            }
+        });
+        let input = Cursor::new(format!("{execute}\n{close}\n"));
+        let mut output = Vec::new();
+
+        run_stdio(server, input, &mut output).expect("run stdio");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        let responses = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json response"))
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert!(responses.iter().any(|response| response["id"] == "close"));
+        let execute_response = responses
+            .iter()
+            .find(|response| response["id"] == "execute")
+            .expect("execute response");
+        assert_eq!(execute_response["result"]["isError"], true);
+    }
+
     fn test_server() -> McpServer {
-        let artifact_root = std::env::temp_dir().join(format!(
-            "dbgflow-mcp-test-{}-{}",
+        McpServer::new(ToolService::new(SessionManager::with_worker_launcher(
+            Arc::new(TestWorkerLauncher::default()),
+            test_artifact_root("dbgflow-mcp-test"),
+        )))
+    }
+
+    fn test_artifact_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
             std::process::id(),
             NEXT_TEST_ARTIFACT_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create test artifact root");
+        root
+    }
 
-        McpServer::new(ToolService::new(SessionManager::with_artifact_root(
-            vec![Arc::new(MockBackend::new())],
-            artifact_root,
-        )))
+    fn test_dump_path(name: &str) -> PathBuf {
+        let root = test_artifact_root(name);
+        let path = root.join("test.dmp");
+        fs::write(&path, b"not a real dump").expect("write fake dump");
+        path
     }
 
     fn tool_text_json(response: &Value) -> Value {
@@ -677,7 +850,7 @@ mod tests {
         serde_json::from_str(text).expect("tool json text")
     }
 
-    fn wait_for_ready(server: &McpServer, session_id: &str) {
+    fn wait_for_break(server: &McpServer, session_id: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let response = server
@@ -694,14 +867,154 @@ mod tests {
                 }))
                 .expect("get session response");
             let session = tool_text_json(&response);
-            if session["state"] == "Ready" {
+            if session["state"] == "Break" {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "session did not become ready: {session}"
+                "session did not break: {session}"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_manager_break(manager: &SessionManager, session_id: SessionId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let session = manager.query_session(session_id).expect("query session");
+            if session.state == SessionState::Break {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session did not break: {session:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[derive(Default)]
+    struct TestWorkerLauncher {
+        next_id: AtomicU64,
+    }
+
+    impl SessionWorkerLauncher for TestWorkerLauncher {
+        fn spawn(
+            &self,
+            _session_id: SessionId,
+            _logger: Arc<dyn dbgflow_core::logging::LogSink>,
+        ) -> Result<Arc<dyn SessionWorker>> {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(TestWorker {
+                backend_session_id: format!("fake-{id}"),
+                closed: Mutex::new(false),
+            }))
+        }
+    }
+
+    struct TestWorker {
+        backend_session_id: String,
+        closed: Mutex<bool>,
+    }
+
+    impl SessionWorker for TestWorker {
+        fn create_session(&self, _request: CreateBackendSession) -> Result<WorkerSession> {
+            Ok(WorkerSession {
+                backend: "fake".to_string(),
+                backend_session_id: self.backend_session_id.clone(),
+                warnings: Vec::new(),
+            })
+        }
+
+        fn execute(&self, command: String) -> Result<ExecuteBackendResult> {
+            Ok(ExecuteBackendResult {
+                output: format!("fake worker executed: {command}"),
+                warnings: Vec::new(),
+            })
+        }
+
+        fn has_exited(&self) -> Result<bool> {
+            Ok(*self.closed.lock().expect("closed lock"))
+        }
+
+        fn close(&self) -> Result<()> {
+            *self.closed.lock().expect("closed lock") = true;
+            Ok(())
+        }
+
+        fn kill(&self, reason: &str) -> Result<()> {
+            *self.closed.lock().expect("closed lock") = true;
+            if reason == "fail-kill" {
+                return Err(dbgflow_core::DbgFlowError::Backend(
+                    "fake kill failed".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingWorkerLauncher {
+        state: Arc<(Mutex<BlockingWorkerState>, Condvar)>,
+    }
+
+    impl SessionWorkerLauncher for BlockingWorkerLauncher {
+        fn spawn(
+            &self,
+            _session_id: SessionId,
+            _logger: Arc<dyn dbgflow_core::logging::LogSink>,
+        ) -> Result<Arc<dyn SessionWorker>> {
+            Ok(Arc::new(BlockingWorker {
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    struct BlockingWorker {
+        state: Arc<(Mutex<BlockingWorkerState>, Condvar)>,
+    }
+
+    impl SessionWorker for BlockingWorker {
+        fn create_session(&self, _request: CreateBackendSession) -> Result<WorkerSession> {
+            Ok(WorkerSession {
+                backend: "fake".to_string(),
+                backend_session_id: "blocking-worker".to_string(),
+                warnings: Vec::new(),
+            })
+        }
+
+        fn execute(&self, _command: String) -> Result<ExecuteBackendResult> {
+            let (lock, cvar) = &*self.state;
+            let mut state = lock.lock().expect("blocking state lock");
+            state.executing = true;
+            cvar.notify_all();
+            while !state.canceled {
+                state = cvar.wait(state).expect("blocking state wait");
+            }
+            Err(dbgflow_core::DbgFlowError::Backend("canceled".to_string()))
+        }
+
+        fn has_exited(&self) -> Result<bool> {
+            let (lock, _) = &*self.state;
+            Ok(lock.lock().expect("blocking state lock").canceled)
+        }
+
+        fn close(&self) -> Result<()> {
+            self.kill("close")
+        }
+
+        fn kill(&self, _reason: &str) -> Result<()> {
+            let (lock, cvar) = &*self.state;
+            let mut state = lock.lock().expect("blocking state lock");
+            state.canceled = true;
+            cvar.notify_all();
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingWorkerState {
+        executing: bool,
+        canceled: bool,
     }
 }

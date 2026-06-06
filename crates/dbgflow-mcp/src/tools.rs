@@ -46,16 +46,8 @@ impl ToolService {
                     "properties": {
                         "target": {
                             "type": "object",
-                            "description": "Debug target. Omit for a mock session.",
+                            "description": "Debug target.",
                             "oneOf": [
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "kind": { "type": "string", "const": "mock" }
-                                    },
-                                    "required": ["kind"],
-                                    "additionalProperties": false
-                                },
                                 {
                                     "type": "object",
                                     "properties": {
@@ -101,6 +93,7 @@ impl ToolService {
                             ]
                         }
                     },
+                    "required": ["target"],
                     "additionalProperties": false
                 }),
             },
@@ -341,15 +334,6 @@ pub struct CreateSessionRequest {
     pub startup_timeout_ms: Option<u64>,
 }
 
-impl Default for CreateSessionRequest {
-    fn default() -> Self {
-        Self {
-            target: DebugTarget::Mock,
-            startup_timeout_ms: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub session_id: SessionId,
@@ -377,7 +361,6 @@ pub struct SetSymbolsRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct McpCreateSessionRequest {
-    #[serde(default)]
     target: McpDebugTarget,
     startup_timeout_ms: Option<u64>,
 }
@@ -394,7 +377,6 @@ impl From<McpCreateSessionRequest> for CreateSessionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum McpDebugTarget {
-    Mock,
     Dump {
         path: PathBuf,
     },
@@ -408,16 +390,9 @@ enum McpDebugTarget {
     },
 }
 
-impl Default for McpDebugTarget {
-    fn default() -> Self {
-        Self::Mock
-    }
-}
-
 impl From<McpDebugTarget> for DebugTarget {
     fn from(value: McpDebugTarget) -> Self {
         match value {
-            McpDebugTarget::Mock => DebugTarget::Mock,
             McpDebugTarget::Dump { path } => DebugTarget::Dump { path },
             McpDebugTarget::Attach { pid } => DebugTarget::Attach { pid },
             McpDebugTarget::Launch { executable, args } => DebugTarget::Launch { executable, args },

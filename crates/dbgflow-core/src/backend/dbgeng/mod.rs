@@ -83,12 +83,6 @@ impl DebugBackend for DbgEngBackend {
     }
 
     fn create_session(&self, request: CreateBackendSession) -> Result<BackendSession> {
-        if matches!(request.target, DebugTarget::Mock) {
-            return Err(DbgFlowError::Backend(
-                "DbgEngBackend does not support mock targets".to_string(),
-            ));
-        }
-
         let id = format!("dbgeng-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::sync_channel(1);
@@ -683,11 +677,6 @@ impl DbgEngSession {
                                 "WaitForEvent after launch failed: {error}"
                             ))
                         })?;
-                    }
-                    DebugTarget::Mock => {
-                        return Err(DbgFlowError::Backend(
-                            "DbgEngSession does not support mock targets".to_string(),
-                        ));
                     }
                 }
             }

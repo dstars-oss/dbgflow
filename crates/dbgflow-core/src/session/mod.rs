@@ -1,5 +1,6 @@
 mod manager;
 mod state;
+pub mod worker;
 
 pub use manager::{
     CreateSession, ExecuteSession, ExecuteSessionResult, OperationStatus, OperationSummary,

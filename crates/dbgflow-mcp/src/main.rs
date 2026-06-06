@@ -22,6 +22,9 @@ fn run() -> Result<(), String> {
         .map_err(|_| "command must be valid UTF-8".to_string())?;
 
     match command.as_str() {
+        dbgflow_core::session::worker::SESSION_WORKER_COMMAND => {
+            run_session_worker().map_err(|error| format!("session worker error: {error}"))
+        }
         "http" => {
             let config = parse_options(args)?;
             let (_shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -45,10 +48,14 @@ fn run_stdio_server() -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
-    run_stdio(
-        default_server(),
+    run_stdio(default_server(), BufReader::new(stdin.lock()), stdout)
+}
+
+fn run_session_worker() -> io::Result<()> {
+    let stdin = io::stdin();
+    dbgflow_core::session::worker::run_session_worker_stdio(
         BufReader::new(stdin.lock()),
-        stdout.lock(),
+        io::stdout(),
     )
 }
 

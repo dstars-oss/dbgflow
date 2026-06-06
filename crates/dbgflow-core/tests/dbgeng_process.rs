@@ -1,12 +1,15 @@
 #![cfg(windows)]
 
 use dbgflow_core::backend::dbgeng::DbgEngBackend;
-use dbgflow_core::backend::mock::MockBackend;
-use dbgflow_core::backend::DebugTarget;
+use dbgflow_core::backend::{
+    CreateBackendSession, DebugBackend, DebugTarget, ExecuteBackendResult,
+};
+use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
 use dbgflow_core::session::{CreateSession, ExecuteSession, SessionManager, SessionState};
+use dbgflow_core::Result;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const CHILD_SLEEP_ENV: &str = "DBGFLOW_PROCESS_SLEEP_CHILD";
@@ -111,13 +114,7 @@ fn cleanup_child(child: &mut Child) {
 }
 
 fn dbgeng_manager(artifact_root: &PathBuf) -> SessionManager {
-    SessionManager::with_artifact_root(
-        vec![
-            std::sync::Arc::new(MockBackend::new()),
-            std::sync::Arc::new(DbgEngBackend::new()),
-        ],
-        artifact_root,
-    )
+    SessionManager::with_worker_launcher(Arc::new(InProcessDbgEngWorkerLauncher), artifact_root)
 }
 
 fn ping_exe() -> PathBuf {
@@ -178,5 +175,84 @@ impl Drop for EnvVarGuard {
         } else {
             std::env::remove_var(self.key);
         }
+    }
+}
+
+struct InProcessDbgEngWorkerLauncher;
+
+impl SessionWorkerLauncher for InProcessDbgEngWorkerLauncher {
+    fn spawn(
+        &self,
+        _session_id: dbgflow_core::session::SessionId,
+        _logger: Arc<dyn dbgflow_core::logging::LogSink>,
+    ) -> Result<Arc<dyn SessionWorker>> {
+        Ok(Arc::new(InProcessDbgEngWorker {
+            backend: DbgEngBackend::new(),
+            backend_session_id: Mutex::new(None),
+        }))
+    }
+}
+
+struct InProcessDbgEngWorker {
+    backend: DbgEngBackend,
+    backend_session_id: Mutex<Option<String>>,
+}
+
+impl SessionWorker for InProcessDbgEngWorker {
+    fn create_session(&self, request: CreateBackendSession) -> Result<WorkerSession> {
+        let session = self.backend.create_session(request)?;
+        *self.backend_session_id.lock().map_err(|_| {
+            dbgflow_core::DbgFlowError::Backend("test worker lock poisoned".into())
+        })? = Some(session.id.clone());
+        Ok(WorkerSession {
+            backend: self.backend.info().name,
+            backend_session_id: session.id,
+            warnings: session.warnings,
+        })
+    }
+
+    fn execute(&self, command: String) -> Result<ExecuteBackendResult> {
+        let backend_session_id = self
+            .backend_session_id
+            .lock()
+            .map_err(|_| dbgflow_core::DbgFlowError::Backend("test worker lock poisoned".into()))?
+            .clone()
+            .ok_or_else(|| {
+                dbgflow_core::DbgFlowError::Backend("test worker not initialized".into())
+            })?;
+        self.backend
+            .execute(dbgflow_core::backend::ExecuteBackendRequest {
+                backend_session_id,
+                command,
+            })
+    }
+
+    fn has_exited(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn close(&self) -> Result<()> {
+        let backend_session_id = self
+            .backend_session_id
+            .lock()
+            .map_err(|_| dbgflow_core::DbgFlowError::Backend("test worker lock poisoned".into()))?
+            .take();
+        if let Some(backend_session_id) = backend_session_id {
+            self.backend.close_session(&backend_session_id)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn kill(&self, _reason: &str) -> Result<()> {
+        let backend_session_id = self
+            .backend_session_id
+            .lock()
+            .map_err(|_| dbgflow_core::DbgFlowError::Backend("test worker lock poisoned".into()))?
+            .clone();
+        if let Some(backend_session_id) = backend_session_id {
+            let _ = self.backend.cancel_session(&backend_session_id);
+        }
+        Ok(())
     }
 }

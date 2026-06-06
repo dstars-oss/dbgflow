@@ -9,8 +9,8 @@ DbgEng dump-analysis / process-debugging MVP, a stdio MCP server, a local
 Streamable HTTP MCP endpoint, and Windows service scripts:
 
 - backend abstraction
-- mock backend
 - session lifecycle management
+- per-session debug worker subprocess isolation
 - command policy
 - artifact manager
 - DbgEng backend for dump targets
@@ -35,11 +35,15 @@ Initial tool names:
 `Starting` session while the backend opens the target in the background. Use
 `get_session`, `list_sessions`, or the HTTP resource update stream to observe
 the transition to `Ready`, `Break`, `Closed`, or `Error`.
+`target` is required; dbgflow no longer exposes a mock target in the MCP tool
+schema.
 
 On Windows, DbgEng sessions use `dbgeng.dll` resolved in this order: WinDbg /
 WinDbg Preview app package, Windows SDK Debuggers, then System32 fallback.
 DbgEng targets currently support dump files, process attach by PID, and process
-launch by executable path plus argument list.
+launch by executable path plus argument list. Each real debug session runs in
+its own worker subprocess; the main MCP process handles message dispatch,
+session state, policy, artifacts, logs, and worker lifecycle control.
 
 Example targets:
 
@@ -73,7 +77,9 @@ command is running, the session exposes `current_operation` plus a
 fields. Clients can observe progress with `get_session`, `resources/read`, or
 the HTTP resource update stream. Legacy timeout fields are accepted for
 compatibility, ignored, and logged as warnings. `close_session` requests backend
-cancellation before closing a session that is currently executing a command.
+cancellation before closing a session that is currently executing a command; if
+the worker is stuck, the main process can terminate that session's worker
+without taking down other sessions or the MCP server.
 
 Run the MCP server over stdio:
 

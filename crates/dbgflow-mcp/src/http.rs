@@ -345,11 +345,9 @@ mod tests {
     };
     use crate::mcp::McpServer;
     use crate::tools::ToolService;
-    use dbgflow_core::backend::mock::MockBackend;
     use dbgflow_core::session::SessionManager;
     use serde_json::{json, Value};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     #[test]
     fn validates_json_content_type() {
@@ -444,7 +442,6 @@ mod tests {
 
     fn test_server() -> McpServer {
         McpServer::new(ToolService::new(SessionManager::with_artifact_root(
-            vec![Arc::new(MockBackend::new())],
             std::env::temp_dir().join(format!("dbgflow-http-test-{}", std::process::id())),
         )))
     }
