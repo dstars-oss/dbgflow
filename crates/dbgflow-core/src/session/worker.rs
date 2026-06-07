@@ -751,6 +751,28 @@ mod tests {
     }
 
     #[test]
+    fn apply_proxy_environment_leaves_env_unchanged_when_proxy_is_none() {
+        let mut command = Command::new("dbgflow-test");
+
+        apply_proxy_environment(&mut command, &ProxyEnvironment::none());
+
+        let envs = command_envs(&command);
+        for key in [
+            "_NT_SYMBOL_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            assert!(!envs.contains_key(key), "expected {key} to be untouched");
+        }
+    }
+
+    #[test]
     fn apply_proxy_environment_removes_known_proxy_keys_when_disabled() {
         let mut command = Command::new("dbgflow-test");
 

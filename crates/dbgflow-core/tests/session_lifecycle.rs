@@ -570,7 +570,7 @@ fn session_manager_passes_proxy_environment_to_worker_launcher() {
 }
 
 #[test]
-fn legacy_worker_launcher_constructor_passes_empty_proxy_environment() {
+fn legacy_worker_launcher_constructor_does_not_intervene_in_proxy_environment() {
     let _env_guard = ProxyEnvGuard::with_proxy_environment();
     let observed_proxy = Arc::new(Mutex::new(None));
     let launcher = RecordingProxyWorkerLauncher {
@@ -598,6 +598,7 @@ fn legacy_worker_launcher_constructor_passes_empty_proxy_environment() {
         .expect("proxy observed");
     assert_eq!(observed.source(), ProxySource::None);
     assert!(observed.proxy_keys().is_empty());
+    assert!(observed.removed_keys().is_empty());
     assert!(observed.value_for("HTTP_PROXY").is_none());
 }
 

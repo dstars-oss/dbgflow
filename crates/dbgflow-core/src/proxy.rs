@@ -105,11 +105,15 @@ impl ProxyEnvironment {
     }
 
     pub fn removed_keys(&self) -> Vec<&'static str> {
-        ALL_PROXY_KEYS
-            .iter()
-            .copied()
-            .filter(|key| !self.vars.contains_key(*key))
-            .collect()
+        match self.source {
+            ProxySource::None => Vec::new(),
+            ProxySource::Disabled => ALL_PROXY_KEYS.to_vec(),
+            ProxySource::Cli | ProxySource::Environment => ALL_PROXY_KEYS
+                .iter()
+                .copied()
+                .filter(|key| !self.vars.contains_key(*key))
+                .collect(),
+        }
     }
 
     pub fn proxy_keys(&self) -> Vec<&'static str> {
@@ -392,6 +396,14 @@ mod tests {
         assert!(proxy.removed_keys().contains(&"HTTP_PROXY"));
         assert!(proxy.removed_keys().contains(&"http_proxy"));
         assert!(proxy.removed_keys().contains(&"NO_PROXY"));
+    }
+
+    #[test]
+    fn no_proxy_environment_does_not_remove_proxy_vars() {
+        let proxy = ProxyEnvironment::none();
+
+        assert_eq!(proxy.source(), ProxySource::None);
+        assert!(proxy.removed_keys().is_empty());
     }
 
     #[test]
