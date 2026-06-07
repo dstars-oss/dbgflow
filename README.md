@@ -20,6 +20,7 @@ endpoint, and Windows service install / uninstall subcommands:
 - Streamable HTTP MCP endpoint at `/mcp` with resource update SSE
 - native Windows service mode
 - native Windows service install / uninstall subcommands
+- main-service proxy configuration for session workers and SymSrv symbol downloads
 
 Initial tool names:
 
@@ -91,6 +92,12 @@ Run the MCP server over local Streamable HTTP from the repository root:
 cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir .\var
 ```
 
+To configure runtime proxy settings for all session workers:
+
+```text
+cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir .\var --proxy-url http://127.0.0.1:7897
+```
+
 The HTTP endpoint is `http://127.0.0.1:7331/mcp`. `POST /mcp` returns JSON
 responses. `GET /mcp` opens a server-sent event stream for MCP notifications,
 including `notifications/resources/updated` for session state changes. `GET
@@ -99,6 +106,14 @@ including `notifications/resources/updated` for session state changes. `GET
 The HTTP transport is local-only: dbgflow only accepts loopback bind addresses
 and rejects non-localhost `Origin` headers. `/mcp` does not require bearer token
 authentication. HTTP request bodies are limited to 16 MiB.
+
+Proxy configuration is service-wide. Pass `--proxy-url http://127.0.0.1:7897`
+to set `_NT_SYMBOL_PROXY=127.0.0.1:7897` for DbgEng/SymSrv symbol downloads
+and `HTTP_PROXY` / `HTTPS_PROXY` plus lowercase equivalents for session workers
+and launched debuggees. Pass `--no-proxy` to clear known proxy variables for
+session workers. If neither option is passed, dbgflow reads `_NT_SYMBOL_PROXY`,
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` from its process
+environment.
 
 The server supports `initialize`, `notifications/initialized`, `ping`,
 `tools/list`, `tools/call`, `resources/list`, and `resources/read`. Tool
@@ -126,6 +141,12 @@ service parameters. The install subcommand copies its current executable to
 --data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks `/healthz`.
 Service artifacts and logs are written under `%LOCALAPPDATA%\dbgflow\var`.
 Uninstall does not delete artifacts or logs by default.
+
+The install script configures the Windows service environment with
+`http://127.0.0.1:7897` by default, including `_NT_SYMBOL_PROXY=127.0.0.1:7897`.
+Use `-ProxyUrl <url>` to choose another proxy. Use `-NoProxy` to write empty
+known service proxy keys and override inherited machine or system proxy
+environment variables.
 
 Live process DbgEng integration tests are ignored by default because attach and
 launch behavior depends on local debugger permissions and target process state.
