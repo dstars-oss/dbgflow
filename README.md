@@ -106,8 +106,8 @@ to set `_NT_SYMBOL_PROXY=127.0.0.1:7897` for DbgEng/SymSrv symbol downloads
 and `HTTP_PROXY` / `HTTPS_PROXY` plus lowercase equivalents for session workers
 and launched debuggees. Pass `--no-proxy` to clear known proxy variables for
 session workers. If neither option is passed, dbgflow reads `_NT_SYMBOL_PROXY`,
-`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` from its process
-environment.
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, and lowercase equivalents
+from its process environment.
 
 The server supports `initialize`, `notifications/initialized`, `ping`,
 `tools/list`, `tools/call`, `resources/list`, and `resources/read`. Tool
