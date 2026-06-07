@@ -6,7 +6,10 @@ pub mod native_etw;
 pub mod procmon;
 pub mod target;
 
-pub use collector::{CollectorFactory, CollectorStart, CollectorStop, ProfileCollector};
+pub use collector::{
+    CollectorFactory, CollectorStart, CollectorStop, DefaultProfileCollectorFactory,
+    ProfileCollector,
+};
 pub use id::ProfileId;
 pub use manager::ProfileManager;
 pub use model::{

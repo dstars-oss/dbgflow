@@ -27,11 +27,11 @@ impl ProfileManager {
 
     pub fn with_runtime(
         artifact_root: impl Into<PathBuf>,
-        _procmon: super::ProcmonRuntime,
+        procmon: super::ProcmonRuntime,
     ) -> Self {
         Self::with_components(
             artifact_root,
-            Arc::new(super::native_etw::NativeEtwCollectorFactory),
+            Arc::new(super::DefaultProfileCollectorFactory::new(procmon)),
             Arc::new(ProcessTargetRunner),
         )
     }

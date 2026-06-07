@@ -361,6 +361,34 @@ fn run_profile_collector_start_failure_does_not_launch_target() {
 }
 
 #[test]
+fn run_profile_procmon_without_sysinternals_dir_does_not_launch_target() {
+    let root = test_profile_root("procmon-unavailable");
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(dbgflow_core::profile::DefaultProfileCollectorFactory::new(
+            dbgflow_core::profile::ProcmonRuntime::unavailable(),
+        )),
+        Arc::new(PanicTargetRunner),
+    );
+
+    let error = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1,
+            collectors: vec![ProfileCollectorConfig::Procmon {
+                capture_stacks: false,
+                filters: Default::default(),
+            }],
+        })
+        .expect_err("procmon unavailable");
+
+    assert!(error.to_string().contains("--sysinternals-dir"));
+}
+
+#[test]
 fn run_profile_starts_and_stops_collectors_in_reverse_stop_order() {
     let root = test_profile_root("multi-collector");
     let collector_state = Arc::new(Mutex::new(Vec::new()));
