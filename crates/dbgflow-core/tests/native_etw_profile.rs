@@ -31,15 +31,14 @@ fn native_etw_run_profile_writes_etl_for_cmd() {
         ProfileCompletionReason::TargetExited
     );
     assert_eq!(result.error, None);
-    assert!(result.artifacts.trace.path.is_file());
+    let trace = result
+        .artifacts
+        .trace
+        .as_ref()
+        .expect("legacy trace artifact");
+    assert!(trace.path.is_file());
     assert!(
-        result
-            .artifacts
-            .trace
-            .path
-            .metadata()
-            .expect("trace metadata")
-            .len()
+        trace.path.metadata().expect("trace metadata").len()
             > 0,
         "expected non-empty ETL"
     );

@@ -64,6 +64,8 @@ impl ArtifactManager {
         let dir = self.ensure_profile_dir_unlocked(profile_id)?;
         fs::create_dir_all(dir.join("target"))
             .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        fs::create_dir_all(dir.join("collectors"))
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
         touch(&dir.join("events.jsonl"))?;
         Ok(dir)
     }
@@ -104,6 +106,46 @@ impl ArtifactManager {
             .join(profile_id.to_string())
             .join("target")
             .join("stderr.txt")
+    }
+
+    pub fn profile_collector_dir(
+        &self,
+        profile_id: ProfileId,
+        collector_name: &str,
+    ) -> Result<PathBuf> {
+        if collector_name.is_empty()
+            || collector_name
+                .chars()
+                .any(|ch| matches!(ch, '/' | '\\') || ch.is_control())
+        {
+            return Err(DbgFlowError::Artifact(
+                "profile collector artifact name is invalid".to_string(),
+            ));
+        }
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let dir = self
+            .ensure_profile_dir_unlocked(profile_id)?
+            .join("collectors")
+            .join(collector_name);
+        fs::create_dir_all(&dir).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(dir)
+    }
+
+    pub fn profile_collector_artifact_path(
+        &self,
+        profile_id: ProfileId,
+        collector_name: &str,
+        file_name: &str,
+    ) -> PathBuf {
+        self.root
+            .join("profiles")
+            .join(profile_id.to_string())
+            .join("collectors")
+            .join(collector_name)
+            .join(file_name)
     }
 
     pub fn append_event(&self, session_id: SessionId, event: &SessionArtifactEvent) -> Result<()> {
@@ -241,6 +283,9 @@ pub enum ArtifactKind {
     ProfileEvents,
     ProfileStdout,
     ProfileStderr,
+    ProfileCollectorTrace,
+    ProfileCollectorSummary,
+    ProfileCollectorEvents,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +377,7 @@ mod tests {
         assert_eq!(dir, root.join("profiles").join(profile_id.to_string()));
         assert!(dir.join("events.jsonl").is_file());
         assert!(dir.join("target").is_dir());
+        assert!(dir.join("collectors").is_dir());
         assert_eq!(
             artifacts.profile_trace_path(profile_id),
             dir.join("trace.etl")
@@ -339,6 +385,34 @@ mod tests {
         assert_eq!(
             artifacts.profile_metadata_path(profile_id),
             dir.join("profile.json")
+        );
+    }
+
+    #[test]
+    fn profile_collector_artifacts_are_under_named_collector_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "dbgflow-profile-collector-artifacts-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let artifacts = ArtifactManager::new(&root);
+        let profile_id = ProfileId::new();
+
+        let dir = artifacts
+            .profile_collector_dir(profile_id, "procmon")
+            .expect("collector dir");
+
+        assert_eq!(
+            dir,
+            root.join("profiles")
+                .join(profile_id.to_string())
+                .join("collectors")
+                .join("procmon")
+        );
+        assert!(dir.is_dir());
+        assert_eq!(
+            artifacts.profile_collector_artifact_path(profile_id, "procmon", "capture.pml"),
+            dir.join("capture.pml")
         );
     }
 
