@@ -887,6 +887,25 @@ mod tests {
     }
 
     #[test]
+    fn service_install_launch_arguments_do_not_include_proxy_url() {
+        let config = parse_service_install_options([
+            OsString::from("--service-name"),
+            OsString::from("dbgflow-dev"),
+            OsString::from("--install-root=C:\\dbgflow"),
+        ])
+        .expect("parse service install options");
+
+        assert!(!config
+            .service_launch_arguments()
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("7897")));
+        assert!(!config
+            .normalized_command_args()
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("7897")));
+    }
+
+    #[test]
     fn service_install_rejects_removed_repo_root_option() {
         let error = parse_service_install_options([
             OsString::from("--install-root=C:\\dbgflow"),
