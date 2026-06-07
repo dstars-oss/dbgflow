@@ -113,7 +113,10 @@ Profile 请求示例：
 `--sysinternals-dir <path>` 配置 service 或 HTTP runtime；dbgflow 只会从该
 目录中派生 `Procmon64.exe` 或 `Procmon.exe`。如果未配置该参数，依赖
 Sysinternals 的能力会返回明确错误，且不会启动目标进程。dbgflow 不下载
-Procmon、不扫描全盘，也不接受单独的 Procmon exe 路径。
+Procmon、不扫描全盘，也不接受单独的 Procmon exe 路径。Procmon 会写入
+权威 artifact `capture.pml`，并导出 `events.csv` 以及按 target PID /
+operation / path best-effort 过滤后的 `events.jsonl`；请求 stack capture 时，
+dbgflow 也会请求带 stack 数据的 XML 导出。
 
 `eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。如果 DbgEng 报告目标正在运行，session state 会变为 `Running`；下一次 debug event 返回后恢复为 `Break`，如果 backend 报告 no debuggee 则变为 `Closed`。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
 如果 worker 卡住，主进程可以终止该 session 对应的 worker 子进程，不会拖垮其他 session 或 MCP server。

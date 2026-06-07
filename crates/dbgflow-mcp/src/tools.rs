@@ -515,8 +515,7 @@ struct RawRunProfileRequest {
     target: dbgflow_core::profile::ProfileTarget,
     timeout_ms: u64,
     collector: Option<ProfileCollectorConfig>,
-    #[serde(default)]
-    collectors: Vec<ProfileCollectorConfig>,
+    collectors: Option<Vec<ProfileCollectorConfig>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -595,15 +594,23 @@ impl<'de> Deserialize<'de> for RunProfileRequest {
         D: serde::Deserializer<'de>,
     {
         let raw = RawRunProfileRequest::deserialize(deserializer)?;
-        if raw.collector.is_some() && !raw.collectors.is_empty() {
+        if raw.collector.is_some() && raw.collectors.is_some() {
             return Err(serde::de::Error::custom(
                 "collector and collectors cannot both be set",
             ));
         }
-        let collectors = match raw.collector {
-            Some(collector) => vec![collector],
-            None if raw.collectors.is_empty() => vec![ProfileCollectorConfig::default()],
-            None => raw.collectors,
+        let collectors = match (raw.collector, raw.collectors) {
+            (Some(collector), None) => vec![collector],
+            (None, None) => vec![ProfileCollectorConfig::default()],
+            (None, Some(collectors)) => {
+                if collectors.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "collectors must contain at least one collector",
+                    ));
+                }
+                collectors
+            }
+            (Some(_), Some(_)) => unreachable!("checked above"),
         };
         Ok(Self {
             target: raw.target,
@@ -742,5 +749,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("collector and collectors cannot both be set"));
+    }
+
+    #[test]
+    fn run_profile_arguments_reject_empty_collectors_array() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collectors": []
+        });
+
+        let error = decode_arguments::<RunProfileRequest>(value).expect_err("reject empty array");
+        assert!(error
+            .to_string()
+            .contains("collectors must contain at least one collector"));
     }
 }

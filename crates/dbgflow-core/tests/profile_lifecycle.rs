@@ -124,7 +124,7 @@ fn fake_collector_records_start_and_stop_calls() {
 
     let started = collector.start().expect("start collector");
     assert_eq!(started.warnings, Vec::<String>::new());
-    let stopped = collector.stop().expect("stop collector");
+    let stopped = collector.stop(None).expect("stop collector");
     assert_eq!(stopped.warnings, Vec::<String>::new());
 
     assert_eq!(
@@ -190,7 +190,7 @@ impl ProfileCollector for TestCollector {
         })
     }
 
-    fn stop(&self) -> Result<CollectorStop> {
+    fn stop(&self, _target_pid: Option<u32>) -> Result<CollectorStop> {
         self.state
             .lock()
             .expect("state")
@@ -492,9 +492,81 @@ fn run_profile_start_failure_stops_already_started_collectors() {
         &[
             "start:native_etw".to_string(),
             "start:procmon".to_string(),
+            "cleanup:procmon".to_string(),
             "stop:native_etw".to_string(),
         ]
     );
+}
+
+#[test]
+fn run_profile_start_failure_cleans_up_failing_collector() {
+    let root = test_profile_root("start-failure-cleanup");
+    let collector_state = Arc::new(Mutex::new(Vec::new()));
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory {
+            state: collector_state.clone(),
+            fail_start: false,
+            fail_stop: false,
+            fail_start_for: Some("native_etw".to_string()),
+            fail_stop_for: None,
+        }),
+        Arc::new(PanicTargetRunner),
+    );
+
+    let error = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            collectors: vec![ProfileCollectorConfig::NativeEtw {
+                preset: ProfilePreset::SystemOverview,
+            }],
+        })
+        .expect_err("collector start fails");
+
+    assert!(error
+        .to_string()
+        .contains("collector start failed: native_etw"));
+    assert_eq!(
+        collector_state.lock().expect("state").as_slice(),
+        &[
+            "start:native_etw".to_string(),
+            "cleanup:native_etw".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn run_profile_rejects_duplicate_collector_kinds() {
+    let root = test_profile_root("duplicate-collectors");
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory::default()),
+        Arc::new(PanicTargetRunner),
+    );
+
+    let error = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            collectors: vec![
+                ProfileCollectorConfig::NativeEtw {
+                    preset: ProfilePreset::SystemOverview,
+                },
+                ProfileCollectorConfig::NativeEtw {
+                    preset: ProfilePreset::SystemOverview,
+                },
+            ],
+        })
+        .expect_err("duplicate collectors rejected");
+
+    assert!(error.to_string().contains("duplicate profile collector"));
 }
 
 fn test_profile_root(name: &str) -> std::path::PathBuf {

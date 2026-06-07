@@ -150,7 +150,7 @@ impl ProfileCollector for NativeEtwCollector {
         })
     }
 
-    fn stop(&self) -> Result<CollectorStop> {
+    fn stop(&self, _target_pid: Option<u32>) -> Result<CollectorStop> {
         let mut state = self
             .state
             .lock()

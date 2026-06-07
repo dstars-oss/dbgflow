@@ -135,6 +135,10 @@ derives `Procmon64.exe` or `Procmon.exe` from that directory. If the option is
 not configured, Sysinternals-dependent features return a clear error and the
 target is not launched. dbgflow does not download Procmon, does not scan the
 whole machine, and does not accept a standalone Procmon executable path.
+Procmon writes `capture.pml` as the authoritative artifact and exports
+`events.csv` plus a best-effort target PID / operation / path filtered
+`events.jsonl`; when stack capture is requested, dbgflow also requests an XML
+export with stack data.
 
 `eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a

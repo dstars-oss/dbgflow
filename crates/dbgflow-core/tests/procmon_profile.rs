@@ -43,4 +43,12 @@ fn procmon_run_profile_writes_pml_for_cmd() {
         .artifacts
         .iter()
         .any(|artifact| artifact.path.extension().is_some_and(|ext| ext == "pml")));
+    assert!(procmon
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.path.ends_with("events.csv")));
+    assert!(procmon
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.path.ends_with("events.jsonl")));
 }

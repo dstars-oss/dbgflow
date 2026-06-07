@@ -7,7 +7,7 @@ pub trait ProfileCollector: Send + Sync {
     fn name(&self) -> &str;
     fn kind(&self) -> ProfileCollectorKind;
     fn start(&self) -> Result<CollectorStart>;
-    fn stop(&self) -> Result<CollectorStop>;
+    fn stop(&self, target_pid: Option<u32>) -> Result<CollectorStop>;
     fn cleanup(&self) -> Result<()>;
 }
 

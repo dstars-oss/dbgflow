@@ -1,7 +1,8 @@
 use super::{
     validate_profile_target, CollectorFactory, ProcessTargetRunner, ProfileArtifacts,
-    ProfileCollector, ProfileCollectorResult, ProfileCollectorStatus, ProfileCompletionReason,
-    ProfileId, ProfileResult, ProfileStatus, RunProfile, TargetExit, TargetRunner,
+    ProfileCollector, ProfileCollectorKind, ProfileCollectorResult, ProfileCollectorStatus,
+    ProfileCompletionReason, ProfileId, ProfileResult, ProfileStatus, RunProfile, TargetExit,
+    TargetRunner,
 };
 use crate::artifacts::{ArtifactKind, ArtifactManager, ArtifactRef, ProfileArtifactEvent};
 use crate::{DbgFlowError, Result};
@@ -53,6 +54,7 @@ impl ProfileManager {
                 "profile timeout_ms must be greater than zero".to_string(),
             ));
         }
+        reject_duplicate_collectors(&request)?;
         let profile_id = ProfileId::new();
         {
             let mut active = self.active_job.lock().map_err(|_| {
@@ -130,6 +132,7 @@ impl ProfileManager {
                     started_collectors.push(collector);
                 }
                 Err(error) => {
+                    let _ = collector.cleanup();
                     stop_started_collectors_for_start_failure(
                         self,
                         profile_id,
@@ -155,6 +158,7 @@ impl ProfileManager {
             &stderr_path,
         );
 
+        let target_pid_for_collectors = target_pid_from_exit(&target_exit);
         let mut stop_error = None;
         let mut collector_results = Vec::new();
         for collector in started_collectors.into_iter().rev() {
@@ -163,7 +167,7 @@ impl ProfileManager {
             let mut fields = Map::new();
             fields.insert("collector".to_string(), Value::String(name.clone()));
             self.record_event(profile_id, "collector_stopping", None, None, fields.clone());
-            match collector.stop() {
+            match collector.stop(target_pid_for_collectors) {
                 Ok(stop) => {
                     warnings.extend(stop.warnings.clone());
                     self.record_event(profile_id, "collector_stopped", None, None, fields);
@@ -379,6 +383,28 @@ fn collector_fields(config: &super::ProfileCollectorConfig) -> Map<String, Value
     fields
 }
 
+fn reject_duplicate_collectors(request: &RunProfile) -> Result<()> {
+    let mut seen = Vec::<ProfileCollectorKind>::new();
+    for collector in &request.collectors {
+        let kind = collector.kind();
+        if seen.contains(&kind) {
+            return Err(DbgFlowError::Backend(format!(
+                "duplicate profile collector kind is not supported: {:?}",
+                kind
+            )));
+        }
+        seen.push(kind);
+    }
+    Ok(())
+}
+
+fn target_pid_from_exit(target_exit: &Result<TargetExit>) -> Option<u32> {
+    match target_exit {
+        Ok(TargetExit::Exited { pid, .. }) | Ok(TargetExit::TimedOut { pid }) => Some(*pid),
+        Err(_) => None,
+    }
+}
+
 fn legacy_trace_artifact(results: &[ProfileCollectorResult]) -> Option<ArtifactRef> {
     results
         .iter()
@@ -405,7 +431,7 @@ fn stop_started_collectors_for_start_failure(
         let mut fields = Map::new();
         fields.insert("collector".to_string(), Value::String(name));
         manager.record_event(profile_id, "collector_stopping", None, None, fields.clone());
-        match collector.stop() {
+        match collector.stop(None) {
             Ok(_) => manager.record_event(profile_id, "collector_stopped", None, None, fields),
             Err(error) => manager.record_event(
                 profile_id,
