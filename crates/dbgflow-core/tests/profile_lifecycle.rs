@@ -7,7 +7,7 @@ use dbgflow_core::profile::{
 use dbgflow_core::Result;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[test]
@@ -313,4 +313,203 @@ impl TargetRunner for PanicTargetRunner {
     ) -> Result<TargetExit> {
         panic!("target runner must not be called when collector start fails");
     }
+}
+
+#[test]
+fn run_profile_rejects_concurrent_profile_job() {
+    let root = test_profile_root("concurrent");
+    let blocker = Arc::new((Mutex::new(BlockingTargetState::default()), Condvar::new()));
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory::default()),
+        Arc::new(BlockingTargetRunner {
+            blocker: blocker.clone(),
+        }),
+    );
+    let request = RunProfile {
+        target: ProfileTarget::Launch {
+            executable: std::env::current_exe().expect("current exe"),
+            args: Vec::new(),
+        },
+        timeout_ms: 1000,
+        collector: ProfileCollectorConfig::default(),
+    };
+    let first_manager = manager.clone();
+    let first_request = request.clone();
+    let first = std::thread::spawn(move || first_manager.run_profile(first_request));
+
+    wait_until_blocking_runner_started(&blocker);
+    let error = manager
+        .run_profile(request)
+        .expect_err("second profile should be rejected");
+    assert!(error.to_string().contains("already active"));
+
+    release_blocking_runner(&blocker);
+    first.join().expect("first thread").expect("first profile");
+}
+
+#[test]
+fn target_launch_failure_after_collector_start_returns_failed_result_and_stops_collector() {
+    let root = test_profile_root("target-launch-failure");
+    let collector_state = Arc::new(Mutex::new(Vec::new()));
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory {
+            state: collector_state.clone(),
+            fail_start: false,
+            fail_stop: false,
+        }),
+        Arc::new(FailingTargetRunner),
+    );
+
+    let result = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            collector: ProfileCollectorConfig::default(),
+        })
+        .expect("failed profile result");
+
+    assert_eq!(result.status, ProfileStatus::Failed);
+    assert_eq!(
+        result.completion_reason,
+        ProfileCompletionReason::TargetLaunchFailed
+    );
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("target failed")));
+    assert_eq!(
+        collector_state.lock().expect("state").as_slice(),
+        &["start".to_string(), "stop".to_string()]
+    );
+}
+
+#[test]
+fn run_profile_allows_new_job_after_failed_profile() {
+    let root = test_profile_root("failure-releases-active");
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory::default()),
+        Arc::new(SequenceTargetRunner {
+            exits: Mutex::new(vec![
+                Err(dbgflow_core::DbgFlowError::Backend(
+                    "target failed".to_string(),
+                )),
+                Ok(TargetExit::Exited {
+                    pid: 99,
+                    exit_code: Some(0),
+                }),
+            ]),
+        }),
+    );
+    let request = RunProfile {
+        target: ProfileTarget::Launch {
+            executable: std::env::current_exe().expect("current exe"),
+            args: Vec::new(),
+        },
+        timeout_ms: 1000,
+        collector: ProfileCollectorConfig::default(),
+    };
+
+    let first = manager
+        .run_profile(request.clone())
+        .expect("first returns failed profile result");
+    assert_eq!(first.status, ProfileStatus::Failed);
+
+    let second = manager.run_profile(request).expect("second profile starts");
+    assert_eq!(second.status, ProfileStatus::Completed);
+    assert_eq!(second.target_pid, Some(99));
+}
+
+struct BlockingTargetRunner {
+    blocker: Arc<(Mutex<BlockingTargetState>, Condvar)>,
+}
+
+impl TargetRunner for BlockingTargetRunner {
+    fn launch_and_wait(
+        &self,
+        _target: &ProfileTarget,
+        _timeout: Duration,
+        _stdout_path: &Path,
+        _stderr_path: &Path,
+    ) -> Result<TargetExit> {
+        let (lock, cvar) = &*self.blocker;
+        let mut state = lock.lock().expect("blocker lock");
+        state.started = true;
+        cvar.notify_all();
+        while !state.released {
+            state = cvar.wait(state).expect("blocker wait");
+        }
+        Ok(TargetExit::Exited {
+            pid: 1,
+            exit_code: Some(0),
+        })
+    }
+}
+
+#[derive(Default)]
+struct BlockingTargetState {
+    started: bool,
+    released: bool,
+}
+
+struct FailingTargetRunner;
+
+impl TargetRunner for FailingTargetRunner {
+    fn launch_and_wait(
+        &self,
+        _target: &ProfileTarget,
+        _timeout: Duration,
+        _stdout_path: &Path,
+        _stderr_path: &Path,
+    ) -> Result<TargetExit> {
+        Err(dbgflow_core::DbgFlowError::Backend(
+            "target failed".to_string(),
+        ))
+    }
+}
+
+struct SequenceTargetRunner {
+    exits: Mutex<Vec<Result<TargetExit>>>,
+}
+
+impl TargetRunner for SequenceTargetRunner {
+    fn launch_and_wait(
+        &self,
+        _target: &ProfileTarget,
+        _timeout: Duration,
+        _stdout_path: &Path,
+        _stderr_path: &Path,
+    ) -> Result<TargetExit> {
+        let mut exits = self.exits.lock().expect("sequence lock");
+        assert!(!exits.is_empty(), "sequence target runner exhausted");
+        exits.remove(0)
+    }
+}
+
+fn wait_until_blocking_runner_started(blocker: &Arc<(Mutex<BlockingTargetState>, Condvar)>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (lock, cvar) = &**blocker;
+    let mut state = lock.lock().expect("blocker lock");
+    while !state.started {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runner did not start"
+        );
+        let (next, _) = cvar
+            .wait_timeout(state, Duration::from_millis(10))
+            .expect("wait");
+        state = next;
+    }
+}
+
+fn release_blocking_runner(blocker: &Arc<(Mutex<BlockingTargetState>, Condvar)>) {
+    let (lock, cvar) = &**blocker;
+    let mut state = lock.lock().expect("blocker lock");
+    state.released = true;
+    cvar.notify_all();
 }
