@@ -52,9 +52,9 @@ Target 示例：
 { "kind": "launch", "executable": "C:\\app\\app.exe", "args": ["--flag"] }
 ```
 
-Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。运行控制命令会单独更新 session 状态。`set_symbols` 接受原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
+Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。session 状态不再从命令文本识别运行控制，而是由 backend execution status 事件和最终状态更新。`set_symbols` 接受原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
 
-`eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
+`eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。如果 DbgEng 报告目标正在运行，session state 会变为 `Running`；下一次 debug event 返回后恢复为 `Break`，如果 backend 报告 no debuggee 则变为 `Closed`。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
 如果 worker 卡住，主进程可以终止该 session 对应的 worker 子进程，不会拖垮其他 session 或 MCP server。
 
 从仓库根目录通过本地 Streamable HTTP 启动 MCP server：

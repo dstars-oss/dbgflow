@@ -1,6 +1,9 @@
 use super::{SessionId, SessionState};
 use crate::artifacts::{ArtifactManager, ArtifactRef, CommandArtifactRecord, SessionArtifactEvent};
-use crate::backend::{CreateBackendSession, DebugTarget};
+use crate::backend::{
+    BackendEventSink, BackendExecutionEvent, BackendExecutionState, CreateBackendSession,
+    DebugTarget,
+};
 use crate::logging::{noop_logger, LogEvent, LogLevel, LogSink};
 use crate::session::worker::{ProcessWorkerLauncher, SessionWorker, SessionWorkerLauncher};
 use crate::{DbgFlowError, Result};
@@ -415,8 +418,6 @@ impl SessionManager {
             self.audit_rejected_eval(&request, &error);
             return Err(error);
         }
-        let is_run_control = is_run_control_command(&request.command);
-
         let operation_lock = self.operation_lock(request.session_id)?;
         let _operation_guard = operation_lock
             .lock()
@@ -442,11 +443,7 @@ impl SessionManager {
         let command = request.command.clone();
         self.start_operation(
             request.session_id,
-            if is_run_control {
-                SessionState::Running
-            } else {
-                session.state
-            },
+            session.state,
             OperationSummary {
                 command_id: command_id.clone(),
                 command: command.clone(),
@@ -479,10 +476,15 @@ impl SessionManager {
                 .session_id(request.session_id)
                 .operation(command.clone())
                 .field("command_id", command_id.clone())
-                .field("backend", session.backend.clone())
-                .field("is_run_control", is_run_control),
+                .field("backend", session.backend.clone()),
         );
-        let backend_result = worker.execute(command.clone());
+        let backend_result = worker.execute(
+            command.clone(),
+            Arc::new(SessionBackendEventSink {
+                manager: self.clone(),
+                session_id: request.session_id,
+            }),
+        );
         let duration_ms = started.elapsed().as_millis();
 
         let backend_result = match backend_result {
@@ -560,11 +562,14 @@ impl SessionManager {
         };
         let operation_finished = self.finish_operation(
             request.session_id,
-            if is_run_control {
-                SessionState::Break
-            } else {
-                session.state
-            },
+            backend_result
+                .final_state
+                .map(session_state_for_backend_execution_state)
+                .unwrap_or_else(|| {
+                    self.query_session(request.session_id)
+                        .map(|session| session.state)
+                        .unwrap_or(session.state)
+                }),
             OperationStatus::Finished,
             Some(artifact.clone()),
             None,
@@ -633,6 +638,74 @@ impl SessionManager {
 
     fn remove_worker(&self, session_id: SessionId) -> Option<Arc<dyn SessionWorker>> {
         self.workers.remove(session_id)
+    }
+
+    fn apply_backend_execution_event(
+        &self,
+        session_id: SessionId,
+        event: BackendExecutionEvent,
+    ) -> Result<()> {
+        let next_state = session_state_for_backend_execution_state(event.state);
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("session manager lock poisoned".to_string()))?;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or(DbgFlowError::SessionNotFound(session_id))?;
+        if session.state == SessionState::Closing {
+            return Ok(());
+        }
+        if session.state.is_terminal() && session.state != SessionState::Closed {
+            return Ok(());
+        }
+        let previous_state = session.state;
+        session.state = next_state;
+        session.updated_at_unix_ms = now_unix_ms();
+        if next_state == SessionState::Closed {
+            session.error = None;
+        }
+        let updated = session.clone();
+        let command = updated.current_operation.clone();
+        let command_id = updated
+            .last_operation
+            .as_ref()
+            .map(|operation| operation.command_id.clone());
+        drop(sessions);
+
+        let mut fields = Map::new();
+        fields.insert(
+            "backend_state".to_string(),
+            Value::String(format!("{:?}", event.state)),
+        );
+        if let Some(reason) = event.reason.clone() {
+            fields.insert("reason".to_string(), Value::String(reason));
+        }
+        self.record_session_event_best_effort(
+            session_id,
+            session_event(
+                "backend_execution_state_changed",
+                &updated,
+                Some(previous_state),
+                command.clone(),
+                command_id.clone(),
+                None,
+                None,
+                fields,
+            ),
+        );
+        self.append_transcript_best_effort(
+            session_id,
+            &format!(
+                "[{}] backend execution state changed {:?}->{:?} command_id={}\n",
+                now_unix_ms(),
+                previous_state,
+                next_state,
+                command_id.unwrap_or_else(|| "-".to_string())
+            ),
+        );
+        self.notify_session_updated(session_id);
+        Ok(())
     }
 
     fn start_operation(
@@ -706,7 +779,12 @@ impl SessionManager {
         let session = sessions
             .get_mut(&session_id)
             .ok_or(DbgFlowError::SessionNotFound(session_id))?;
-        if session.state.is_terminal() || session.state == SessionState::Closing {
+        if session.state == SessionState::Closing
+            || (session.state.is_terminal()
+                && !(session.state == SessionState::Closed
+                    && state == SessionState::Closed
+                    && status == OperationStatus::Finished))
+        {
             return Ok(false);
         }
         let previous_state = session.state;
@@ -1333,11 +1411,43 @@ impl Default for SessionManager {
     }
 }
 
+struct SessionBackendEventSink {
+    manager: SessionManager,
+    session_id: SessionId,
+}
+
+impl BackendEventSink for SessionBackendEventSink {
+    fn execution_state_changed(&self, event: BackendExecutionEvent) {
+        if let Err(error) = self
+            .manager
+            .apply_backend_execution_event(self.session_id, event)
+        {
+            self.manager.log(
+                LogEvent::new(
+                    LogLevel::Warn,
+                    "session",
+                    "backend_execution_state_apply_failed",
+                )
+                .session_id(self.session_id)
+                .error(error.to_string()),
+            );
+        }
+    }
+}
+
 fn state_for_target(target: &DebugTarget) -> SessionState {
     match target {
         DebugTarget::Dump { .. } | DebugTarget::Attach { .. } | DebugTarget::Launch { .. } => {
             SessionState::Break
         }
+    }
+}
+
+fn session_state_for_backend_execution_state(state: BackendExecutionState) -> SessionState {
+    match state {
+        BackendExecutionState::Break => SessionState::Break,
+        BackendExecutionState::Running => SessionState::Running,
+        BackendExecutionState::Closed => SessionState::Closed,
     }
 }
 
@@ -1547,25 +1657,6 @@ fn operation_status_label(status: OperationStatus) -> &'static str {
         OperationStatus::Finished => "Finished",
         OperationStatus::Failed => "Failed",
     }
-}
-
-fn is_run_control_command(command: &str) -> bool {
-    let normalized = command
-        .split(|ch| matches!(ch, ';' | '\r' | '\n' | '\u{2028}' | '\u{2029}'))
-        .next()
-        .unwrap_or(command)
-        .trim();
-    matches!(normalized, "g" | "p" | "t")
-        || has_command_prefix(normalized, "g")
-        || has_command_prefix(normalized, "p")
-        || has_command_prefix(normalized, "t")
-}
-
-fn has_command_prefix(command: &str, prefix: &str) -> bool {
-    command == prefix
-        || command
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

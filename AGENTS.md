@@ -96,7 +96,7 @@ Closed
 Error
 ```
 
-运行控制类操作应单独建模，例如 `continue_until_event` 和 `break_execution`。不要把 `g`、`p`、`t` 等运行类命令当成普通查询命令处理。
+运行控制类操作应单独建模，例如 `continue_until_event` 和 `break_execution`。执行状态必须来自 backend 状态事件或最终状态，不要用 `g`、`p`、`t` 等命令文本识别结果冒充可靠状态。
 
 ## 5. 安全规则
 
@@ -129,7 +129,7 @@ HTTP 拒绝非 localhost Origin
 要求：
 
 * 除空命令外，`eval` 原样传递命令给调试后端。
-* 区分查询命令与运行控制命令。
+* 区分查询能力与运行控制能力；session 状态不得依赖普通文本命令解析。
 * 记录原始命令、输出、状态变化和错误。
 * 对输出大小设置限制。
 * 完整输出写入 artifact；当前 `eval` 响应返回完整输出和 artifact 引用。

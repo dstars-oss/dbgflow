@@ -217,7 +217,11 @@ impl SessionWorker for InProcessDbgEngWorker {
         })
     }
 
-    fn execute(&self, command: String) -> Result<ExecuteBackendResult> {
+    fn execute(
+        &self,
+        command: String,
+        event_sink: std::sync::Arc<dyn dbgflow_core::backend::BackendEventSink>,
+    ) -> Result<ExecuteBackendResult> {
         let backend_session_id = self
             .backend_session_id
             .lock()
@@ -226,11 +230,13 @@ impl SessionWorker for InProcessDbgEngWorker {
             .ok_or_else(|| {
                 dbgflow_core::DbgFlowError::Backend("test worker not initialized".into())
             })?;
-        self.backend
-            .execute(dbgflow_core::backend::ExecuteBackendRequest {
+        self.backend.execute(
+            dbgflow_core::backend::ExecuteBackendRequest {
                 backend_session_id,
                 command,
-            })
+            },
+            event_sink,
+        )
     }
 
     fn has_exited(&self) -> Result<bool> {

@@ -812,10 +812,15 @@ mod tests {
             })
         }
 
-        fn execute(&self, command: String) -> Result<ExecuteBackendResult> {
+        fn execute(
+            &self,
+            command: String,
+            _event_sink: std::sync::Arc<dyn dbgflow_core::backend::BackendEventSink>,
+        ) -> Result<ExecuteBackendResult> {
             Ok(ExecuteBackendResult {
                 output: format!("fake worker executed: {command}"),
                 warnings: Vec::new(),
+                final_state: None,
             })
         }
 

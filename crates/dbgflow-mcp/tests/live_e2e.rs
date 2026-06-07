@@ -55,13 +55,8 @@ fn http_worker_can_attach_to_process_and_eval_queries() {
     assert_nonempty_output_with_artifact(&stacks);
 
     let resource = resource_read(&server.addr, &session_id);
-    assert_eq!(resource["state"], "Break");
+    assert_eq!(resource["state"], "Closed");
 
-    tool_call(
-        &server.addr,
-        "close_session",
-        json!({ "session_id": session_id }),
-    );
     let closed = wait_for_session_state(&server.addr, &session_id, "Closed");
     assert_eq!(closed["state"], "Closed");
 
@@ -107,13 +102,8 @@ fn http_worker_can_launch_process_and_continue_to_exit() {
         .is_some_and(Path::is_file));
 
     let resource = resource_read(&server.addr, &session_id);
-    assert_eq!(resource["state"], "Break");
+    assert_eq!(resource["state"], "Closed");
 
-    tool_call(
-        &server.addr,
-        "close_session",
-        json!({ "session_id": session_id }),
-    );
     let closed = wait_for_session_state(&server.addr, &session_id, "Closed");
     assert_eq!(closed["state"], "Closed");
 

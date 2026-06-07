@@ -63,12 +63,41 @@ pub struct ExecuteBackendRequest {
 pub struct ExecuteBackendResult {
     pub output: String,
     pub warnings: Vec<String>,
+    pub final_state: Option<BackendExecutionState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackendExecutionState {
+    Break,
+    Running,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendExecutionEvent {
+    pub state: BackendExecutionState,
+    pub reason: Option<String>,
+}
+
+pub trait BackendEventSink: Send + Sync {
+    fn execution_state_changed(&self, event: BackendExecutionEvent);
+}
+
+#[derive(Debug, Default)]
+pub struct NoopBackendEventSink;
+
+impl BackendEventSink for NoopBackendEventSink {
+    fn execution_state_changed(&self, _event: BackendExecutionEvent) {}
 }
 
 pub trait DebugBackend: Send + Sync {
     fn info(&self) -> BackendInfo;
     fn create_session(&self, request: CreateBackendSession) -> Result<BackendSession>;
-    fn execute(&self, request: ExecuteBackendRequest) -> Result<ExecuteBackendResult>;
+    fn execute(
+        &self,
+        request: ExecuteBackendRequest,
+        event_sink: std::sync::Arc<dyn BackendEventSink>,
+    ) -> Result<ExecuteBackendResult>;
     fn cancel_startup(&self, _correlation_id: &str) -> Result<()> {
         Err(DbgFlowError::Backend(
             "backend does not support startup cancellation".to_string(),

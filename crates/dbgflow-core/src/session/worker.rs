@@ -1,7 +1,8 @@
 #[cfg(windows)]
 use crate::backend::{dbgeng::DbgEngBackend, DebugBackend};
 use crate::backend::{
-    CreateBackendSession, DebugTarget, ExecuteBackendRequest, ExecuteBackendResult,
+    BackendEventSink, BackendExecutionEvent, CreateBackendSession, DebugTarget,
+    ExecuteBackendRequest, ExecuteBackendResult,
 };
 use crate::logging::{LogEvent, LogLevel, LogSink};
 use crate::session::SessionId;
@@ -38,7 +39,11 @@ pub trait SessionWorkerLauncher: Send + Sync {
 
 pub trait SessionWorker: Send + Sync {
     fn create_session(&self, request: CreateBackendSession) -> Result<WorkerSession>;
-    fn execute(&self, command: String) -> Result<ExecuteBackendResult>;
+    fn execute(
+        &self,
+        command: String,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> Result<ExecuteBackendResult>;
     fn has_exited(&self) -> Result<bool>;
     fn close(&self) -> Result<()>;
     fn kill(&self, reason: &str) -> Result<()>;
@@ -167,6 +172,14 @@ impl ProcessSessionWorker {
     }
 
     fn request(&self, request: WorkerRequest) -> Result<WorkerResult> {
+        self.request_with_event_sink(request, None)
+    }
+
+    fn request_with_event_sink(
+        &self,
+        request: WorkerRequest,
+        event_sink: Option<Arc<dyn BackendEventSink>>,
+    ) -> Result<WorkerResult> {
         let _request_guard = self
             .inner
             .request_lock
@@ -223,6 +236,11 @@ impl ProcessSessionWorker {
                 DbgFlowError::Backend(format!("parse worker response failed: {error}"))
             })? {
                 WorkerOutput::Log { event } => self.inner.logger.log(event),
+                WorkerOutput::ExecutionStateChanged { event } => {
+                    if let Some(event_sink) = &event_sink {
+                        event_sink.execution_state_changed(event);
+                    }
+                }
                 WorkerOutput::Response {
                     request_id: response_id,
                     result,
@@ -324,11 +342,21 @@ impl SessionWorker for ProcessSessionWorker {
         }
     }
 
-    fn execute(&self, command: String) -> Result<ExecuteBackendResult> {
-        match self.request(WorkerRequest::Execute { command })? {
-            WorkerResult::Executed { output, warnings } => {
-                Ok(ExecuteBackendResult { output, warnings })
-            }
+    fn execute(
+        &self,
+        command: String,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> Result<ExecuteBackendResult> {
+        match self.request_with_event_sink(WorkerRequest::Execute { command }, Some(event_sink))? {
+            WorkerResult::Executed {
+                output,
+                warnings,
+                final_state,
+            } => Ok(ExecuteBackendResult {
+                output,
+                warnings,
+                final_state,
+            }),
             other => Err(DbgFlowError::Backend(format!(
                 "unexpected worker execute response: {other:?}"
             ))),
@@ -440,6 +468,9 @@ enum WorkerOutput {
     Log {
         event: LogEvent,
     },
+    ExecutionStateChanged {
+        event: BackendExecutionEvent,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -453,6 +484,7 @@ enum WorkerResult {
     Executed {
         output: String,
         warnings: Vec<String>,
+        final_state: Option<crate::backend::BackendExecutionState>,
     },
     Closed,
 }
@@ -492,7 +524,8 @@ where
             }
         };
 
-        let (result, should_exit) = runtime.handle(envelope.request);
+        let (result, should_exit) =
+            runtime.handle(envelope.request, envelope.request_id, output.clone());
         write_response(&output, envelope.request_id, result)?;
         if should_exit {
             break;
@@ -559,7 +592,12 @@ impl WorkerRuntime {
         }
     }
 
-    fn handle(&mut self, request: WorkerRequest) -> (Result<WorkerResult>, bool) {
+    fn handle<W: Write + Send + 'static>(
+        &mut self,
+        request: WorkerRequest,
+        _request_id: u64,
+        output: Arc<Mutex<W>>,
+    ) -> (Result<WorkerResult>, bool) {
         match request {
             WorkerRequest::CreateSession {
                 target,
@@ -602,13 +640,17 @@ impl WorkerRuntime {
                 };
                 (
                     self.backend
-                        .execute(ExecuteBackendRequest {
-                            backend_session_id,
-                            command,
-                        })
+                        .execute(
+                            ExecuteBackendRequest {
+                                backend_session_id,
+                                command,
+                            },
+                            Arc::new(WorkerProtocolEventSink { output }),
+                        )
                         .map(|result| WorkerResult::Executed {
                             output: result.output,
                             warnings: result.warnings,
+                            final_state: result.final_state,
                         }),
                     false,
                 )
@@ -625,6 +667,16 @@ impl WorkerRuntime {
                 )
             }
         }
+    }
+}
+
+struct WorkerProtocolEventSink<W: Write + Send + 'static> {
+    output: Arc<Mutex<W>>,
+}
+
+impl<W: Write + Send + 'static> BackendEventSink for WorkerProtocolEventSink<W> {
+    fn execution_state_changed(&self, event: BackendExecutionEvent) {
+        let _ = write_worker_output(&self.output, &WorkerOutput::ExecutionStateChanged { event });
     }
 }
 
@@ -676,7 +728,12 @@ impl WorkerRuntime {
         Self
     }
 
-    fn handle(&mut self, request: WorkerRequest) -> (Result<WorkerResult>, bool) {
+    fn handle<W: Write + Send + 'static>(
+        &mut self,
+        request: WorkerRequest,
+        _request_id: u64,
+        _output: Arc<Mutex<W>>,
+    ) -> (Result<WorkerResult>, bool) {
         match request {
             WorkerRequest::CreateSession { .. } => (
                 Err(DbgFlowError::Backend(

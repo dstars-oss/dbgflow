@@ -201,17 +201,17 @@ Rust MCP Server
 * 避免维护不完整 denylist 造成误判。
 * 本项目当前定位为可信本机调试工具，主要边界是 loopback HTTP、worker 隔离、显式 data-dir 和 artifacts 审计。
 
-### D-003: 运行控制单独建模
+### D-003: 执行状态由 backend 感知
 
 决定：
 
-`g`、`p`、`t` 等运行类命令不作为普通 query command 处理。
+session 的 `Running` / `Break` / `Closed` 状态由 backend execution status 事件和最终状态更新，不通过 WinDbg 命令文本、前缀或分隔符推断。
 
 原因：
 
-* 运行命令可能长时间不返回。
-* 运行命令会改变 session 状态。
-* 更适合通过 `continue_until_event` 表达。
+* DbgEng 能感知真实执行状态，文本识别会漏掉别名、复合命令和未来能力。
+* `eval` 是原生命令透传接口，不能把命令解析结果冒充调试目标状态。
+* 后续 `continue_until_event`、step、breakpoint 等专用 tool 应复用同一 backend 状态通道。
 
 ### D-004: 每个 session 独立 artifact 目录
 
@@ -291,7 +291,7 @@ Rust MCP Server
 
 * [x] 支持 attach process MVP。
 * [x] 支持 launch process MVP。
-* [x] 支持最小 continue until event：通过 `eval` 精确命令 `g`，进度由 session 状态和 cancellation 控制。
+* [x] 支持 backend execution status 驱动的运行状态感知：`eval` 不通过命令文本判断运行控制。
 * [x] 支持本地 Streamable HTTP MCP endpoint。
 * [x] 支持 Windows service 安装 / 卸载子命令。
 * [x] 补齐更多 live attach / launch HTTP E2E ignored 验证场景。
@@ -314,7 +314,7 @@ Rust MCP Server
 2. 继续在更多真实目标上验证 live attach / launch ignored integration tests
 3. 完善 transcript.log / events.jsonl 的 redaction 与报告消费格式
 4. 支持调试报告生成 MVP
-5. 在状态机稳定后扩展 breakpoint / step / break_execution 等运行控制
+5. 基于 backend execution status 通道扩展 breakpoint / step / break_execution 等运行控制
 ```
 
 优先保持架构清晰，而不是过早追求完整调试能力。

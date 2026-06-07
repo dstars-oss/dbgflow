@@ -1,6 +1,7 @@
 use super::{
-    BackendCapability, BackendInfo, BackendKind, BackendSession, CreateBackendSession,
-    DebugBackend, DebugTarget, ExecuteBackendRequest, ExecuteBackendResult,
+    BackendCapability, BackendEventSink, BackendExecutionEvent, BackendExecutionState, BackendInfo,
+    BackendKind, BackendSession, CreateBackendSession, DebugBackend, DebugTarget,
+    ExecuteBackendRequest, ExecuteBackendResult,
 };
 use crate::logging::{noop_logger, LogEvent, LogLevel, LogSink};
 use crate::{DbgFlowError, Result};
@@ -17,7 +18,11 @@ use windows::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugClient, IDebugClient4, IDebugClient5, IDebugControl4, IDebugOutputCallbacksWide,
     IDebugOutputCallbacksWide_Impl, DEBUG_ATTACH_DEFAULT, DEBUG_END_PASSIVE, DEBUG_EXECUTE_DEFAULT,
-    DEBUG_INTERRUPT_EXIT, DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_STATUS_GO,
+    DEBUG_INTERRUPT_EXIT, DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_STATUS_BREAK, DEBUG_STATUS_GO,
+    DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK,
+    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_REVERSE_GO, DEBUG_STATUS_REVERSE_STEP_BRANCH,
+    DEBUG_STATUS_REVERSE_STEP_INTO, DEBUG_STATUS_REVERSE_STEP_OVER, DEBUG_STATUS_STEP_BRANCH,
+    DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
@@ -135,7 +140,11 @@ impl DebugBackend for DbgEngBackend {
         })
     }
 
-    fn execute(&self, request: ExecuteBackendRequest) -> Result<ExecuteBackendResult> {
+    fn execute(
+        &self,
+        request: ExecuteBackendRequest,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> Result<ExecuteBackendResult> {
         let tx = self
             .sessions
             .lock()
@@ -152,6 +161,7 @@ impl DebugBackend for DbgEngBackend {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         tx.send(WorkerCommand::Execute {
             command: request.command,
+            event_sink,
             reply: reply_tx,
         })
         .map_err(|_| DbgFlowError::Backend("dbgeng worker is not available".to_string()))?;
@@ -425,6 +435,7 @@ impl Drop for SendableDebugControl {
 enum WorkerCommand {
     Execute {
         command: String,
+        event_sink: Arc<dyn BackendEventSink>,
         reply: mpsc::SyncSender<Result<ExecuteBackendResult>>,
     },
     Close {
@@ -458,8 +469,12 @@ fn worker_main(
 
     while let Ok(command) = rx.recv() {
         match command {
-            WorkerCommand::Execute { command, reply } => {
-                let _ = reply.send(session.execute(&command));
+            WorkerCommand::Execute {
+                command,
+                event_sink,
+                reply,
+            } => {
+                let _ = reply.send(session.execute(&command, event_sink));
             }
             WorkerCommand::Close { reply } => {
                 let result = session.close();
@@ -731,7 +746,11 @@ impl DbgEngSession {
         }
     }
 
-    fn execute(&mut self, command: &str) -> Result<ExecuteBackendResult> {
+    fn execute(
+        &mut self,
+        command: &str,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> Result<ExecuteBackendResult> {
         let command_text = command.to_string();
         let _dbgeng_guard = global_dbgeng_lock().lock().map_err(|_| {
             DbgFlowError::Backend("global dbgeng operation lock poisoned".to_string())
@@ -754,39 +773,6 @@ impl DbgEngSession {
             output.clear();
         }
 
-        if command.trim() == "g" {
-            let mut warnings = Vec::new();
-            unsafe {
-                self.control
-                    .SetExecutionStatus(DEBUG_STATUS_GO)
-                    .map_err(|error| {
-                        DbgFlowError::Backend(format!(
-                            "SetExecutionStatus(DEBUG_STATUS_GO) failed: {error}"
-                        ))
-                    })?;
-            }
-            warnings.extend(wait_for_go_event(&self.control)?);
-
-            let output = self
-                .output
-                .lock()
-                .map_err(|_| DbgFlowError::Backend("dbgeng output buffer poisoned".to_string()))?
-                .clone();
-
-            self.logger.log(
-                dbgeng_event(
-                    LogLevel::Info,
-                    "execute_finished",
-                    &self.correlation_id,
-                    Some(&self.backend_session_id),
-                )
-                .operation("g")
-                .duration_ms(started.elapsed().as_millis())
-                .field("output_bytes", output.len()),
-            );
-            return Ok(ExecuteBackendResult { output, warnings });
-        }
-
         if command.contains('\0') {
             return Err(DbgFlowError::Backend(
                 "command contains NUL byte".to_string(),
@@ -803,6 +789,28 @@ impl DbgEngSession {
                 .map_err(|error| {
                     DbgFlowError::Backend(format!("IDebugControl4::ExecuteWide failed: {error}"))
                 })?;
+        }
+
+        let mut warnings = Vec::new();
+        let mut final_state = self.query_execution_state()?;
+        if final_state == Some(BackendExecutionState::Running) {
+            event_sink.execution_state_changed(BackendExecutionEvent {
+                state: BackendExecutionState::Running,
+                reason: Some("dbgeng execution status running".to_string()),
+            });
+            warnings.extend(wait_for_execution_event(&self.control)?);
+            final_state = self.query_execution_state()?;
+            if let Some(state) = final_state {
+                event_sink.execution_state_changed(BackendExecutionEvent {
+                    state,
+                    reason: Some("dbgeng wait event returned".to_string()),
+                });
+            }
+        } else if final_state == Some(BackendExecutionState::Closed) {
+            event_sink.execution_state_changed(BackendExecutionEvent {
+                state: BackendExecutionState::Closed,
+                reason: Some("dbgeng execution status no debuggee".to_string()),
+            });
         }
 
         let output = self
@@ -825,8 +833,18 @@ impl DbgEngSession {
 
         Ok(ExecuteBackendResult {
             output,
-            warnings: Vec::new(),
+            warnings,
+            final_state,
         })
+    }
+
+    fn query_execution_state(&self) -> Result<Option<BackendExecutionState>> {
+        let status = unsafe { self.control.GetExecutionStatus() }.map_err(|error| {
+            DbgFlowError::Backend(format!(
+                "IDebugControl4::GetExecutionStatus failed: {error}"
+            ))
+        })?;
+        Ok(execution_state_from_dbgeng_status(status))
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1006,7 +1024,7 @@ fn attach_process(client: &IDebugClient4, pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_go_event(control: &IDebugControl4) -> Result<Vec<String>> {
+fn wait_for_execution_event(control: &IDebugControl4) -> Result<Vec<String>> {
     let hr = unsafe {
         (Interface::vtable(control).WaitForEvent)(Interface::as_raw(control), 0, INFINITE_WAIT_MS)
     };
@@ -1015,17 +1033,33 @@ fn wait_for_go_event(control: &IDebugControl4) -> Result<Vec<String>> {
     }
     if hr == S_FALSE {
         return Err(DbgFlowError::Backend(
-            "WaitForEvent after g returned without an event".to_string(),
+            "WaitForEvent returned without an event".to_string(),
         ));
     }
     if hr == E_UNEXPECTED {
-        return Ok(vec![
-            "target exited or no debuggee remains after g".to_string()
-        ]);
+        return Ok(vec!["target exited or no debuggee remains".to_string()]);
     }
     Err(DbgFlowError::Backend(format!(
-        "WaitForEvent after g failed: {hr:?}"
+        "WaitForEvent failed: {hr:?}"
     )))
+}
+
+fn execution_state_from_dbgeng_status(status: u32) -> Option<BackendExecutionState> {
+    match status & DEBUG_STATUS_MASK {
+        DEBUG_STATUS_GO
+        | DEBUG_STATUS_GO_HANDLED
+        | DEBUG_STATUS_GO_NOT_HANDLED
+        | DEBUG_STATUS_STEP_OVER
+        | DEBUG_STATUS_STEP_INTO
+        | DEBUG_STATUS_STEP_BRANCH
+        | DEBUG_STATUS_REVERSE_GO
+        | DEBUG_STATUS_REVERSE_STEP_BRANCH
+        | DEBUG_STATUS_REVERSE_STEP_OVER
+        | DEBUG_STATUS_REVERSE_STEP_INTO => Some(BackendExecutionState::Running),
+        DEBUG_STATUS_BREAK => Some(BackendExecutionState::Break),
+        DEBUG_STATUS_NO_DEBUGGEE => Some(BackendExecutionState::Closed),
+        _ => None,
+    }
 }
 
 fn cleanup_open_target_failure(

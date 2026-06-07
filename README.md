@@ -67,19 +67,23 @@ Command output, transcripts, command records, event records, and logs are still
 written under controlled runtime directories.
 `eval` passes native debugger commands through to DbgEng except for empty
 commands. Use it only in a trusted local environment. Run-control commands
-update session state separately from ordinary queries.
+are not detected from command text; session state is updated from backend
+execution-status events and final backend status.
 `set_symbols` accepts native WinDbg symbol path strings, including symbol server
 paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
 
 `eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a
 `last_operation` summary with status, timing, artifact, error, and output-size
-fields. Clients can observe progress with `get_session`, `resources/read`, or
-the HTTP resource update stream. Legacy timeout fields are accepted for
-compatibility, ignored, and logged as warnings. `close_session` requests backend
-cancellation before closing a session that is currently executing a command; if
-the worker is stuck, the main process can terminate that session's worker
-without taking down other sessions or the MCP server.
+fields. If DbgEng reports the target running, the session state becomes
+`Running` until the next debug event returns it to `Break` or the backend
+reports no debuggee and the session becomes `Closed`. Clients can observe
+progress with `get_session`, `resources/read`, or the HTTP resource update
+stream. Legacy timeout fields are accepted for compatibility, ignored, and
+logged as warnings. `close_session` requests backend cancellation before closing
+a session that is currently executing a command; if the worker is stuck, the
+main process can terminate that session's worker without taking down other
+sessions or the MCP server.
 
 Run the MCP server over local Streamable HTTP from the repository root:
 

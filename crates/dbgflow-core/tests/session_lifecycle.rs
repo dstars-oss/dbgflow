@@ -1,4 +1,7 @@
-use dbgflow_core::backend::{CreateBackendSession, DebugTarget, ExecuteBackendResult};
+use dbgflow_core::backend::{
+    BackendEventSink, BackendExecutionEvent, BackendExecutionState, CreateBackendSession,
+    DebugTarget, ExecuteBackendResult,
+};
 use dbgflow_core::logging::{LogEvent, LogSink};
 use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
 use dbgflow_core::session::{
@@ -346,10 +349,13 @@ fn eval_sets_observable_operation_state() {
 }
 
 #[test]
-fn compound_run_control_command_sets_running_state() {
+fn eval_uses_backend_state_events_without_command_text_detection() {
     let manager = test_manager(
-        "compound-run-control",
-        WorkerBehavior::SlowExecute(Duration::from_millis(250)),
+        "backend-state-events",
+        WorkerBehavior::StateEvents {
+            running_delay: Duration::from_millis(250),
+            final_state: BackendExecutionState::Break,
+        },
     );
     let session = manager
         .create_session(CreateSession {
@@ -365,18 +371,53 @@ fn compound_run_control_command_sets_running_state() {
         eval_manager
             .eval(EvalSession {
                 session_id,
-                command: "g; k".to_string(),
+                command: "k".to_string(),
                 timeout_ms: None,
             })
-            .expect("eval compound run-control command")
+            .expect("eval state event command")
     });
 
-    let running = wait_for_current_operation(&manager, session_id);
+    let running = wait_for_state(&manager, session_id, SessionState::Running);
     assert_eq!(running.state, SessionState::Running);
-    assert_eq!(running.current_operation.as_deref(), Some("g; k"));
+    assert_eq!(running.current_operation.as_deref(), Some("k"));
 
     let result = eval.join().expect("eval thread");
     assert_eq!(result.session.state, SessionState::Break);
+}
+
+#[test]
+fn backend_closed_state_closes_session_without_error() {
+    let manager = test_manager(
+        "backend-closed-state",
+        WorkerBehavior::StateEvents {
+            running_delay: Duration::from_millis(0),
+            final_state: BackendExecutionState::Closed,
+        },
+    );
+    let session = manager
+        .create_session(CreateSession {
+            target: test_dump_target("backend-closed-state-target"),
+            startup_timeout_ms: None,
+        })
+        .expect("create session");
+    let session = wait_for_break(&manager, session.id);
+
+    let result = manager
+        .eval(EvalSession {
+            session_id: session.id,
+            command: "any-command".to_string(),
+            timeout_ms: None,
+        })
+        .expect("eval closed state command");
+
+    assert_eq!(result.session.state, SessionState::Closed);
+    assert_eq!(result.session.error, None);
+    let last = result
+        .session
+        .last_operation
+        .as_ref()
+        .expect("last operation");
+    assert_eq!(last.status, OperationStatus::Finished);
 }
 
 #[test]
@@ -688,6 +729,25 @@ fn wait_for_current_operation(
     }
 }
 
+fn wait_for_state(
+    manager: &SessionManager,
+    session_id: SessionId,
+    expected: SessionState,
+) -> dbgflow_core::session::Session {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let session = manager.query_session(session_id).expect("query session");
+        if session.state == expected {
+            return session;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session did not enter {expected:?}: {session:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_until_executing(state: &Arc<(Mutex<BlockingState>, Condvar)>) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (lock, cvar) = &**state;
@@ -734,6 +794,10 @@ enum WorkerBehavior {
     BlockingExecute {
         state: Arc<(Mutex<BlockingState>, Condvar)>,
         kill_count: Arc<AtomicUsize>,
+    },
+    StateEvents {
+        running_delay: Duration,
+        final_state: BackendExecutionState,
     },
     ExitAfterCreate {
         exited: Arc<AtomicBool>,
@@ -790,7 +854,12 @@ impl SessionWorker for TestWorker {
         })
     }
 
-    fn execute(&self, command: String) -> Result<ExecuteBackendResult> {
+    fn execute(
+        &self,
+        command: String,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> Result<ExecuteBackendResult> {
+        let mut final_state = None;
         match &self.behavior {
             WorkerBehavior::SlowExecute(delay) => std::thread::sleep(*delay),
             WorkerBehavior::BlockingExecute { state, .. } => {
@@ -803,6 +872,21 @@ impl SessionWorker for TestWorker {
                 }
                 return Err(DbgFlowError::Backend("canceled".to_string()));
             }
+            WorkerBehavior::StateEvents {
+                running_delay,
+                final_state: reported_final_state,
+            } => {
+                event_sink.execution_state_changed(BackendExecutionEvent {
+                    state: BackendExecutionState::Running,
+                    reason: Some("test running".to_string()),
+                });
+                std::thread::sleep(*running_delay);
+                event_sink.execution_state_changed(BackendExecutionEvent {
+                    state: *reported_final_state,
+                    reason: Some("test final".to_string()),
+                });
+                final_state = Some(*reported_final_state);
+            }
             _ => {}
         }
         if self.closed.load(Ordering::SeqCst) {
@@ -811,6 +895,7 @@ impl SessionWorker for TestWorker {
         Ok(ExecuteBackendResult {
             output: format!("fake worker executed: {command}"),
             warnings: Vec::new(),
+            final_state,
         })
     }
 
