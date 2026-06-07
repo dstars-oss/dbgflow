@@ -1,4 +1,5 @@
 use dbgflow_core::proxy::ProxyEnvironment;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,6 +8,17 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:7331";
 pub const SERVICE_NAME: &str = "dbgflow-mcp";
 pub const SERVICE_DISPLAY_NAME: &str = "dbgflow MCP Server";
 pub const SERVICE_DESCRIPTION: &str = "dbgflow Streamable HTTP MCP server";
+const KNOWN_PROXY_KEYS: &[&str] = &[
+    "_NT_SYMBOL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -105,6 +117,14 @@ pub fn parse_options<I>(args: I) -> Result<AppConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
+    let env = std::env::vars().collect::<HashMap<_, _>>();
+    parse_options_with_env(args, &env)
+}
+
+fn parse_options_with_env<I>(args: I, env: &HashMap<String, String>) -> Result<AppConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
     let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
     let mut data_dir = None;
     let mut proxy_url = None;
@@ -150,7 +170,7 @@ where
 
     let data_dir =
         data_dir.ok_or_else(|| format!("missing required --data-dir <path>\n\n{}", help_text()))?;
-    let proxy = resolve_proxy(proxy_url, no_proxy)?;
+    let proxy = resolve_proxy(proxy_url, no_proxy, env)?;
     Ok(AppConfig {
         bind,
         data_dir,
@@ -159,6 +179,17 @@ where
 }
 
 pub fn parse_service_process_options<I>(args: I) -> Result<ServiceProcessConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let env = std::env::vars().collect::<HashMap<_, _>>();
+    parse_service_process_options_with_env(args, &env)
+}
+
+fn parse_service_process_options_with_env<I>(
+    args: I,
+    env: &HashMap<String, String>,
+) -> Result<ServiceProcessConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -216,7 +247,7 @@ where
 
     let data_dir =
         data_dir.ok_or_else(|| format!("missing required --data-dir <path>\n\n{}", help_text()))?;
-    let proxy = resolve_proxy(proxy_url, no_proxy)?;
+    let proxy = resolve_proxy(proxy_url, no_proxy, env)?;
     Ok(ServiceProcessConfig {
         service_name,
         app: AppConfig {
@@ -228,6 +259,17 @@ where
 }
 
 pub fn service_process_options_from_command_line<I>(args: I) -> Result<ServiceProcessConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let env = std::env::vars().collect::<HashMap<_, _>>();
+    service_process_options_from_command_line_with_env(args, &env)
+}
+
+fn service_process_options_from_command_line_with_env<I>(
+    args: I,
+    env: &HashMap<String, String>,
+) -> Result<ServiceProcessConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -245,7 +287,7 @@ where
             "expected service run command, got service {service_command}"
         ));
     }
-    parse_service_process_options(args)
+    parse_service_process_options_with_env(args, env)
 }
 
 pub fn parse_service_install_options<I>(args: I) -> Result<ServiceInstallConfig, String>
@@ -371,7 +413,7 @@ where
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]        Run local HTTP MCP transport\n  dbgflow-mcp service run --data-dir <path> [options] Run as a Windows service process\n  dbgflow-mcp service install [options]               Install and start the Windows service\n  dbgflow-mcp service uninstall [options]             Stop and uninstall the Windows service\n  dbgflow-mcp worker session                          Run an internal session worker process\n\nRuntime options:\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --data-dir <path>                                   Required. Uses <path>\\artifacts and <path>\\logs\n  --service-name <name>                               Service process name. Default: dbgflow-mcp\n  --proxy-url <url>                                   Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars for all session workers\n  --no-proxy                                         Clears known proxy vars for all session workers"
+    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]        Run local HTTP MCP transport\n  dbgflow-mcp service run --data-dir <path> [options] Run as a Windows service process\n  dbgflow-mcp service install [options]               Install and start the Windows service\n  dbgflow-mcp service uninstall [options]             Stop and uninstall the Windows service\n  dbgflow-mcp worker session                          Run an internal session worker process\n\nRuntime options:\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --data-dir <path>                                   Required. Uses <path>\\artifacts and <path>\\logs\n  --service-name <name>                               Service process name. Default: dbgflow-mcp\n  --proxy-url <url>                                   Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars for all session workers\n  --no-proxy                                         Clears known proxy vars for all session workers\n  Default proxy behavior inherits non-empty known proxy environment variables when no proxy option is passed"
 }
 
 pub fn service_install_help_text() -> &'static str {
@@ -433,7 +475,11 @@ fn parse_bind(value: &str) -> Result<SocketAddr, String> {
     Ok(bind)
 }
 
-fn resolve_proxy(proxy_url: Option<String>, no_proxy: bool) -> Result<ProxyEnvironment, String> {
+fn resolve_proxy(
+    proxy_url: Option<String>,
+    no_proxy: bool,
+    env: &HashMap<String, String>,
+) -> Result<ProxyEnvironment, String> {
     if no_proxy && proxy_url.is_some() {
         return Err("--proxy-url and --no-proxy cannot be used together".to_string());
     }
@@ -443,7 +489,21 @@ fn resolve_proxy(proxy_url: Option<String>, no_proxy: bool) -> Result<ProxyEnvir
     if let Some(proxy_url) = proxy_url {
         return ProxyEnvironment::from_cli_proxy_url(&proxy_url).map_err(|error| error.to_string());
     }
-    ProxyEnvironment::from_current_environment().map_err(|error| error.to_string())
+    let env = proxy_environment_map_without_empty_known_keys(env);
+    ProxyEnvironment::from_environment_map(&env).map_err(|error| error.to_string())
+}
+
+fn proxy_environment_map_without_empty_known_keys(
+    env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    env.iter()
+        .filter(|(key, value)| !(value.is_empty() && is_known_proxy_key(key)))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn is_known_proxy_key(key: &str) -> bool {
+    KNOWN_PROXY_KEYS.contains(&key)
 }
 
 fn default_install_root() -> Result<PathBuf, String> {
@@ -490,20 +550,32 @@ fn path_starts_with(path: &std::path::Path, base: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_options, parse_service_install_options, parse_service_process_options,
-        parse_service_uninstall_options, remove_install_files_target,
-        service_process_options_from_command_line, DEFAULT_BIND, SERVICE_NAME,
+        parse_options_with_env, parse_service_install_options,
+        parse_service_process_options_with_env, parse_service_uninstall_options,
+        remove_install_files_target, service_process_options_from_command_line_with_env,
+        DEFAULT_BIND, SERVICE_NAME,
     };
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
+    fn env(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
     #[test]
     fn parses_runtime_options() {
-        let config = parse_options([
-            OsString::from("--bind"),
-            OsString::from("127.0.0.1:9000"),
-            OsString::from("--data-dir=C:\\dbgflow\\var"),
-        ])
+        let config = parse_options_with_env(
+            [
+                OsString::from("--bind"),
+                OsString::from("127.0.0.1:9000"),
+                OsString::from("--data-dir=C:\\dbgflow\\var"),
+            ],
+            &env(&[("HTTP_PROXY", "")]),
+        )
         .expect("parse options");
 
         assert_eq!(config.bind.to_string(), "127.0.0.1:9000");
@@ -512,20 +584,26 @@ mod tests {
 
     #[test]
     fn uses_default_bind_with_required_data_dir() {
-        let config = parse_options([OsString::from("--data-dir"), OsString::from(".\\var")])
-            .expect("parse options");
+        let config = parse_options_with_env(
+            [OsString::from("--data-dir"), OsString::from(".\\var")],
+            &env(&[("HTTP_PROXY", "")]),
+        )
+        .expect("parse options");
         assert_eq!(config.bind.to_string(), DEFAULT_BIND);
         assert_eq!(config.data_dir, PathBuf::from(".\\var"));
     }
 
     #[test]
     fn parses_http_proxy_url_option() {
-        let config = parse_options([
-            OsString::from("--data-dir"),
-            OsString::from(".\\var"),
-            OsString::from("--proxy-url"),
-            OsString::from("http://127.0.0.1:7897"),
-        ])
+        let config = parse_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from(".\\var"),
+                OsString::from("--proxy-url"),
+                OsString::from("http://127.0.0.1:7897"),
+            ],
+            &env(&[]),
+        )
         .expect("parse options");
 
         assert_eq!(
@@ -540,11 +618,14 @@ mod tests {
 
     #[test]
     fn parses_no_proxy_option() {
-        let config = parse_options([
-            OsString::from("--data-dir"),
-            OsString::from(".\\var"),
-            OsString::from("--no-proxy"),
-        ])
+        let config = parse_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from(".\\var"),
+                OsString::from("--no-proxy"),
+            ],
+            &env(&[]),
+        )
         .expect("parse options");
 
         assert_eq!(
@@ -555,54 +636,141 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_proxy_options() {
-        let error = parse_options([
-            OsString::from("--data-dir"),
-            OsString::from(".\\var"),
-            OsString::from("--proxy-url"),
-            OsString::from("http://127.0.0.1:7897"),
-            OsString::from("--no-proxy"),
-        ])
+        let error = parse_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from(".\\var"),
+                OsString::from("--proxy-url"),
+                OsString::from("http://127.0.0.1:7897"),
+                OsString::from("--no-proxy"),
+            ],
+            &env(&[]),
+        )
         .expect_err("reject conflicting proxy options");
 
         assert!(error.contains("cannot be used together"));
     }
 
     #[test]
+    fn rejects_conflicting_proxy_options_in_either_order() {
+        let no_proxy_first = parse_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from(".\\var"),
+                OsString::from("--no-proxy"),
+                OsString::from("--proxy-url=http://127.0.0.1:7897"),
+            ],
+            &env(&[]),
+        )
+        .expect_err("reject conflicting proxy options");
+        let proxy_url_first = parse_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from(".\\var"),
+                OsString::from("--proxy-url=http://127.0.0.1:7897"),
+                OsString::from("--no-proxy"),
+            ],
+            &env(&[]),
+        )
+        .expect_err("reject conflicting proxy options");
+
+        assert!(no_proxy_first.contains("cannot be used together"));
+        assert!(proxy_url_first.contains("cannot be used together"));
+    }
+
+    #[test]
+    fn inherits_proxy_from_non_empty_environment() {
+        let config = parse_options_with_env(
+            [OsString::from("--data-dir"), OsString::from(".\\var")],
+            &env(&[
+                ("_NT_SYMBOL_PROXY", "symproxy:80"),
+                ("HTTP_PROXY", "http://proxy:8080"),
+            ]),
+        )
+        .expect("parse options");
+
+        assert_eq!(
+            config.app_proxy().source(),
+            dbgflow_core::proxy::ProxySource::Environment
+        );
+        assert_eq!(
+            config.app_proxy().value_for("_NT_SYMBOL_PROXY").as_deref(),
+            Some("symproxy:80")
+        );
+        assert_eq!(
+            config.app_proxy().value_for("HTTP_PROXY").as_deref(),
+            Some("http://proxy:8080")
+        );
+    }
+
+    #[test]
+    fn no_proxy_wins_over_environment_proxy_entries() {
+        let config = parse_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from(".\\var"),
+                OsString::from("--no-proxy"),
+            ],
+            &env(&[
+                ("_NT_SYMBOL_PROXY", "symproxy:80"),
+                ("HTTP_PROXY", "http://proxy:8080"),
+            ]),
+        )
+        .expect("parse options");
+
+        assert_eq!(
+            config.app_proxy().source(),
+            dbgflow_core::proxy::ProxySource::Disabled
+        );
+    }
+
+    #[test]
     fn rejects_missing_data_dir() {
-        let error = parse_options([]).expect_err("reject missing data dir");
+        let error = parse_options_with_env([], &env(&[])).expect_err("reject missing data dir");
         assert!(error.contains("--data-dir"));
     }
 
     #[test]
     fn rejects_non_loopback_bind() {
-        let error = parse_options([OsString::from("--bind"), OsString::from("0.0.0.0:7331")])
-            .expect_err("reject non-loopback bind");
+        let error = parse_options_with_env(
+            [OsString::from("--bind"), OsString::from("0.0.0.0:7331")],
+            &env(&[]),
+        )
+        .expect_err("reject non-loopback bind");
 
         assert!(error.contains("loopback"));
     }
 
     #[test]
     fn rejects_removed_directory_options() {
-        let artifact_error =
-            parse_options([OsString::from("--artifact-root=C:\\dbgflow\\artifacts")])
-                .expect_err("reject artifact-root");
+        let artifact_error = parse_options_with_env(
+            [OsString::from("--artifact-root=C:\\dbgflow\\artifacts")],
+            &env(&[]),
+        )
+        .expect_err("reject artifact-root");
         assert!(artifact_error.contains("unknown option"));
 
-        let log_error = parse_options([OsString::from("--log-dir"), OsString::from("C:\\logs")])
-            .expect_err("reject log-dir");
+        let log_error = parse_options_with_env(
+            [OsString::from("--log-dir"), OsString::from("C:\\logs")],
+            &env(&[]),
+        )
+        .expect_err("reject log-dir");
         assert!(log_error.contains("unknown option"));
     }
 
     #[test]
     fn parses_service_process_options_with_service_name() {
-        let config = parse_service_process_options([
-            OsString::from("--service-name"),
-            OsString::from("dbgflow-dev"),
-            OsString::from("--bind"),
-            OsString::from("127.0.0.1:9001"),
-            OsString::from("--data-dir"),
-            OsString::from("C:\\dbgflow\\var"),
-        ])
+        let config = parse_service_process_options_with_env(
+            [
+                OsString::from("--service-name"),
+                OsString::from("dbgflow-dev"),
+                OsString::from("--bind"),
+                OsString::from("127.0.0.1:9001"),
+                OsString::from("--data-dir"),
+                OsString::from("C:\\dbgflow\\var"),
+            ],
+            &env(&[("HTTP_PROXY", "")]),
+        )
         .expect("parse service process options");
 
         assert_eq!(config.service_name, "dbgflow-dev");
@@ -612,11 +780,14 @@ mod tests {
 
     #[test]
     fn parses_service_process_proxy_url_option() {
-        let config = parse_service_process_options([
-            OsString::from("--data-dir"),
-            OsString::from("C:\\dbgflow\\var"),
-            OsString::from("--proxy-url=http://127.0.0.1:7897"),
-        ])
+        let config = parse_service_process_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from("C:\\dbgflow\\var"),
+                OsString::from("--proxy-url=http://127.0.0.1:7897"),
+            ],
+            &env(&[]),
+        )
         .expect("parse service process options");
 
         assert_eq!(
@@ -631,17 +802,20 @@ mod tests {
 
     #[test]
     fn parses_service_run_process_options_from_full_command_line() {
-        let config = service_process_options_from_command_line([
-            OsString::from("dbgflow-mcp.exe"),
-            OsString::from("service"),
-            OsString::from("run"),
-            OsString::from("--service-name"),
-            OsString::from("dbgflow-dev"),
-            OsString::from("--bind"),
-            OsString::from("127.0.0.1:9001"),
-            OsString::from("--data-dir"),
-            OsString::from("C:\\dbgflow\\var"),
-        ])
+        let config = service_process_options_from_command_line_with_env(
+            [
+                OsString::from("dbgflow-mcp.exe"),
+                OsString::from("service"),
+                OsString::from("run"),
+                OsString::from("--service-name"),
+                OsString::from("dbgflow-dev"),
+                OsString::from("--bind"),
+                OsString::from("127.0.0.1:9001"),
+                OsString::from("--data-dir"),
+                OsString::from("C:\\dbgflow\\var"),
+            ],
+            &env(&[("HTTP_PROXY", "")]),
+        )
         .expect("parse service run command line");
 
         assert_eq!(config.service_name, "dbgflow-dev");
@@ -651,12 +825,15 @@ mod tests {
 
     #[test]
     fn rejects_legacy_service_process_command_line_without_run() {
-        let error = service_process_options_from_command_line([
-            OsString::from("dbgflow-mcp.exe"),
-            OsString::from("service"),
-            OsString::from("--data-dir"),
-            OsString::from("C:\\dbgflow\\var"),
-        ])
+        let error = service_process_options_from_command_line_with_env(
+            [
+                OsString::from("dbgflow-mcp.exe"),
+                OsString::from("service"),
+                OsString::from("--data-dir"),
+                OsString::from("C:\\dbgflow\\var"),
+            ],
+            &env(&[]),
+        )
         .expect_err("reject legacy service process command line");
 
         assert!(error.contains("expected service run"));
@@ -750,10 +927,13 @@ mod tests {
 
     #[test]
     fn service_process_uses_default_service_name() {
-        let config = parse_service_process_options([
-            OsString::from("--data-dir"),
-            OsString::from("C:\\dbgflow\\var"),
-        ])
+        let config = parse_service_process_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from("C:\\dbgflow\\var"),
+            ],
+            &env(&[("HTTP_PROXY", "")]),
+        )
         .expect("parse service process options");
 
         assert_eq!(config.service_name, SERVICE_NAME);
