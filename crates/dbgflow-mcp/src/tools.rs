@@ -232,15 +232,85 @@ impl ToolService {
                         },
                         "collector": {
                             "type": "object",
-                            "properties": {
-                                "kind": { "type": "string", "const": "native_etw" },
-                                "preset": { "type": "string", "const": "system_overview" }
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "native_etw" },
+                                        "preset": { "type": "string", "const": "system_overview" }
+                                    },
+                                    "required": ["kind", "preset"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "procmon" },
+                                        "capture_stacks": { "type": "boolean" },
+                                        "filters": {
+                                            "type": "object",
+                                            "properties": {
+                                                "operations": {
+                                                    "type": "array",
+                                                    "items": { "type": "string" }
+                                                },
+                                                "paths": {
+                                                    "type": "array",
+                                                    "items": { "type": "string" }
+                                                }
+                                            },
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "required": ["kind"],
+                                    "additionalProperties": false
+                                }
+                            ],
+                            "description": "Legacy single collector form. Do not pass together with collectors."
+                        },
+                        "collectors": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "type": "string", "const": "native_etw" },
+                                            "preset": { "type": "string", "const": "system_overview" }
+                                        },
+                                        "required": ["kind", "preset"],
+                                        "additionalProperties": false
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "type": "string", "const": "procmon" },
+                                            "capture_stacks": { "type": "boolean" },
+                                            "filters": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "operations": {
+                                                        "type": "array",
+                                                        "items": { "type": "string" }
+                                                    },
+                                                    "paths": {
+                                                        "type": "array",
+                                                        "items": { "type": "string" }
+                                                    }
+                                                },
+                                                "additionalProperties": false
+                                            }
+                                        },
+                                        "required": ["kind"],
+                                        "additionalProperties": false
+                                    }
+                                ]
                             },
-                            "required": ["kind", "preset"],
-                            "additionalProperties": false
+                            "description": "Collectors to run around the same launched target. Do not pass together with collector."
                         }
                     },
-                    "required": ["target", "timeout_ms", "collector"],
+                    "required": ["target", "timeout_ms"],
                     "additionalProperties": false
                 }),
             },
@@ -423,11 +493,11 @@ pub struct SetSymbolsRequest {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunProfileRequest {
     pub target: dbgflow_core::profile::ProfileTarget,
     pub timeout_ms: u64,
-    pub collector: ProfileCollectorConfig,
+    pub collectors: Vec<ProfileCollectorConfig>,
 }
 
 impl From<RunProfileRequest> for RunProfile {
@@ -435,9 +505,18 @@ impl From<RunProfileRequest> for RunProfile {
         Self {
             target: value.target,
             timeout_ms: value.timeout_ms,
-            collectors: vec![value.collector],
+            collectors: value.collectors,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RawRunProfileRequest {
+    target: dbgflow_core::profile::ProfileTarget,
+    timeout_ms: u64,
+    collector: Option<ProfileCollectorConfig>,
+    #[serde(default)]
+    collectors: Vec<ProfileCollectorConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -510,6 +589,30 @@ impl<'de> Deserialize<'de> for CreateSessionRequest {
     }
 }
 
+impl<'de> Deserialize<'de> for RunProfileRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawRunProfileRequest::deserialize(deserializer)?;
+        if raw.collector.is_some() && !raw.collectors.is_empty() {
+            return Err(serde::de::Error::custom(
+                "collector and collectors cannot both be set",
+            ));
+        }
+        let collectors = match raw.collector {
+            Some(collector) => vec![collector],
+            None if raw.collectors.is_empty() => vec![ProfileCollectorConfig::default()],
+            None => raw.collectors,
+        };
+        Ok(Self {
+            target: raw.target,
+            timeout_ms: raw.timeout_ms,
+            collectors,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,12 +649,95 @@ mod tests {
 
         let request: RunProfileRequest = decode_arguments(value).expect("decode request");
         assert_eq!(request.timeout_ms, 1000);
-        assert_eq!(request.collector.kind(), ProfileCollectorKind::NativeEtw);
+        assert_eq!(request.collectors.len(), 1);
+        assert_eq!(request.collectors[0].kind(), ProfileCollectorKind::NativeEtw);
         assert!(matches!(
-            request.collector,
+            request.collectors[0],
             ProfileCollectorConfig::NativeEtw {
                 preset: ProfilePreset::SystemOverview
             }
         ));
+    }
+
+    #[test]
+    fn run_profile_arguments_decode_legacy_collector_to_collectors() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collector": {
+                "kind": "native_etw",
+                "preset": "system_overview"
+            }
+        });
+
+        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
+        assert_eq!(request.collectors.len(), 1);
+        assert!(matches!(
+            request.collectors[0],
+            ProfileCollectorConfig::NativeEtw {
+                preset: ProfilePreset::SystemOverview
+            }
+        ));
+    }
+
+    #[test]
+    fn run_profile_arguments_decode_procmon_collectors_array() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collectors": [
+                {
+                    "kind": "native_etw",
+                    "preset": "system_overview"
+                },
+                {
+                    "kind": "procmon",
+                    "capture_stacks": true,
+                    "filters": {
+                        "operations": ["CreateFile", "ReadFile"],
+                        "paths": ["C:\\data\\large_input.bin"]
+                    }
+                }
+            ]
+        });
+
+        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
+        assert_eq!(request.collectors.len(), 2);
+        assert!(matches!(
+            request.collectors[1],
+            ProfileCollectorConfig::Procmon { .. }
+        ));
+    }
+
+    #[test]
+    fn run_profile_arguments_reject_both_collector_forms() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collector": {
+                "kind": "native_etw",
+                "preset": "system_overview"
+            },
+            "collectors": [
+                {
+                    "kind": "native_etw",
+                    "preset": "system_overview"
+                }
+            ]
+        });
+
+        let error = decode_arguments::<RunProfileRequest>(value).expect_err("reject both forms");
+        assert!(error
+            .to_string()
+            .contains("collector and collectors cannot both be set"));
     }
 }

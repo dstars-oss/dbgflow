@@ -25,6 +25,7 @@ impl RunProfile {
 pub enum ProfileTarget {
     Launch {
         executable: PathBuf,
+        #[serde(default)]
         args: Vec<String>,
     },
 }
