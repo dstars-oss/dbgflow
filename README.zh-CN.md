@@ -19,6 +19,7 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - 原生 Windows service 运行模式
 - 原生 Windows service 安装 / 卸载子命令
 - 主服务级代理配置，供 session worker 和 SymSrv 符号下载使用
+- 安装时配置 DbgEng 初始 symbol path
 - launch-only profiling，支持 native ETW 和可选 Sysinternals Procmon collector
 
 初始公开 tool 名称：
@@ -56,6 +57,8 @@ Target 示例：
 ```
 
 Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。session 状态不再从命令文本识别运行控制，而是由 backend execution status 事件和最终状态更新。`set_symbols` 接受原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
+运行配置也可以提供初始 DbgEng symbol path。dbgflow 会在打开 target 前通过
+DbgEng symbols API 应用该路径，而不是依赖 worker 环境变量生效。
 
 `run_profile` 启动本地可执行文件，并围绕同一个 target 生命周期运行一个
 或多个 profiling collector。默认 collector 是 `native_etw/system_overview`，
@@ -144,6 +147,7 @@ data_dir = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\var"
 
 [debugger]
 dbgeng_dir = "C:\\Program Files\\WindowsApps\\Microsoft.WinDbg_...\\amd64"
+symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 
 [tools]
 sysinternals_dir = "C:\\Users\\dstars\\Bin\\SysinternalsSuite"
@@ -193,7 +197,10 @@ transcript 中。
 System32 最后的顺序探测 DbgEng。Sysinternals 仍是可选依赖；如果没有配置
 Sysinternals 目录，service 仍会正常安装运行，但 Procmon-based profiling 不可用。
 使用 `-ProxyUrl <url>`、`-NoProxy` 或现有 proxy 环境变量控制生成的 `[proxy]`
-配置；使用 `-NonInteractive` 可跳过最终确认，直接写入探测值 / 默认值。
+配置。使用 `-SymbolPath <path>` 写入 `[debugger].symbol_path`；如果未传该参数，
+安装脚本会在当前环境存在 `_NT_ALT_SYMBOL_PATH` / `_NT_SYMBOL_PATH` 时持久化它们，
+否则不写入该字段。脚本不会默认写入 Microsoft public symbol server。使用
+`-NonInteractive` 可跳过最终确认，直接写入探测值 / 默认值。
 
 卸载会从 Windows Service Control Manager 查询已安装服务命令行，找回已安装 exe
 路径和 `--config` 路径，然后删除服务并删除整个配置中的 install root，包括 `bin`、

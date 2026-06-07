@@ -21,6 +21,7 @@ endpoint, and Windows service install / uninstall subcommands:
 - native Windows service mode
 - native Windows service install / uninstall subcommands
 - main-service proxy configuration for session workers and SymSrv symbol downloads
+- install-time DbgEng symbol path configuration
 - launch-only profiling with native ETW and optional Sysinternals Procmon collectors
 
 Initial tool names:
@@ -74,6 +75,9 @@ are not detected from command text; session state is updated from backend
 execution-status events and final backend status.
 `set_symbols` accepts native WinDbg symbol path strings, including symbol server
 paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
+The runtime config can also provide an initial DbgEng symbol path. dbgflow
+applies this through the DbgEng symbols API before opening the target; it is not
+implemented by relying on worker environment variables.
 
 `run_profile` launches a local executable and records one or more profiling
 collectors around the same target lifetime. The default collector is
@@ -176,6 +180,7 @@ data_dir = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\var"
 
 [debugger]
 dbgeng_dir = "C:\\Program Files\\WindowsApps\\Microsoft.WinDbg_...\\amd64"
+symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 
 [tools]
 sysinternals_dir = "C:\\Users\\dstars\\Bin\\SysinternalsSuite"
@@ -240,8 +245,11 @@ then Windows Kits / WDK Debuggers, then System32. Sysinternals is optional; if
 no Sysinternals directory is configured, the service still installs and runs,
 but Procmon-based profiling is unavailable. Use `-ProxyUrl <url>`, `-NoProxy`,
 or existing proxy environment variables to control the generated `[proxy]`
-section. Use `-NonInteractive` to write the detected/default config without the
-final confirmation prompt.
+section. Use `-SymbolPath <path>` to write `[debugger].symbol_path`; if omitted,
+the install script persists `_NT_ALT_SYMBOL_PATH` and `_NT_SYMBOL_PATH` from the
+current environment when present, and otherwise leaves the field unset. It does
+not default to Microsoft's public symbol server. Use `-NonInteractive` to write
+the detected/default config without the final confirmation prompt.
 
 Uninstall queries the installed service command line from the Windows Service
 Control Manager to recover the installed executable path and `--config` path,

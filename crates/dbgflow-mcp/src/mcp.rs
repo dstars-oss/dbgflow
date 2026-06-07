@@ -433,17 +433,44 @@ pub fn server_with_data_dir_proxy_and_sysinternals(
     proxy: ProxyEnvironment,
     sysinternals_dir: Option<PathBuf>,
 ) -> std::result::Result<McpServer, String> {
+    server_with_data_dir_proxy_sysinternals_and_symbol_path(data_dir, proxy, sysinternals_dir, None)
+}
+
+pub fn server_with_data_dir_proxy_sysinternals_and_symbol_path(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    sysinternals_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
+) -> std::result::Result<McpServer, String> {
     let data_dir = data_dir.into();
     let logger = Arc::new(
         FileLogSink::new(data_dir.join("logs"), 7)
             .map_err(|error| format!("initialize log directory: {error}"))?,
     );
-    Ok(server_with_data_dir_proxy_sysinternals_and_logger(
+    Ok(
+        server_with_data_dir_proxy_sysinternals_symbol_path_and_logger(
+            data_dir,
+            proxy,
+            sysinternals_dir,
+            symbol_path,
+            logger,
+        ),
+    )
+}
+
+pub fn server_with_data_dir_proxy_sysinternals_and_logger(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    sysinternals_dir: Option<PathBuf>,
+    logger: Arc<dyn LogSink>,
+) -> McpServer {
+    server_with_data_dir_proxy_sysinternals_symbol_path_and_logger(
         data_dir,
         proxy,
         sysinternals_dir,
+        None,
         logger,
-    ))
+    )
 }
 
 pub fn server_with_data_dir_and_logger(
@@ -461,20 +488,23 @@ pub fn server_with_data_dir_proxy_and_logger(
     server_with_data_dir_proxy_sysinternals_and_logger(data_dir, proxy, None, logger)
 }
 
-pub fn server_with_data_dir_proxy_sysinternals_and_logger(
+pub fn server_with_data_dir_proxy_sysinternals_symbol_path_and_logger(
     data_dir: impl Into<PathBuf>,
     proxy: ProxyEnvironment,
     sysinternals_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
     logger: Arc<dyn LogSink>,
 ) -> McpServer {
     let data_dir = data_dir.into();
     let artifact_root = data_dir.join("artifacts");
-    let sessions = dbgflow_core::session::SessionManager::with_worker_launcher_proxy_and_logger(
-        default_process_worker_launcher(),
-        &artifact_root,
-        proxy,
-        logger.clone(),
-    );
+    let sessions =
+        dbgflow_core::session::SessionManager::with_worker_launcher_proxy_symbol_path_and_logger(
+            default_process_worker_launcher(),
+            &artifact_root,
+            proxy,
+            symbol_path,
+            logger.clone(),
+        );
     let profiles = ProfileManager::with_runtime_and_logger(
         &artifact_root,
         dbgflow_core::profile::ProcmonRuntime::from(sysinternals_dir),

@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub proxy: ProxyEnvironment,
     pub sysinternals_dir: Option<PathBuf>,
     pub dbgeng_dir: Option<PathBuf>,
+    pub symbol_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,10 +88,15 @@ impl RuntimeConfig {
             ));
         }
 
-        let dbgeng_dir = raw
-            .debugger
-            .and_then(|debugger| debugger.dbgeng_dir)
-            .map(|path| parse_dbgeng_dir_path(&path, "debugger.dbgeng_dir"))
+        let debugger = raw.debugger;
+        let dbgeng_dir = debugger
+            .as_ref()
+            .and_then(|debugger| debugger.dbgeng_dir.as_ref())
+            .map(|path| parse_dbgeng_dir_path(path, "debugger.dbgeng_dir"))
+            .transpose()?;
+        let symbol_path = debugger
+            .and_then(|debugger| debugger.symbol_path)
+            .map(|symbol_path| parse_symbol_path(&symbol_path, "debugger.symbol_path"))
             .transpose()?;
         let sysinternals_dir = raw
             .tools
@@ -112,6 +118,7 @@ impl RuntimeConfig {
                 proxy,
                 sysinternals_dir,
                 dbgeng_dir,
+                symbol_path,
             },
         })
     }
@@ -427,6 +434,7 @@ struct RawServerConfig {
 #[derive(Debug, Deserialize)]
 struct RawDebuggerConfig {
     dbgeng_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -544,6 +552,19 @@ fn parse_sysinternals_dir_path(path: &Path, label: &str) -> Result<PathBuf, Stri
         ));
     }
     Ok(path)
+}
+
+fn parse_symbol_path(value: &str, label: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value
+        .chars()
+        .any(|ch| matches!(ch, '\0' | '\r' | '\n' | '\u{2028}' | '\u{2029}') || ch.is_control())
+    {
+        return Err(format!("{label} contains unsupported control characters"));
+    }
+    Ok(value.to_string())
 }
 
 fn parse_existing_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -811,6 +832,7 @@ data_dir = "{}"
 
 [debugger]
 dbgeng_dir = "{}"
+symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 
 [tools]
 sysinternals_dir = "{}"
@@ -835,6 +857,84 @@ url = "http://127.0.0.1:7897"
             config.app.proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
             Some("127.0.0.1:7897")
         );
+        assert_eq!(
+            config.app.symbol_path.as_deref(),
+            Some("srv*C:\\symbols*https://msdl.microsoft.com/download/symbols")
+        );
+    }
+
+    #[test]
+    fn parses_symbol_path_without_dbgeng_dir() {
+        let root = unique_test_dir("runtime-symbol-path-only");
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[debugger]
+symbol_path = "cache*C:\\symbols;srv*https://msdl.microsoft.com/download/symbols"
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+            ),
+        );
+
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+
+        assert!(config.app.dbgeng_dir.is_none());
+        assert_eq!(
+            config.app.symbol_path.as_deref(),
+            Some("cache*C:\\symbols;srv*https://msdl.microsoft.com/download/symbols")
+        );
+    }
+
+    #[test]
+    fn rejects_symbol_path_control_characters() {
+        let root = unique_test_dir("runtime-symbol-path-control");
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[debugger]
+symbol_path = "srv*C:\\symbols\r\n.shell dir"
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+            ),
+        );
+
+        let error = RuntimeConfig::load(&config_path).expect_err("reject symbol path");
+
+        assert!(error.contains("debugger.symbol_path contains unsupported control characters"));
     }
 
     #[test]

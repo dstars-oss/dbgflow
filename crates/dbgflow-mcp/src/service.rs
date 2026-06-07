@@ -1,6 +1,6 @@
 use crate::http::{run_http, HttpConfig};
 use crate::logging::FileLogSink;
-use crate::mcp::server_with_data_dir_proxy_sysinternals_and_logger;
+use crate::mcp::server_with_data_dir_proxy_sysinternals_symbol_path_and_logger;
 use crate::runtime::{
     apply_runtime_environment, parse_installed_service_command,
     service_process_options_from_command_line, validate_install_root_removal, RuntimeConfig,
@@ -89,7 +89,8 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
                     .dbgeng_dir
                     .as_ref()
                     .map(|path| path.display().to_string()),
-            ),
+            )
+            .field("symbol_path_configured", config.app.symbol_path.is_some()),
     );
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -112,10 +113,11 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
     )?;
 
     let result = run_http(
-        server_with_data_dir_proxy_sysinternals_and_logger(
+        server_with_data_dir_proxy_sysinternals_symbol_path_and_logger(
             data_dir,
             config.app.proxy.clone(),
             config.app.sysinternals_dir.clone(),
+            config.app.symbol_path.clone(),
             logger.clone(),
         ),
         HttpConfig {

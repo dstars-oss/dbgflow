@@ -570,6 +570,38 @@ fn session_manager_passes_proxy_environment_to_worker_launcher() {
 }
 
 #[test]
+fn session_manager_passes_symbol_path_to_worker_request() {
+    let observed_request = Arc::new(Mutex::new(None));
+    let symbol_path = "cache*C:\\symbols;srv*https://msdl.microsoft.com/download/symbols";
+    let launcher = RecordingCreateSessionWorkerLauncher {
+        observed_request: observed_request.clone(),
+    };
+    let manager = SessionManager::with_worker_launcher_proxy_symbol_path_and_logger(
+        Arc::new(launcher),
+        test_artifact_root("symbol-path-worker-request"),
+        ProxyEnvironment::none(),
+        Some(symbol_path.to_string()),
+        Arc::new(RecordingLogSink::default()),
+    );
+
+    let session = manager
+        .create_session(CreateSession {
+            target: test_dump_target("symbol-path-worker-request-target"),
+            startup_timeout_ms: None,
+        })
+        .expect("create session");
+    let session = wait_for_break(&manager, session.id);
+    assert_eq!(session.state, SessionState::Break);
+
+    let observed = observed_request
+        .lock()
+        .expect("observed request lock")
+        .clone()
+        .expect("request observed");
+    assert_eq!(observed.symbol_path.as_deref(), Some(symbol_path));
+}
+
+#[test]
 fn legacy_worker_launcher_constructor_does_not_intervene_in_proxy_environment() {
     let _env_guard = ProxyEnvGuard::with_proxy_environment();
     let observed_proxy = Arc::new(Mutex::new(None));
@@ -993,6 +1025,15 @@ struct RecordingProxyWorkerLauncher {
     observed_proxy: Arc<Mutex<Option<ProxyEnvironment>>>,
 }
 
+struct RecordingCreateSessionWorkerLauncher {
+    observed_request: Arc<Mutex<Option<CreateBackendSession>>>,
+}
+
+struct RecordingCreateSessionWorker {
+    observed_request: Arc<Mutex<Option<CreateBackendSession>>>,
+    closed: AtomicBool,
+}
+
 impl SessionWorkerLauncher for RecordingProxyWorkerLauncher {
     fn spawn(
         &self,
@@ -1004,6 +1045,20 @@ impl SessionWorkerLauncher for RecordingProxyWorkerLauncher {
         Ok(Arc::new(TestWorker {
             backend_session_id: "proxy-observer".to_string(),
             behavior: WorkerBehavior::Normal,
+            closed: AtomicBool::new(false),
+        }))
+    }
+}
+
+impl SessionWorkerLauncher for RecordingCreateSessionWorkerLauncher {
+    fn spawn(
+        &self,
+        _session_id: SessionId,
+        _logger: Arc<dyn LogSink>,
+        _proxy: ProxyEnvironment,
+    ) -> Result<Arc<dyn SessionWorker>> {
+        Ok(Arc::new(RecordingCreateSessionWorker {
+            observed_request: self.observed_request.clone(),
             closed: AtomicBool::new(false),
         }))
     }
@@ -1022,6 +1077,43 @@ impl SessionWorkerLauncher for TestWorkerLauncher {
             behavior: self.behavior.clone(),
             closed: AtomicBool::new(false),
         }))
+    }
+}
+
+impl SessionWorker for RecordingCreateSessionWorker {
+    fn create_session(&self, request: CreateBackendSession) -> Result<WorkerSession> {
+        *self.observed_request.lock().expect("observed request lock") = Some(request);
+        Ok(WorkerSession {
+            backend: "fake".to_string(),
+            backend_session_id: "symbol-path-observer".to_string(),
+            warnings: Vec::new(),
+        })
+    }
+
+    fn execute(
+        &self,
+        command: String,
+        _event_sink: Arc<dyn BackendEventSink>,
+    ) -> Result<ExecuteBackendResult> {
+        Ok(ExecuteBackendResult {
+            output: format!("fake worker executed: {command}"),
+            warnings: Vec::new(),
+            final_state: None,
+        })
+    }
+
+    fn has_exited(&self) -> Result<bool> {
+        Ok(self.closed.load(Ordering::SeqCst))
+    }
+
+    fn close(&self) -> Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn kill(&self, _reason: &str) -> Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 

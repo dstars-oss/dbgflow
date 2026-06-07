@@ -17,9 +17,9 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugClient, IDebugClient4, IDebugClient5, IDebugControl4, IDebugOutputCallbacksWide,
-    IDebugOutputCallbacksWide_Impl, DEBUG_ATTACH_DEFAULT, DEBUG_END_PASSIVE, DEBUG_EXECUTE_DEFAULT,
-    DEBUG_INTERRUPT_EXIT, DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_STATUS_BREAK, DEBUG_STATUS_GO,
-    DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK,
+    IDebugOutputCallbacksWide_Impl, IDebugSymbols3, DEBUG_ATTACH_DEFAULT, DEBUG_END_PASSIVE,
+    DEBUG_EXECUTE_DEFAULT, DEBUG_INTERRUPT_EXIT, DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_STATUS_BREAK,
+    DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK,
     DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_REVERSE_GO, DEBUG_STATUS_REVERSE_STEP_BRANCH,
     DEBUG_STATUS_REVERSE_STEP_INTO, DEBUG_STATUS_REVERSE_STEP_OVER, DEBUG_STATUS_STEP_BRANCH,
     DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER,
@@ -94,6 +94,7 @@ impl DebugBackend for DbgEngBackend {
         let worker_id = id.clone();
         let logger = self.logger.clone();
         let correlation_id = request.correlation_id.clone();
+        let symbol_path = request.symbol_path.clone();
         let startup_key = correlation_id.clone().unwrap_or_else(|| id.clone());
         let startup_cancel = Arc::new(StartupCancellation::default());
         self.pending_startups
@@ -105,6 +106,7 @@ impl DebugBackend for DbgEngBackend {
                 worker_id,
                 request.target,
                 correlation_id,
+                symbol_path,
                 logger,
                 rx,
                 init_tx,
@@ -447,25 +449,32 @@ fn worker_main(
     id: String,
     target: DebugTarget,
     correlation_id: Option<String>,
+    symbol_path: Option<String>,
     logger: Arc<dyn LogSink>,
     rx: mpsc::Receiver<WorkerCommand>,
     init_tx: mpsc::SyncSender<Result<WorkerInit>>,
     startup_cancel: Arc<StartupCancellation>,
 ) {
-    let mut session =
-        match DbgEngSession::open_target(&id, correlation_id, &target, logger, startup_cancel) {
-            Ok(session) => {
-                let _ = init_tx.send(Ok(WorkerInit {
-                    warnings: session.warnings.clone(),
-                    interrupt: session.interrupt_handle(),
-                }));
-                session
-            }
-            Err(error) => {
-                let _ = init_tx.send(Err(error));
-                return;
-            }
-        };
+    let mut session = match DbgEngSession::open_target(
+        &id,
+        correlation_id,
+        &target,
+        symbol_path,
+        logger,
+        startup_cancel,
+    ) {
+        Ok(session) => {
+            let _ = init_tx.send(Ok(WorkerInit {
+                warnings: session.warnings.clone(),
+                interrupt: session.interrupt_handle(),
+            }));
+            session
+        }
+        Err(error) => {
+            let _ = init_tx.send(Err(error));
+            return;
+        }
+    };
 
     while let Ok(command) = rx.recv() {
         match command {
@@ -505,6 +514,7 @@ impl DbgEngSession {
         backend_session_id: &str,
         correlation_id: Option<String>,
         target: &DebugTarget,
+        symbol_path: Option<String>,
         logger: Arc<dyn LogSink>,
         startup_cancel: Arc<StartupCancellation>,
     ) -> Result<Self> {
@@ -523,6 +533,7 @@ impl DbgEngSession {
             backend_session_id,
             correlation_id.clone(),
             target,
+            symbol_path,
             logger.clone(),
             startup_cancel,
             startup_started,
@@ -547,6 +558,7 @@ impl DbgEngSession {
         backend_session_id: &str,
         correlation_id: Option<String>,
         target: &DebugTarget,
+        symbol_path: Option<String>,
         logger: Arc<dyn LogSink>,
         startup_cancel: Arc<StartupCancellation>,
         startup_started: Instant,
@@ -601,6 +613,15 @@ impl DbgEngSession {
         let control: IDebugControl4 = client.cast().map_err(|error| {
             DbgFlowError::Backend(format!("query IDebugControl4 failed: {error}"))
         })?;
+        if let Some(symbol_path) = symbol_path.as_deref() {
+            set_symbol_path_wide(
+                &client,
+                symbol_path,
+                &logger,
+                &correlation_id,
+                backend_session_id,
+            )?;
+        }
         startup_cancel.install_interrupt(DbgEngInterrupt {
             control: SendableDebugControl::new(&control),
             logger: logger.clone(),
@@ -1055,6 +1076,85 @@ fn to_wide_null(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+fn set_symbol_path_wide(
+    client: &IDebugClient,
+    symbol_path: &str,
+    logger: &Arc<dyn LogSink>,
+    correlation_id: &Option<String>,
+    backend_session_id: &str,
+) -> Result<()> {
+    validate_symbol_path(symbol_path)?;
+    let started = Instant::now();
+    logger.log(
+        dbgeng_event(
+            LogLevel::Info,
+            "set_symbol_path_started",
+            correlation_id,
+            Some(backend_session_id),
+        )
+        .field("symbol_path_length", symbol_path.len()),
+    );
+    let symbols: IDebugSymbols3 = client.cast().map_err(|error| {
+        logger.log(
+            dbgeng_event(
+                LogLevel::Error,
+                "query_debug_symbols_failed",
+                correlation_id,
+                Some(backend_session_id),
+            )
+            .duration_ms(started.elapsed().as_millis())
+            .error(error.to_string()),
+        );
+        DbgFlowError::Backend(format!("query IDebugSymbols3 failed: {error}"))
+    })?;
+    let wide_symbol_path = to_wide_null_str(symbol_path);
+    unsafe {
+        symbols
+            .SetSymbolPathWide(PCWSTR(wide_symbol_path.as_ptr()))
+            .map_err(|error| {
+                logger.log(
+                    dbgeng_event(
+                        LogLevel::Error,
+                        "set_symbol_path_failed",
+                        correlation_id,
+                        Some(backend_session_id),
+                    )
+                    .duration_ms(started.elapsed().as_millis())
+                    .error(error.to_string()),
+                );
+                DbgFlowError::Backend(format!("IDebugSymbols3::SetSymbolPathWide failed: {error}"))
+            })?;
+    }
+    logger.log(
+        dbgeng_event(
+            LogLevel::Info,
+            "set_symbol_path_finished",
+            correlation_id,
+            Some(backend_session_id),
+        )
+        .duration_ms(started.elapsed().as_millis())
+        .field("symbol_path_length", symbol_path.len()),
+    );
+    Ok(())
+}
+
+fn validate_symbol_path(symbol_path: &str) -> Result<()> {
+    if symbol_path.trim().is_empty() {
+        return Err(DbgFlowError::Backend(
+            "symbol path must not be empty".to_string(),
+        ));
+    }
+    if symbol_path
+        .chars()
+        .any(|ch| matches!(ch, '\0' | '\r' | '\n' | '\u{2028}' | '\u{2029}') || ch.is_control())
+    {
+        return Err(DbgFlowError::Backend(
+            "symbol path contains unsupported control characters".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn break_process(pid: u32) -> Result<()> {

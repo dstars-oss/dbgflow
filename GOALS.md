@@ -329,6 +329,21 @@ fallback。
 * 卸载必须以已安装服务的真实命令行为准，避免从另一个工作区或另一个 exe 运行
   uninstall 时删错路径。
 
+### D-011: 初始 DbgEng symbol path 由 runtime 配置承载并通过 API 应用
+
+决定：
+
+`config.toml` 的 `[debugger].symbol_path` 记录安装时确定的初始符号路径。
+安装脚本支持显式 `-SymbolPath`；未传时继承当前 `_NT_ALT_SYMBOL_PATH` 和
+`_NT_SYMBOL_PATH`，不存在则不写入。真实 DbgEng session 在打开 target 前通过
+`IDebugSymbols3::SetSymbolPathWide` 应用该路径。
+
+原因：
+
+* symbol path 是调试后端配置，不应依赖 worker 环境变量作为标准化生效机制。
+* 保留原生 WinDbg symbol path 字符串，兼容 `srv*`、`cache*`、UNC 和分号语义。
+* 不默认写入 Microsoft public symbol server，避免默认网络下载和隐藏磁盘占用。
+
 ## 8. 当前待办
 
 ### P0
@@ -361,6 +376,7 @@ fallback。
 * [x] 支持本地 Streamable HTTP MCP endpoint。
 * [x] 支持 Windows service 安装 / 卸载子命令。
 * [x] 支持主服务级代理配置，并通过 `_NT_SYMBOL_PROXY` 支持 SymSrv 符号下载代理。
+* [x] 支持安装配置中的初始 DbgEng symbol path，并通过 DbgEng symbols API 应用。
 * [x] 将 Windows service 交互式安装旅程、依赖探测、提权和 service 环境写入收敛到主程序。
 * [x] 补齐更多 live attach / launch HTTP E2E ignored 验证场景。
 * [x] 补齐 `transcript.log` 和 `events.jsonl` 审计链路。

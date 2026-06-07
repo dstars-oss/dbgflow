@@ -237,6 +237,8 @@ cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir D:\Repos\Proje
 
 `AGENTS.md` 只记录协作规则、架构边界和安全要求。
 
+`docs/reference/` 记录外部平台、调试后端、API、命令语义和运行时行为的依据性参考材料。调研结论或会影响实现决策的外部文档摘要应放在这里，并优先链接官方资料。
+
 `GOALS.md` 记录：
 
 * 项目目标

@@ -37,6 +37,7 @@ pub struct BackendSession {
 pub struct CreateBackendSession {
     pub target: DebugTarget,
     pub correlation_id: Option<String>,
+    pub symbol_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

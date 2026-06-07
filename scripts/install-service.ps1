@@ -8,12 +8,14 @@ param(
     [string]$ConfigPath,
     [string]$ProxyUrl,
     [string]$DbgEngDir,
+    [string]$SymbolPath,
     [string]$SysinternalsDir,
     [switch]$NoProxy,
     [switch]$NonInteractive
 )
 
 $ErrorActionPreference = "Stop"
+$SymbolPathWasProvided = $PSBoundParameters.ContainsKey("SymbolPath")
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = Split-Path -Parent $ScriptDir
@@ -296,12 +298,51 @@ function Get-ProxyConfig {
     return @{ Mode = "none"; Url = $null; Env = @{} }
 }
 
+function Assert-SymbolPathValue {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        throw "$Label must not be empty"
+    }
+    foreach ($ch in $Value.ToCharArray()) {
+        $code = [int][char]$ch
+        if ($code -eq 0 -or $code -eq 10 -or $code -eq 13 -or $code -eq 0x2028 -or $code -eq 0x2029 -or [char]::IsControl($ch)) {
+            throw "$Label contains unsupported control characters"
+        }
+    }
+}
+
+function Get-SymbolPathConfig {
+    if ($SymbolPathWasProvided) {
+        Assert-SymbolPathValue -Value $SymbolPath -Label "Symbol path"
+        return $SymbolPath
+    }
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @("_NT_ALT_SYMBOL_PATH", "_NT_SYMBOL_PATH")) {
+        $value = [System.Environment]::GetEnvironmentVariable($key)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            continue
+        }
+        Assert-SymbolPathValue -Value $value -Label $key
+        $parts.Add($value)
+    }
+    if ($parts.Count -eq 0) {
+        return $null
+    }
+    return ($parts -join ";")
+}
+
 function Write-DbgFlowConfig {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$InstallRoot,
         [Parameter(Mandatory = $true)][string]$DataDir,
         [string]$ResolvedDbgEngDir,
+        [string]$ResolvedSymbolPath,
         [string]$ResolvedSysinternalsDir,
         [Parameter(Mandatory = $true)]$ProxyConfig
     )
@@ -318,10 +359,15 @@ function Write-DbgFlowConfig {
     $lines.Add("bind = $(ConvertTo-TomlString $Bind)")
     $lines.Add("data_dir = $(ConvertTo-TomlString $DataDir)")
 
-    if ($ResolvedDbgEngDir) {
+    if ($ResolvedDbgEngDir -or $ResolvedSymbolPath) {
         $lines.Add("")
         $lines.Add("[debugger]")
-        $lines.Add("dbgeng_dir = $(ConvertTo-TomlString $ResolvedDbgEngDir)")
+        if ($ResolvedDbgEngDir) {
+            $lines.Add("dbgeng_dir = $(ConvertTo-TomlString $ResolvedDbgEngDir)")
+        }
+        if ($ResolvedSymbolPath) {
+            $lines.Add("symbol_path = $(ConvertTo-TomlString $ResolvedSymbolPath)")
+        }
     }
     if ($ResolvedSysinternalsDir) {
         $lines.Add("")
@@ -417,6 +463,7 @@ try {
     }
 
     $proxyConfig = Get-ProxyConfig
+    $resolvedSymbolPath = Get-SymbolPathConfig
 
     Write-Host "dbgflow Windows service install"
     Write-Host ""
@@ -427,6 +474,7 @@ try {
     Write-Host "Config: $ConfigPath"
     Write-Host "Data dir: $DataDir"
     Write-Host "DbgEng dir: $(if ($resolvedDbgEngDir) { $resolvedDbgEngDir } else { 'not configured' })"
+    Write-Host "Symbol path: $(if ($resolvedSymbolPath) { 'configured' } else { 'not configured' })"
     Write-Host "Sysinternals dir: $(if ($resolvedSysinternalsDir) { $resolvedSysinternalsDir } else { 'not configured' })"
     Write-Host "Proxy mode: $($proxyConfig.Mode)"
     if ($proxyConfig.Url) {
@@ -444,7 +492,7 @@ try {
         }
     }
 
-    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSysinternalsDir $resolvedSysinternalsDir -ProxyConfig $proxyConfig
+    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedSysinternalsDir $resolvedSysinternalsDir -ProxyConfig $proxyConfig
 
     & $Exe service install --config $ConfigPath
     exit $LASTEXITCODE

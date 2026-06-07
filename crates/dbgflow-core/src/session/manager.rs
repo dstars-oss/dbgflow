@@ -72,6 +72,7 @@ pub struct SessionManager {
     event_subscribers: Arc<Mutex<Vec<mpsc::Sender<SessionId>>>>,
     logger: Arc<dyn LogSink>,
     proxy: ProxyEnvironment,
+    symbol_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -162,6 +163,22 @@ impl SessionManager {
         proxy: ProxyEnvironment,
         logger: Arc<dyn LogSink>,
     ) -> Self {
+        Self::with_worker_launcher_proxy_symbol_path_and_logger(
+            worker_launcher,
+            artifact_root,
+            proxy,
+            None,
+            logger,
+        )
+    }
+
+    pub fn with_worker_launcher_proxy_symbol_path_and_logger(
+        worker_launcher: Arc<dyn SessionWorkerLauncher>,
+        artifact_root: impl Into<PathBuf>,
+        proxy: ProxyEnvironment,
+        symbol_path: Option<String>,
+        logger: Arc<dyn LogSink>,
+    ) -> Self {
         Self {
             worker_launcher,
             workers: Arc::new(WorkerRegistry::default()),
@@ -171,6 +188,7 @@ impl SessionManager {
             event_subscribers: Arc::new(Mutex::new(Vec::new())),
             logger,
             proxy,
+            symbol_path,
         }
     }
 
@@ -267,7 +285,8 @@ impl SessionManager {
                 .field("backend", "worker")
                 .field("target", &session.target)
                 .field("proxy_source", format!("{:?}", self.proxy.source()))
-                .field("proxy_keys", self.proxy.proxy_keys()),
+                .field("proxy_keys", self.proxy.proxy_keys())
+                .field("symbol_path_configured", self.symbol_path.is_some()),
         );
         if let Some(startup_timeout_ms) = request.startup_timeout_ms {
             self.log(
@@ -1251,6 +1270,7 @@ impl SessionManager {
     fn spawn_worker_startup(&self, session_id: SessionId, target: DebugTarget) {
         let manager = self.clone();
         let proxy = self.proxy.clone();
+        let symbol_path = self.symbol_path.clone();
         thread::spawn(move || {
             let startup_started = Instant::now();
             manager.log(
@@ -1294,6 +1314,7 @@ impl SessionManager {
             let startup_result = worker.create_session(CreateBackendSession {
                 target,
                 correlation_id: Some(session_id.to_string()),
+                symbol_path,
             });
             manager.finish_worker_startup(
                 session_id,

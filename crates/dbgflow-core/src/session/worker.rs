@@ -439,6 +439,7 @@ impl SessionWorker for ProcessSessionWorker {
         match self.request(WorkerRequest::CreateSession {
             target: request.target,
             correlation_id: request.correlation_id,
+            symbol_path: request.symbol_path,
         })? {
             WorkerResult::SessionCreated {
                 backend,
@@ -563,6 +564,7 @@ enum WorkerRequest {
     CreateSession {
         target: DebugTarget,
         correlation_id: Option<String>,
+        symbol_path: Option<String>,
     },
     Execute {
         command: String,
@@ -735,6 +737,7 @@ impl WorkerRuntime {
             WorkerRequest::CreateSession {
                 target,
                 correlation_id,
+                symbol_path,
             } => {
                 if self.backend_session_id.is_some() {
                     return (
@@ -747,6 +750,7 @@ impl WorkerRuntime {
                 match self.backend.create_session(CreateBackendSession {
                     target,
                     correlation_id,
+                    symbol_path,
                 }) {
                     Ok(session) => {
                         self.backend_session_id = Some(session.id.clone());
