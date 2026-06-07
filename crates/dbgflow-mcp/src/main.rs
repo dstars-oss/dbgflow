@@ -1,7 +1,8 @@
 use dbgflow_mcp::http::{run_http, HttpConfig};
 use dbgflow_mcp::mcp::server_with_data_dir_proxy_and_sysinternals;
 use dbgflow_mcp::runtime::{
-    help_text, parse_options, parse_service_install_options, parse_service_uninstall_options,
+    apply_runtime_environment, help_text, parse_options, parse_service_install_options,
+    parse_service_uninstall_options,
 };
 use std::ffi::OsString;
 use std::io::{self, BufReader};
@@ -32,6 +33,7 @@ fn run() -> Result<(), String> {
         }
         CommandMode::Http => {
             let config = parse_options(args.into_iter().skip(1))?;
+            apply_runtime_environment(&config);
             let (_shutdown_tx, shutdown_rx) = mpsc::channel();
             let server = server_with_data_dir_proxy_and_sysinternals(
                 config.data_dir,

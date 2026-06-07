@@ -130,12 +130,12 @@ Parallel collectors example:
 ```
 
 The `procmon` collector is optional and depends on Sysinternals Process Monitor.
-Configure the service or HTTP runtime with `--sysinternals-dir <path>`; dbgflow
-derives `Procmon64.exe` or `Procmon.exe` from that directory. If the option is
-not configured, Sysinternals-dependent features return a clear error and the
-target is not launched. `run_profile` requests do not accept a Sysinternals path;
-this is server runtime configuration. dbgflow does not download Procmon, does
-not scan the whole machine, and does not accept a standalone Procmon executable path.
+Configure `[tools].sysinternals_dir` in `config.toml`; dbgflow derives
+`Procmon64.exe` or `Procmon.exe` from that directory. If it is not configured,
+Sysinternals-dependent features return a clear error and the target is not
+launched. `run_profile` requests do not accept a Sysinternals path; this is
+server runtime configuration. dbgflow does not download Procmon, does not scan
+the whole machine, and does not accept a standalone Procmon executable path.
 Procmon writes `capture.pml` as the authoritative artifact and exports
 `events.csv` plus a best-effort target PID / operation / path filtered
 `events.jsonl`; when stack capture is requested, dbgflow also requests an XML
@@ -157,7 +157,32 @@ sessions or the MCP server.
 Run the MCP server over local Streamable HTTP from the repository root:
 
 ```text
-cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir .\var --proxy-url http://127.0.0.1:7897
+cargo run -p dbgflow-mcp -- http --config C:\Users\dstars\AppData\Local\dbgflow\config.toml
+```
+
+Runtime configuration is read from TOML:
+
+```toml
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "C:\\Users\\dstars\\AppData\\Local\\dbgflow"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\var"
+
+[debugger]
+dbgeng_dir = "C:\\Program Files\\WindowsApps\\Microsoft.WinDbg_...\\amd64"
+
+[tools]
+sysinternals_dir = "C:\\Users\\dstars\\Bin\\SysinternalsSuite"
+
+[proxy]
+mode = "url"
+url = "http://127.0.0.1:7897"
 ```
 
 The HTTP endpoint is `http://127.0.0.1:7331/mcp`. `POST /mcp` returns JSON
@@ -169,13 +194,12 @@ The HTTP transport is local-only: dbgflow only accepts loopback bind addresses
 and rejects non-localhost `Origin` headers. `/mcp` does not require bearer token
 authentication. HTTP request bodies are limited to 16 MiB.
 
-Proxy configuration is service-wide. Pass `--proxy-url http://127.0.0.1:7897`
-to set `_NT_SYMBOL_PROXY=127.0.0.1:7897` for DbgEng/SymSrv symbol downloads
-and `HTTP_PROXY` / `HTTPS_PROXY` plus lowercase equivalents for session workers
-and launched debuggees. Pass `--no-proxy` to clear known proxy variables for
-session workers. If neither option is passed, dbgflow reads `_NT_SYMBOL_PROXY`,
-`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, and lowercase equivalents
-from its process environment.
+Proxy configuration is service-wide and comes from `[proxy]` in `config.toml`.
+Use `mode = "url"` with `url = "http://host:port"` to set
+`_NT_SYMBOL_PROXY`, `HTTP_PROXY` / `HTTPS_PROXY`, and lowercase equivalents for
+session workers and launched debuggees. Use `mode = "disabled"` to clear known
+proxy variables, `mode = "env"` with `[proxy.env]` to persist specific proxy
+environment variables, or `mode = "none"` to leave proxy unconfigured.
 
 The server supports `initialize`, `notifications/initialized`, `ping`,
 `tools/list`, `tools/call`, `resources/list`, and `resources/read`. Tool
@@ -203,31 +227,27 @@ Build and install or uninstall the Windows service from the repository scripts:
 .\scripts\uninstall-service.ps1
 ```
 
-The install script only builds `dbgflow-mcp` in release mode and invokes the
-built `target\release\dbgflow-mcp.exe service install`. The install subcommand
-owns the rest of the flow: it prompts for service settings, detects local
-DbgEng in WinDbg Store packages first, Windows Kits / WDK Debuggers second, and
-the Windows directory last, detects Sysinternals from environment variables,
-`PATH`, and common Sysinternals directories, requests UAC elevation when needed,
-copies its current executable to
-`%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem with `service run
---data-dir %LOCALAPPDATA%\dbgflow\var`, writes the selected service
-environment, starts the service, and checks `/healthz`. Service artifacts and
-logs are written under `%LOCALAPPDATA%\dbgflow\var`. Uninstall does not delete
-artifacts or logs by default.
+The install script builds `dbgflow-mcp` in release mode, detects local runtime
+dependencies, writes `%LOCALAPPDATA%\dbgflow\config.toml`, shows a final
+summary, then invokes `target\release\dbgflow-mcp.exe service install --config
+<path>`. The install subcommand validates the config, requests UAC elevation
+when needed, copies its current executable to `%LOCALAPPDATA%\dbgflow\bin`,
+installs it as LocalSystem with `service run --config <path>`, starts the
+service, and checks `/healthz`.
 
-During installation, accept the detected DbgEng directory or enter another
-directory containing `dbgeng.dll`. The selected path is written as
-`DBGFLOW_DBGENG_DIR` in the service environment and is preferred by the DbgEng
-resolver. Sysinternals is optional; if no Sysinternals directory is configured,
-the service still installs and runs, but Procmon-based profiling is
-unavailable.
+The install script detects DbgEng from Microsoft Store WinDbg packages first,
+then Windows Kits / WDK Debuggers, then System32. Sysinternals is optional; if
+no Sysinternals directory is configured, the service still installs and runs,
+but Procmon-based profiling is unavailable. Use `-ProxyUrl <url>`, `-NoProxy`,
+or existing proxy environment variables to control the generated `[proxy]`
+section. Use `-NonInteractive` to write the detected/default config without the
+final confirmation prompt.
 
-The interactive installer uses `-ProxyUrl <url>` or existing proxy environment
-variables as the displayed proxy default. If neither is present, proxy is left
-unconfigured by default. Use `-NoProxy`, or type `none` at the prompt, to clear
-known service proxy keys. Use `-NonInteractive` to use provided/default CLI
-values without prompts.
+Uninstall queries the installed service command line from the Windows Service
+Control Manager to recover the installed executable path and `--config` path,
+then deletes the service and the entire configured install root, including
+`bin`, `config.toml`, logs, and artifacts. If the service is already missing,
+pass `-ConfigPath <path>` to `scripts\uninstall-service.ps1` as a fallback.
 
 Live process DbgEng integration tests are ignored by default because attach and
 launch behavior depends on local debugger permissions and target process state.

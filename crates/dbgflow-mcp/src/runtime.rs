@@ -1,4 +1,6 @@
+use dbgflow_core::backend::dbgeng::DBGFLOW_DBGENG_DIR_ENV;
 use dbgflow_core::proxy::ProxyEnvironment;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -8,6 +10,7 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:7331";
 pub const SERVICE_NAME: &str = "dbgflow-mcp";
 pub const SERVICE_DISPLAY_NAME: &str = "dbgflow MCP Server";
 pub const SERVICE_DESCRIPTION: &str = "dbgflow Streamable HTTP MCP server";
+const CONFIG_VERSION: u32 = 1;
 const KNOWN_PROXY_KEYS: &[&str] = &[
     "_NT_SYMBOL_PROXY",
     "HTTP_PROXY",
@@ -26,11 +29,91 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub proxy: ProxyEnvironment,
     pub sysinternals_dir: Option<PathBuf>,
+    pub dbgeng_dir: Option<PathBuf>,
 }
 
-impl AppConfig {
-    pub fn app_proxy(&self) -> &ProxyEnvironment {
-        &self.proxy
+#[derive(Debug, Clone)]
+pub struct ServiceSettings {
+    pub name: String,
+    pub display_name: String,
+    pub install_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub config_path: PathBuf,
+    pub service: ServiceSettings,
+    pub app: AppConfig,
+}
+
+impl RuntimeConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
+        let config_path = normalize_absolute_existing_file(path.as_ref(), "--config")?;
+        let contents = std::fs::read_to_string(&config_path)
+            .map_err(|error| format!("read config {}: {error}", config_path.display()))?;
+        let raw = toml::from_str::<RawRuntimeConfig>(&contents)
+            .map_err(|error| format!("parse config {}: {error}", config_path.display()))?;
+        Self::from_raw(config_path, raw)
+    }
+
+    fn from_raw(config_path: PathBuf, raw: RawRuntimeConfig) -> Result<Self, String> {
+        if raw.version != CONFIG_VERSION {
+            return Err(format!(
+                "unsupported config version {}; expected {}",
+                raw.version, CONFIG_VERSION
+            ));
+        }
+
+        validate_service_name(&raw.service.name)?;
+        if raw.service.display_name.trim().is_empty() {
+            return Err("service.display_name must not be empty".to_string());
+        }
+
+        let install_root =
+            normalize_absolute_required(&raw.service.install_root, "service.install_root")?;
+        reject_dangerous_install_root(&install_root)?;
+        let data_dir = normalize_absolute_required(&raw.server.data_dir, "server.data_dir")?;
+        let bind = parse_bind(&raw.server.bind)?;
+        if !path_starts_with_case_insensitive(&config_path, &install_root) {
+            return Err(format!(
+                "config path must be under service.install_root: {}",
+                config_path.display()
+            ));
+        }
+        if !path_starts_with_case_insensitive(&data_dir, &install_root) {
+            return Err(format!(
+                "server.data_dir must be under service.install_root: {}",
+                data_dir.display()
+            ));
+        }
+
+        let dbgeng_dir = raw
+            .debugger
+            .and_then(|debugger| debugger.dbgeng_dir)
+            .map(|path| parse_dbgeng_dir_path(&path, "debugger.dbgeng_dir"))
+            .transpose()?;
+        let sysinternals_dir = raw
+            .tools
+            .and_then(|tools| tools.sysinternals_dir)
+            .map(|path| parse_sysinternals_dir_path(&path, "tools.sysinternals_dir"))
+            .transpose()?;
+        let proxy = proxy_from_config(raw.proxy)?;
+
+        Ok(Self {
+            config_path,
+            service: ServiceSettings {
+                name: raw.service.name,
+                display_name: raw.service.display_name,
+                install_root,
+            },
+            app: AppConfig {
+                bind,
+                data_dir,
+                proxy,
+                sysinternals_dir,
+                dbgeng_dir,
+            },
+        })
     }
 }
 
@@ -42,23 +125,14 @@ pub struct ServiceProcessConfig {
 
 #[derive(Debug, Clone)]
 pub struct ServiceInstallConfig {
-    pub service_name: String,
-    pub display_name: String,
-    pub bind: SocketAddr,
-    pub install_root: PathBuf,
-    pub proxy: ProxyEnvironment,
-    pub dbgeng_dir: Option<PathBuf>,
-    pub sysinternals_dir: Option<PathBuf>,
-    pub interactive: bool,
+    pub config_path: PathBuf,
+    pub service: ServiceSettings,
+    pub app: AppConfig,
 }
 
 impl ServiceInstallConfig {
-    pub fn data_dir(&self) -> PathBuf {
-        self.install_root.join("var")
-    }
-
     pub fn bin_dir(&self) -> PathBuf {
-        self.install_root.join("bin")
+        self.service.install_root.join("bin")
     }
 
     pub fn installed_exe(&self) -> PathBuf {
@@ -66,72 +140,28 @@ impl ServiceInstallConfig {
     }
 
     pub fn normalized_command_args(&self) -> Vec<OsString> {
-        let mut args = vec![
+        vec![
             OsString::from("service"),
             OsString::from("install"),
-            OsString::from("--service-name"),
-            OsString::from(&self.service_name),
-            OsString::from("--display-name"),
-            OsString::from(&self.display_name),
-            OsString::from("--bind"),
-            OsString::from(self.bind.to_string()),
-            OsString::from("--install-root"),
-            self.install_root.as_os_str().to_os_string(),
-        ];
-        if let Some(sysinternals_dir) = &self.sysinternals_dir {
-            args.push(OsString::from("--sysinternals-dir"));
-            args.push(sysinternals_dir.as_os_str().to_os_string());
-        }
-        if let Some(dbgeng_dir) = &self.dbgeng_dir {
-            args.push(OsString::from("--dbgeng-dir"));
-            args.push(dbgeng_dir.as_os_str().to_os_string());
-        }
-        match self.proxy.source() {
-            dbgflow_core::proxy::ProxySource::Cli => {
-                if let Some(proxy_url) = self.proxy.value_for("HTTP_PROXY") {
-                    args.push(OsString::from("--proxy-url"));
-                    args.push(OsString::from(proxy_url));
-                }
-            }
-            dbgflow_core::proxy::ProxySource::Environment => {
-                for (key, value) in self.proxy.env_vars() {
-                    args.push(OsString::from("--proxy-env"));
-                    args.push(OsString::from(format!("{key}={value}")));
-                }
-            }
-            dbgflow_core::proxy::ProxySource::Disabled => {
-                args.push(OsString::from("--no-proxy"));
-            }
-            dbgflow_core::proxy::ProxySource::None => {}
-        }
-        args.push(OsString::from("--non-interactive"));
-        args
+            OsString::from("--config"),
+            self.config_path.as_os_str().to_os_string(),
+        ]
     }
 
     pub fn service_launch_arguments(&self) -> Vec<OsString> {
-        let mut args = vec![
+        vec![
             OsString::from("service"),
             OsString::from("run"),
-            OsString::from("--service-name"),
-            OsString::from(&self.service_name),
-            OsString::from("--bind"),
-            OsString::from(self.bind.to_string()),
-            OsString::from("--data-dir"),
-            self.data_dir().as_os_str().to_os_string(),
-        ];
-        if let Some(sysinternals_dir) = &self.sysinternals_dir {
-            args.push(OsString::from("--sysinternals-dir"));
-            args.push(sysinternals_dir.as_os_str().to_os_string());
-        }
-        args
+            OsString::from("--config"),
+            self.config_path.as_os_str().to_os_string(),
+        ]
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ServiceUninstallConfig {
     pub service_name: String,
-    pub install_root: PathBuf,
-    pub remove_install_files: bool,
+    pub config_path: Option<PathBuf>,
 }
 
 impl ServiceUninstallConfig {
@@ -141,178 +171,38 @@ impl ServiceUninstallConfig {
             OsString::from("uninstall"),
             OsString::from("--service-name"),
             OsString::from(&self.service_name),
-            OsString::from("--install-root"),
-            self.install_root.as_os_str().to_os_string(),
         ];
-        if self.remove_install_files {
-            args.push(OsString::from("--remove-install-files"));
+        if let Some(config_path) = &self.config_path {
+            args.push(OsString::from("--config"));
+            args.push(config_path.as_os_str().to_os_string());
         }
         args
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledServiceCommand {
+    pub executable_path: PathBuf,
+    pub config_path: PathBuf,
 }
 
 pub fn parse_options<I>(args: I) -> Result<AppConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let env = std::env::vars().collect::<HashMap<_, _>>();
-    parse_options_with_env(args, &env)
-}
-
-fn parse_options_with_env<I>(args: I, env: &HashMap<String, String>) -> Result<AppConfig, String>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
-    let mut data_dir = None;
-    let mut proxy_url = None;
-    let mut no_proxy = false;
-    let mut sysinternals_dir = None;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        let arg = arg
-            .into_string()
-            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
-
-        if let Some(value) = arg.strip_prefix("--bind=") {
-            bind = parse_bind(value)?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--data-dir=") {
-            data_dir = Some(PathBuf::from(value));
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--proxy-url=") {
-            proxy_url = Some(parse_non_empty(value, "--proxy-url")?);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--sysinternals-dir=") {
-            sysinternals_dir = Some(parse_existing_dir(value, "--sysinternals-dir")?);
-            continue;
-        }
-
-        match arg.as_str() {
-            "--bind" => {
-                let value = next_value(&mut args, "--bind")?;
-                bind = parse_bind(&value)?;
-            }
-            "--data-dir" => {
-                let value = next_value(&mut args, "--data-dir")?;
-                data_dir = Some(PathBuf::from(value));
-            }
-            "--proxy-url" => {
-                let value = next_value(&mut args, "--proxy-url")?;
-                proxy_url = Some(parse_non_empty(&value, "--proxy-url")?);
-            }
-            "--sysinternals-dir" => {
-                let value = next_value(&mut args, "--sysinternals-dir")?;
-                sysinternals_dir = Some(parse_existing_dir(&value, "--sysinternals-dir")?);
-            }
-            "--no-proxy" => no_proxy = true,
-            "--help" | "-h" => return Err(help_text().to_string()),
-            other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
-        }
-    }
-
-    let data_dir =
-        data_dir.ok_or_else(|| format!("missing required --data-dir <path>\n\n{}", help_text()))?;
-    let proxy = resolve_proxy(proxy_url, no_proxy, env)?;
-    Ok(AppConfig {
-        bind,
-        data_dir,
-        proxy,
-        sysinternals_dir,
-    })
+    let config_path = parse_required_config_path(args, help_text())?;
+    Ok(RuntimeConfig::load(config_path)?.app)
 }
 
 pub fn parse_service_process_options<I>(args: I) -> Result<ServiceProcessConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let env = std::env::vars().collect::<HashMap<_, _>>();
-    parse_service_process_options_with_env(args, &env)
-}
-
-fn parse_service_process_options_with_env<I>(
-    args: I,
-    env: &HashMap<String, String>,
-) -> Result<ServiceProcessConfig, String>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut service_name = SERVICE_NAME.to_string();
-    let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
-    let mut data_dir = None;
-    let mut proxy_url = None;
-    let mut no_proxy = false;
-    let mut sysinternals_dir = None;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        let arg = arg
-            .into_string()
-            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
-
-        if let Some(value) = arg.strip_prefix("--bind=") {
-            bind = parse_bind(value)?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--data-dir=") {
-            data_dir = Some(PathBuf::from(value));
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--service-name=") {
-            service_name = parse_service_name(value)?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--proxy-url=") {
-            proxy_url = Some(parse_non_empty(value, "--proxy-url")?);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--sysinternals-dir=") {
-            sysinternals_dir = Some(parse_existing_dir(value, "--sysinternals-dir")?);
-            continue;
-        }
-
-        match arg.as_str() {
-            "--bind" => {
-                let value = next_value(&mut args, "--bind")?;
-                bind = parse_bind(&value)?;
-            }
-            "--data-dir" => {
-                let value = next_value(&mut args, "--data-dir")?;
-                data_dir = Some(PathBuf::from(value));
-            }
-            "--service-name" => {
-                let value = next_value(&mut args, "--service-name")?;
-                service_name = parse_service_name(&value)?;
-            }
-            "--proxy-url" => {
-                let value = next_value(&mut args, "--proxy-url")?;
-                proxy_url = Some(parse_non_empty(&value, "--proxy-url")?);
-            }
-            "--sysinternals-dir" => {
-                let value = next_value(&mut args, "--sysinternals-dir")?;
-                sysinternals_dir = Some(parse_existing_dir(&value, "--sysinternals-dir")?);
-            }
-            "--no-proxy" => no_proxy = true,
-            "--help" | "-h" => return Err(help_text().to_string()),
-            other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
-        }
-    }
-
-    let data_dir =
-        data_dir.ok_or_else(|| format!("missing required --data-dir <path>\n\n{}", help_text()))?;
-    let proxy = resolve_proxy(proxy_url, no_proxy, env)?;
+    let config_path = parse_required_config_path(args, help_text())?;
+    let config = RuntimeConfig::load(config_path)?;
     Ok(ServiceProcessConfig {
-        service_name,
-        app: AppConfig {
-            bind,
-            data_dir,
-            proxy,
-            sysinternals_dir,
-        },
+        service_name: config.service.name,
+        app: config.app,
     })
 }
 
@@ -320,157 +210,31 @@ pub fn service_process_options_from_command_line<I>(args: I) -> Result<ServicePr
 where
     I: IntoIterator<Item = OsString>,
 {
-    let env = std::env::vars().collect::<HashMap<_, _>>();
-    service_process_options_from_command_line_with_env(args, &env)
-}
-
-fn service_process_options_from_command_line_with_env<I>(
-    args: I,
-    env: &HashMap<String, String>,
-) -> Result<ServiceProcessConfig, String>
-where
-    I: IntoIterator<Item = OsString>,
-{
     let mut args = args.into_iter();
     let _exe = args
         .next()
         .ok_or_else(|| "missing executable path".to_string())?;
-    let command = next_command(&mut args, "service")?;
+    let command = next_command(&mut args, "top-level")?;
     if command != "service" {
-        return Err(format!("expected service command, got {command}"));
+        return Err(format!("expected service command, got: {command}"));
     }
-    let service_command = next_command(&mut args, "service run")?;
-    if service_command != "run" {
-        return Err(format!(
-            "expected service run command, got service {service_command}"
-        ));
+    let subcommand = next_command(&mut args, "service")?;
+    if subcommand != "run" {
+        return Err(format!("expected service run, got service {subcommand}"));
     }
-    parse_service_process_options_with_env(args, env)
+    parse_service_process_options(args)
 }
 
 pub fn parse_service_install_options<I>(args: I) -> Result<ServiceInstallConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let env = std::env::vars().collect::<HashMap<_, _>>();
-    parse_service_install_options_with_env(args, &env)
-}
-
-fn parse_service_install_options_with_env<I>(
-    args: I,
-    env: &HashMap<String, String>,
-) -> Result<ServiceInstallConfig, String>
-where
-    I: IntoIterator<Item = OsString>,
-{
-    let mut service_name = SERVICE_NAME.to_string();
-    let mut display_name = SERVICE_DISPLAY_NAME.to_string();
-    let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
-    let mut install_root = None;
-    let mut proxy_url = None;
-    let mut no_proxy = false;
-    let mut proxy_env = HashMap::new();
-    let mut dbgeng_dir = None;
-    let mut sysinternals_dir = None;
-    let mut interactive = true;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        let arg = arg
-            .into_string()
-            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
-
-        if let Some(value) = arg.strip_prefix("--service-name=") {
-            service_name = parse_service_name(value)?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--display-name=") {
-            display_name = parse_non_empty(value, "--display-name")?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--bind=") {
-            bind = parse_bind(value)?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--install-root=") {
-            install_root = Some(PathBuf::from(value));
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--proxy-url=") {
-            proxy_url = Some(parse_non_empty(value, "--proxy-url")?);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--proxy-env=") {
-            let (key, value) = parse_proxy_env_pair(value)?;
-            proxy_env.insert(key, value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--dbgeng-dir=") {
-            dbgeng_dir = Some(parse_dbgeng_dir(value, "--dbgeng-dir")?);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--sysinternals-dir=") {
-            sysinternals_dir = Some(parse_existing_dir(value, "--sysinternals-dir")?);
-            continue;
-        }
-        match arg.as_str() {
-            "--service-name" => {
-                let value = next_value(&mut args, "--service-name")?;
-                service_name = parse_service_name(&value)?;
-            }
-            "--display-name" => {
-                let value = next_value(&mut args, "--display-name")?;
-                display_name = parse_non_empty(&value, "--display-name")?;
-            }
-            "--bind" => {
-                let value = next_value(&mut args, "--bind")?;
-                bind = parse_bind(&value)?;
-            }
-            "--install-root" => {
-                let value = next_value(&mut args, "--install-root")?;
-                install_root = Some(PathBuf::from(value));
-            }
-            "--proxy-url" => {
-                let value = next_value(&mut args, "--proxy-url")?;
-                proxy_url = Some(parse_non_empty(&value, "--proxy-url")?);
-            }
-            "--proxy-env" => {
-                let value = next_value(&mut args, "--proxy-env")?;
-                let (key, value) = parse_proxy_env_pair(&value)?;
-                proxy_env.insert(key, value);
-            }
-            "--dbgeng-dir" => {
-                let value = next_value(&mut args, "--dbgeng-dir")?;
-                dbgeng_dir = Some(parse_dbgeng_dir(&value, "--dbgeng-dir")?);
-            }
-            "--sysinternals-dir" => {
-                let value = next_value(&mut args, "--sysinternals-dir")?;
-                sysinternals_dir = Some(parse_existing_dir(&value, "--sysinternals-dir")?);
-            }
-            "--no-proxy" => no_proxy = true,
-            "--non-interactive" | "--yes" => interactive = false,
-            "--help" | "-h" => return Err(service_install_help_text().to_string()),
-            other => {
-                return Err(format!(
-                    "unknown option: {other}\n\n{}",
-                    service_install_help_text()
-                ))
-            }
-        }
-    }
-
+    let config_path = parse_required_config_path(args, service_install_help_text())?;
+    let config = RuntimeConfig::load(config_path)?;
     Ok(ServiceInstallConfig {
-        service_name,
-        display_name,
-        bind,
-        install_root: match install_root {
-            Some(path) => path,
-            None => default_install_root()?,
-        },
-        proxy: resolve_service_install_proxy(proxy_url, no_proxy, proxy_env, env)?,
-        dbgeng_dir,
-        sysinternals_dir,
-        interactive,
+        config_path: config.config_path,
+        service: config.service,
+        app: config.app,
     })
 }
 
@@ -478,9 +242,8 @@ pub fn parse_service_uninstall_options<I>(args: I) -> Result<ServiceUninstallCon
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut service_name = SERVICE_NAME.to_string();
-    let mut install_root = None;
-    let mut remove_install_files = false;
+    let mut service_name = None;
+    let mut config_path = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -489,24 +252,29 @@ where
             .map_err(|_| "arguments must be valid UTF-8".to_string())?;
 
         if let Some(value) = arg.strip_prefix("--service-name=") {
-            service_name = parse_service_name(value)?;
+            service_name = Some(parse_service_name(value)?);
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--install-root=") {
-            install_root = Some(PathBuf::from(value));
+        if let Some(value) = arg.strip_prefix("--config=") {
+            config_path = Some(normalize_absolute_existing_file(
+                Path::new(value),
+                "--config",
+            )?);
             continue;
         }
 
         match arg.as_str() {
             "--service-name" => {
                 let value = next_value(&mut args, "--service-name")?;
-                service_name = parse_service_name(&value)?;
+                service_name = Some(parse_service_name(&value)?);
             }
-            "--install-root" => {
-                let value = next_value(&mut args, "--install-root")?;
-                install_root = Some(PathBuf::from(value));
+            "--config" => {
+                let value = next_value(&mut args, "--config")?;
+                config_path = Some(normalize_absolute_existing_file(
+                    Path::new(&value),
+                    "--config",
+                )?);
             }
-            "--remove-install-files" => remove_install_files = true,
             "--help" | "-h" => return Err(service_uninstall_help_text().to_string()),
             other => {
                 return Err(format!(
@@ -517,38 +285,192 @@ where
         }
     }
 
+    let service_name = match (service_name, config_path.as_ref()) {
+        (Some(service_name), Some(config_path)) => {
+            let config = RuntimeConfig::load(config_path)?;
+            if config.service.name != service_name {
+                return Err(format!(
+                    "--service-name '{}' does not match config service.name '{}'",
+                    service_name, config.service.name
+                ));
+            }
+            service_name
+        }
+        (Some(service_name), None) => service_name,
+        (None, Some(config_path)) => RuntimeConfig::load(config_path)?.service.name,
+        (None, None) => SERVICE_NAME.to_string(),
+    };
+
     Ok(ServiceUninstallConfig {
         service_name,
-        install_root: match install_root {
-            Some(path) => path,
-            None => default_install_root()?,
-        },
-        remove_install_files,
+        config_path,
     })
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]        Run local HTTP MCP transport\n  dbgflow-mcp service run --data-dir <path> [options] Run as a Windows service process\n  dbgflow-mcp service install [options]               Install and start the Windows service\n  dbgflow-mcp service uninstall [options]             Stop and uninstall the Windows service\n  dbgflow-mcp worker session                          Run an internal session worker process\n\nRuntime options:\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --data-dir <path>                                   Required. Uses <path>\\artifacts and <path>\\logs\n  --service-name <name>                               Service process name. Default: dbgflow-mcp\n  --proxy-url <url>                                   Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars for all session workers\n  --no-proxy                                         Clears known proxy vars for all session workers\n  --sysinternals-dir <path>                           Optional Sysinternals directory for Procmon-based features\n  Default proxy behavior inherits non-empty known proxy environment variables when no proxy option is passed"
+    "Usage:\n  dbgflow-mcp http --config <path>                Run local HTTP MCP transport\n  dbgflow-mcp service run --config <path>         Run as a Windows service process\n  dbgflow-mcp service install --config <path>     Install and start the Windows service\n  dbgflow-mcp service uninstall [options]         Stop, uninstall, and remove install root\n  dbgflow-mcp worker session                      Run an internal session worker process"
 }
 
 pub fn service_install_help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --proxy-url <url>                                   Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars for the service\n  --no-proxy                                         Clears known proxy vars for the service\n  --dbgeng-dir <path>                                 Directory containing dbgeng.dll\n  --sysinternals-dir <path>                           Optional Sysinternals directory for Procmon-based features\n  --non-interactive, --yes                            Use provided/default values without prompting"
+    "Usage:\n  dbgflow-mcp service install --config <path>\n\nOptions:\n  --config <path>                                  Required TOML config file"
 }
 
 pub fn service_uninstall_help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp service uninstall [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --remove-install-files                              Remove <install-root>\\bin; artifacts and logs stay under <install-root>\\var"
+    "Usage:\n  dbgflow-mcp service uninstall [options]\n\nOptions:\n  --service-name <name>                            Default: dbgflow-mcp\n  --config <path>                                  Fallback config path when the service is missing or has an unparsable command"
 }
 
-pub fn remove_install_files_target(install_root: PathBuf) -> Result<PathBuf, String> {
-    let root = normalize_absolute_path(&install_root)?;
-    let bin_dir = normalize_absolute_path(&install_root.join("bin"))?;
-    if !path_starts_with(&bin_dir, &root) {
+pub fn apply_runtime_environment(config: &AppConfig) {
+    if let Some(dbgeng_dir) = &config.dbgeng_dir {
+        std::env::set_var(DBGFLOW_DBGENG_DIR_ENV, dbgeng_dir);
+    } else {
+        std::env::remove_var(DBGFLOW_DBGENG_DIR_ENV);
+    }
+}
+
+pub fn parse_installed_service_command(
+    command_line: &str,
+) -> Result<InstalledServiceCommand, String> {
+    let args = split_windows_command_line(command_line)?;
+    if args.len() < 4 {
+        return Err("service command line is too short".to_string());
+    }
+    if args.get(1).map(String::as_str) != Some("service")
+        || args.get(2).map(String::as_str) != Some("run")
+    {
+        return Err("service command line is not 'service run --config <path>'".to_string());
+    }
+
+    let mut config_path = None;
+    let mut index = 3;
+    while index < args.len() {
+        if args[index] == "--config" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "service command line has --config without a value".to_string())?;
+            config_path = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        if let Some(value) = args[index].strip_prefix("--config=") {
+            config_path = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        index += 1;
+    }
+
+    let config_path = config_path
+        .ok_or_else(|| "service command line does not include --config <path>".to_string())?;
+    Ok(InstalledServiceCommand {
+        executable_path: PathBuf::from(&args[0]),
+        config_path,
+    })
+}
+
+pub fn validate_install_root_removal(
+    config: &RuntimeConfig,
+    installed_exe: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let install_root =
+        normalize_absolute_required(&config.service.install_root, "service.install_root")?;
+    reject_dangerous_install_root(&install_root)?;
+
+    if !path_starts_with_case_insensitive(&config.config_path, &install_root) {
         return Err(format!(
-            "refusing to remove path outside install root: {}",
-            bin_dir.display()
+            "refusing to remove install root because config is outside it: {}",
+            config.config_path.display()
         ));
     }
-    Ok(bin_dir)
+    if !path_starts_with_case_insensitive(&config.app.data_dir, &install_root) {
+        return Err(format!(
+            "refusing to remove install root because data_dir is outside it: {}",
+            config.app.data_dir.display()
+        ));
+    }
+    if let Some(installed_exe) = installed_exe {
+        let installed_exe =
+            normalize_absolute_required(installed_exe, "installed service executable")?;
+        if !path_starts_with_case_insensitive(&installed_exe, &install_root) {
+            return Err(format!(
+                "refusing to remove install root because service executable is outside it: {}",
+                installed_exe.display()
+            ));
+        }
+    }
+
+    Ok(install_root)
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRuntimeConfig {
+    version: u32,
+    service: RawServiceConfig,
+    server: RawServerConfig,
+    debugger: Option<RawDebuggerConfig>,
+    tools: Option<RawToolsConfig>,
+    proxy: Option<RawProxyConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawServiceConfig {
+    name: String,
+    display_name: String,
+    install_root: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawServerConfig {
+    bind: String,
+    data_dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDebuggerConfig {
+    dbgeng_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawToolsConfig {
+    sysinternals_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProxyConfig {
+    mode: String,
+    url: Option<String>,
+    env: Option<HashMap<String, String>>,
+}
+
+fn parse_required_config_path<I>(args: I, help: &str) -> Result<PathBuf, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut config_path = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let arg = arg
+            .into_string()
+            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
+        if let Some(value) = arg.strip_prefix("--config=") {
+            config_path = Some(normalize_absolute_existing_file(
+                Path::new(value),
+                "--config",
+            )?);
+            continue;
+        }
+        match arg.as_str() {
+            "--config" => {
+                let value = next_value(&mut args, "--config")?;
+                config_path = Some(normalize_absolute_existing_file(
+                    Path::new(&value),
+                    "--config",
+                )?);
+            }
+            "--help" | "-h" => return Err(help.to_string()),
+            other => return Err(format!("unknown option: {other}\n\n{help}")),
+        }
+    }
+    config_path.ok_or_else(|| format!("missing required --config <path>\n\n{help}"))
 }
 
 fn next_value<I>(args: &mut I, option: &str) -> Result<String, String>
@@ -571,167 +493,142 @@ where
         .map_err(|_| format!("{label} command must be valid UTF-8"))
 }
 
-fn parse_non_empty(value: &str, option: &str) -> Result<String, String> {
-    if value.trim().is_empty() {
-        return Err(format!("{option} must not be empty"));
-    }
+fn parse_service_name(value: &str) -> Result<String, String> {
+    validate_service_name(value)?;
     Ok(value.to_string())
 }
 
-fn parse_existing_dir(value: &str, option: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(parse_non_empty(value, option)?);
-    if !path.is_dir() {
-        return Err(format!(
-            "{option} must point to an existing directory: {}",
-            path.display()
-        ));
+fn validate_service_name(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("service name must not be empty".to_string());
     }
-    Ok(path)
-}
-
-fn parse_dbgeng_dir(value: &str, option: &str) -> Result<PathBuf, String> {
-    let path = parse_existing_dir(value, option)?;
-    if !path.join("dbgeng.dll").is_file() {
-        return Err(format!(
-            "{option} must point to a directory containing dbgeng.dll: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
-fn parse_proxy_env_pair(value: &str) -> Result<(String, String), String> {
-    let (key, value) = value
-        .split_once('=')
-        .ok_or_else(|| "--proxy-env must use KEY=VALUE".to_string())?;
-    if !is_known_proxy_key(key) {
-        return Err(format!("--proxy-env key is not supported: {key}"));
-    }
-    Ok((key.to_string(), value.to_string()))
-}
-
-pub fn dbgeng_dir_from_dependency_root(path: &Path) -> Option<PathBuf> {
-    if path.join("dbgeng.dll").is_file() {
-        return Some(path.to_path_buf());
-    }
-    let arch = debugger_arch();
-    let direct = path.join("Debuggers").join(arch);
-    if direct.join("dbgeng.dll").is_file() {
-        return Some(direct);
-    }
-    for prefix in [path.join("Windows Kits").join("10"), path.to_path_buf()] {
-        let candidate = prefix.join("Debuggers").join(arch);
-        if candidate.join("dbgeng.dll").is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-pub fn debugger_arch() -> &'static str {
-    if cfg!(target_arch = "x86") {
-        "x86"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "x64"
-    }
-}
-
-fn parse_service_name(value: &str) -> Result<String, String> {
-    let service_name = parse_non_empty(value, "--service-name")?;
-    if service_name
+    if value
         .chars()
         .any(|ch| matches!(ch, '/' | '\\' | '*' | '?' | '[' | ']') || ch.is_control())
     {
         return Err(
-            "--service-name must not contain path separators, wildcards, or control characters"
+            "service name must not contain path separators, wildcards, or control characters"
                 .to_string(),
         );
     }
-    Ok(service_name)
+    Ok(())
 }
 
 fn parse_bind(value: &str) -> Result<SocketAddr, String> {
-    let bind: SocketAddr = value
-        .parse()
+    let bind = value
+        .parse::<SocketAddr>()
         .map_err(|error| format!("invalid bind address {value}: {error}"))?;
     if !bind.ip().is_loopback() {
-        return Err(format!(
-            "bind address must be loopback; dbgflow does not support remote HTTP access: {value}"
-        ));
+        return Err("bind address must be loopback".to_string());
     }
     Ok(bind)
 }
 
-fn resolve_proxy(
-    proxy_url: Option<String>,
-    no_proxy: bool,
-    env: &HashMap<String, String>,
-) -> Result<ProxyEnvironment, String> {
-    if no_proxy && proxy_url.is_some() {
-        return Err("--proxy-url and --no-proxy cannot be used together".to_string());
+fn parse_dbgeng_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = parse_existing_dir_path(path, label)?;
+    if !path.join("dbgeng.dll").is_file() {
+        return Err(format!(
+            "{label} must point to a directory containing dbgeng.dll: {}",
+            path.display()
+        ));
     }
-    if no_proxy {
-        return Ok(ProxyEnvironment::disabled());
-    }
-    if let Some(proxy_url) = proxy_url {
-        return ProxyEnvironment::from_cli_proxy_url(&proxy_url).map_err(|error| error.to_string());
-    }
-    let env = proxy_environment_map_without_empty_known_keys(env);
-    ProxyEnvironment::from_environment_map(&env).map_err(|error| error.to_string())
+    Ok(path)
 }
 
-fn resolve_service_install_proxy(
-    proxy_url: Option<String>,
-    no_proxy: bool,
-    proxy_env: HashMap<String, String>,
-    env: &HashMap<String, String>,
-) -> Result<ProxyEnvironment, String> {
-    if !proxy_env.is_empty() {
-        if no_proxy || proxy_url.is_some() {
-            return Err("--proxy-env cannot be used with --proxy-url or --no-proxy".to_string());
+fn parse_sysinternals_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = parse_existing_dir_path(path, label)?;
+    if !is_sysinternals_dir(&path) {
+        return Err(format!(
+            "{label} must point to a directory containing Procmon64.exe or Procmon.exe: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn parse_existing_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = normalize_absolute_required(path, label)?;
+    if !path.is_dir() {
+        return Err(format!(
+            "{label} must point to an existing directory: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn is_sysinternals_dir(path: &Path) -> bool {
+    path.join("Procmon64.exe").is_file() || path.join("Procmon.exe").is_file()
+}
+
+fn proxy_from_config(config: Option<RawProxyConfig>) -> Result<ProxyEnvironment, String> {
+    let Some(config) = config else {
+        return Ok(ProxyEnvironment::none());
+    };
+    match config.mode.as_str() {
+        "none" => Ok(ProxyEnvironment::none()),
+        "disabled" => Ok(ProxyEnvironment::disabled()),
+        "url" => {
+            let url = config
+                .url
+                .ok_or_else(|| "proxy.url is required when proxy.mode = \"url\"".to_string())?;
+            ProxyEnvironment::from_cli_proxy_url(&url).map_err(|error| error.to_string())
         }
-        return ProxyEnvironment::from_environment_map(&proxy_env)
-            .map_err(|error| error.to_string());
+        "env" => {
+            let env = config.env.unwrap_or_default();
+            for (key, value) in &env {
+                if !is_known_proxy_key(key) {
+                    return Err(format!("proxy.env key is not supported: {key}"));
+                }
+                if value.is_empty() {
+                    return Err(format!("proxy.env value must not be empty for key: {key}"));
+                }
+            }
+            ProxyEnvironment::from_environment_map(&env).map_err(|error| error.to_string())
+        }
+        other => Err(format!(
+            "proxy.mode must be one of none, disabled, url, env; got {other}"
+        )),
     }
-    resolve_proxy(proxy_url, no_proxy, env)
-}
-
-fn proxy_environment_map_without_empty_known_keys(
-    env: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    env.iter()
-        .filter(|(key, value)| !(value.is_empty() && is_known_proxy_key(key)))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
 }
 
 fn is_known_proxy_key(key: &str) -> bool {
     KNOWN_PROXY_KEYS.contains(&key)
 }
 
-fn default_install_root() -> Result<PathBuf, String> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .ok_or_else(|| "LOCALAPPDATA is not set; pass --install-root <path>".to_string())?;
-    Ok(PathBuf::from(local_app_data).join("dbgflow"))
+fn normalize_absolute_existing_file(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = normalize_absolute_required(path, label)?;
+    if !path.is_file() {
+        return Err(format!(
+            "{label} must point to an existing file: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
-fn normalize_absolute_path(path: &std::path::Path) -> Result<PathBuf, String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| format!("resolve current directory: {error}"))?
-            .join(path)
-    };
+fn normalize_absolute_required(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "{label} must be an absolute path: {}",
+            path.display()
+        ));
+    }
+    normalize_path_lexically(path)
+}
 
+fn normalize_path_lexically(path: &Path) -> Result<PathBuf, String> {
     let mut normalized = PathBuf::new();
-    for component in absolute.components() {
+    for component in path.components() {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                normalized.pop();
+                if !normalized.pop() {
+                    return Err(format!("path escapes its root: {}", path.display()));
+                }
             }
             other => normalized.push(other.as_os_str()),
         }
@@ -739,7 +636,67 @@ fn normalize_absolute_path(path: &std::path::Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-fn path_starts_with(path: &std::path::Path, base: &std::path::Path) -> bool {
+fn reject_dangerous_install_root(path: &Path) -> Result<(), String> {
+    if path.components().count() <= 2 {
+        return Err(format!(
+            "service.install_root must not be a filesystem root: {}",
+            path.display()
+        ));
+    }
+    if path
+        .file_name()
+        .is_none_or(|name| !name.eq_ignore_ascii_case("dbgflow"))
+    {
+        return Err(format!(
+            "service.install_root must be a dedicated 'dbgflow' directory: {}",
+            path.display()
+        ));
+    }
+    for (key, label) in [
+        ("USERPROFILE", "the user profile root"),
+        ("LOCALAPPDATA", "LOCALAPPDATA"),
+        ("APPDATA", "APPDATA"),
+        ("ProgramData", "ProgramData"),
+        ("ProgramFiles", "ProgramFiles"),
+        ("ProgramFiles(x86)", "ProgramFiles(x86)"),
+    ] {
+        if let Some(root) = std::env::var_os(key).map(PathBuf::from) {
+            let root = normalize_path_lexically(&root)?;
+            if path_eq_case_insensitive(path, &root) {
+                return Err(format!(
+                    "service.install_root must not be {label}: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    for high_level in [Path::new(r"C:\Users"), Path::new(r"C:\ProgramData")] {
+        if path_eq_case_insensitive(path, high_level) {
+            return Err(format!(
+                "service.install_root must not be a high-level system directory: {}",
+                path.display()
+            ));
+        }
+    }
+    if let Some(user_profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        let user_profile = normalize_path_lexically(&user_profile)?;
+        let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        if path_starts_with_case_insensitive(path, &user_profile)
+            && local_app_data
+                .as_ref()
+                .is_none_or(|root| !path_starts_with_case_insensitive(path, root))
+            && path.components().count() < user_profile.components().count() + 2
+        {
+            return Err(format!(
+                "service.install_root must be a dedicated child directory under the user profile: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn path_starts_with_case_insensitive(path: &Path, base: &Path) -> bool {
     if path.starts_with(base) {
         return true;
     }
@@ -752,581 +709,388 @@ fn path_starts_with(path: &std::path::Path, base: &std::path::Path) -> bool {
             .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
 }
 
+fn path_eq_case_insensitive(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+fn split_windows_command_line(value: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut arg = String::new();
+    let mut in_quotes = false;
+    let mut in_arg = false;
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut index = 0;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() && !in_quotes {
+            if in_arg {
+                args.push(std::mem::take(&mut arg));
+                in_arg = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '\\' {
+            let mut count = 0usize;
+            while index < chars.len() && chars[index] == '\\' {
+                count += 1;
+                index += 1;
+            }
+            if index < chars.len() && chars[index] == '"' {
+                arg.push_str(&"\\".repeat(count / 2));
+                if count % 2 == 0 {
+                    in_quotes = !in_quotes;
+                } else {
+                    arg.push('"');
+                }
+                in_arg = true;
+                index += 1;
+            } else {
+                arg.push_str(&"\\".repeat(count));
+                in_arg = true;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            in_arg = true;
+            index += 1;
+            continue;
+        }
+
+        arg.push(ch);
+        in_arg = true;
+        index += 1;
+    }
+
+    if in_quotes {
+        return Err("service command line has an unterminated quote".to_string());
+    }
+    if in_arg {
+        args.push(arg);
+    }
+    Ok(args)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        dbgeng_dir_from_dependency_root, parse_options_with_env, parse_service_install_options,
-        parse_service_install_options_with_env, parse_service_process_options_with_env,
-        parse_service_uninstall_options, remove_install_files_target,
-        service_process_options_from_command_line_with_env, DEFAULT_BIND, SERVICE_NAME,
-    };
-    use std::collections::HashMap;
-    use std::ffi::OsString;
-    use std::path::PathBuf;
+    use super::*;
+    use dbgflow_core::proxy::ProxySource;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn env(entries: &[(&str, &str)]) -> HashMap<String, String> {
-        entries
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
-    }
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn parses_runtime_options() {
-        let config = parse_options_with_env(
-            [
-                OsString::from("--bind"),
-                OsString::from("127.0.0.1:9000"),
-                OsString::from("--data-dir=C:\\dbgflow\\var"),
-            ],
-            &env(&[("HTTP_PROXY", "")]),
-        )
-        .expect("parse options");
+    fn parses_runtime_config() {
+        let root = unique_test_dir("runtime-config");
+        let dbgeng = root.join("dbgeng");
+        let sysinternals = root.join("sysinternals");
+        std::fs::create_dir_all(&dbgeng).expect("create dbgeng dir");
+        std::fs::create_dir_all(&sysinternals).expect("create sysinternals dir");
+        touch(dbgeng.join("dbgeng.dll"));
+        touch(sysinternals.join("Procmon64.exe"));
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
 
-        assert_eq!(config.bind.to_string(), "127.0.0.1:9000");
-        assert_eq!(config.data_dir, PathBuf::from("C:\\dbgflow\\var"));
-    }
+[service]
+name = "dbgflow-dev"
+display_name = "dbgflow Dev"
+install_root = "{}"
 
-    #[test]
-    fn parses_sysinternals_dir_for_http_runtime() {
-        let root =
-            std::env::temp_dir().join(format!("dbgflow-sysinternals-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create sysinternals dir");
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
 
-        let config = parse_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from(".\\var"),
-                OsString::from("--sysinternals-dir"),
-                root.as_os_str().to_os_string(),
-            ],
-            &env(&[]),
-        )
-        .expect("parse options");
+[debugger]
+dbgeng_dir = "{}"
 
-        assert_eq!(config.sysinternals_dir.as_deref(), Some(root.as_path()));
-    }
+[tools]
+sysinternals_dir = "{}"
 
-    #[test]
-    fn uses_default_bind_with_required_data_dir() {
-        let config = parse_options_with_env(
-            [OsString::from("--data-dir"), OsString::from(".\\var")],
-            &env(&[("HTTP_PROXY", "")]),
-        )
-        .expect("parse options");
-        assert_eq!(config.bind.to_string(), DEFAULT_BIND);
-        assert_eq!(config.data_dir, PathBuf::from(".\\var"));
-    }
+[proxy]
+mode = "url"
+url = "http://127.0.0.1:7897"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+                toml_path(&dbgeng),
+                toml_path(&sysinternals),
+            ),
+        );
 
-    #[test]
-    fn parses_http_proxy_url_option() {
-        let config = parse_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from(".\\var"),
-                OsString::from("--proxy-url"),
-                OsString::from("http://127.0.0.1:7897"),
-            ],
-            &env(&[]),
-        )
-        .expect("parse options");
-
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+        assert_eq!(config.service.name, "dbgflow-dev");
+        assert_eq!(config.service.display_name, "dbgflow Dev");
+        assert_eq!(config.app.bind.to_string(), "127.0.0.1:7331");
+        assert_eq!(config.app.proxy.source(), ProxySource::Cli);
         assert_eq!(
-            config.app_proxy().value_for("_NT_SYMBOL_PROXY").as_deref(),
+            config.app.proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
             Some("127.0.0.1:7897")
         );
-        assert_eq!(
-            config.app_proxy().value_for("HTTP_PROXY").as_deref(),
-            Some("http://127.0.0.1:7897")
-        );
     }
 
     #[test]
-    fn parses_no_proxy_option() {
-        let config = parse_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from(".\\var"),
-                OsString::from("--no-proxy"),
-            ],
-            &env(&[]),
-        )
-        .expect("parse options");
+    fn rejects_config_outside_install_root() {
+        let root = unique_test_dir("runtime-config-outside");
+        let config_dir = unique_test_dir("runtime-config-outside-file");
+        let config_path = config_dir.join("config.toml");
+        write_minimal_config(&config_path, &root, &root.join("var"));
 
-        assert_eq!(
-            config.app_proxy().source(),
-            dbgflow_core::proxy::ProxySource::Disabled
-        );
+        let error = RuntimeConfig::load(&config_path).expect_err("reject outside config");
+        assert!(error.contains("config path must be under service.install_root"));
     }
 
     #[test]
-    fn rejects_conflicting_proxy_options() {
-        let error = parse_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from(".\\var"),
-                OsString::from("--proxy-url"),
-                OsString::from("http://127.0.0.1:7897"),
-                OsString::from("--no-proxy"),
-            ],
-            &env(&[]),
-        )
-        .expect_err("reject conflicting proxy options");
+    fn rejects_install_root_that_is_not_dedicated_dbgflow_dir() {
+        let base = unique_test_base_dir("runtime-config-dangerous-root");
+        let install_root = base.join("not-dbgflow");
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        let config_path = install_root.join("config.toml");
+        write_minimal_config(&config_path, &install_root, &install_root.join("var"));
 
-        assert!(error.contains("cannot be used together"));
-    }
-
-    #[test]
-    fn rejects_conflicting_proxy_options_in_either_order() {
-        let no_proxy_first = parse_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from(".\\var"),
-                OsString::from("--no-proxy"),
-                OsString::from("--proxy-url=http://127.0.0.1:7897"),
-            ],
-            &env(&[]),
-        )
-        .expect_err("reject conflicting proxy options");
-        let proxy_url_first = parse_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from(".\\var"),
-                OsString::from("--proxy-url=http://127.0.0.1:7897"),
-                OsString::from("--no-proxy"),
-            ],
-            &env(&[]),
-        )
-        .expect_err("reject conflicting proxy options");
-
-        assert!(no_proxy_first.contains("cannot be used together"));
-        assert!(proxy_url_first.contains("cannot be used together"));
-    }
-
-    #[test]
-    fn inherits_proxy_from_non_empty_environment() {
-        let config = parse_options_with_env(
-            [OsString::from("--data-dir"), OsString::from(".\\var")],
-            &env(&[
-                ("_NT_SYMBOL_PROXY", "symproxy:80"),
-                ("HTTP_PROXY", "http://proxy:8080"),
-            ]),
-        )
-        .expect("parse options");
-
-        assert_eq!(
-            config.app_proxy().source(),
-            dbgflow_core::proxy::ProxySource::Environment
-        );
-        assert_eq!(
-            config.app_proxy().value_for("_NT_SYMBOL_PROXY").as_deref(),
-            Some("symproxy:80")
-        );
-        assert_eq!(
-            config.app_proxy().value_for("HTTP_PROXY").as_deref(),
-            Some("http://proxy:8080")
-        );
-    }
-
-    #[test]
-    fn no_proxy_wins_over_environment_proxy_entries() {
-        let config = parse_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from(".\\var"),
-                OsString::from("--no-proxy"),
-            ],
-            &env(&[
-                ("_NT_SYMBOL_PROXY", "symproxy:80"),
-                ("HTTP_PROXY", "http://proxy:8080"),
-            ]),
-        )
-        .expect("parse options");
-
-        assert_eq!(
-            config.app_proxy().source(),
-            dbgflow_core::proxy::ProxySource::Disabled
-        );
-    }
-
-    #[test]
-    fn rejects_missing_data_dir() {
-        let error = parse_options_with_env([], &env(&[])).expect_err("reject missing data dir");
-        assert!(error.contains("--data-dir"));
+        let error = RuntimeConfig::load(&config_path).expect_err("reject dangerous root");
+        assert!(error.contains("dedicated 'dbgflow' directory"));
     }
 
     #[test]
     fn rejects_non_loopback_bind() {
-        let error = parse_options_with_env(
-            [OsString::from("--bind"), OsString::from("0.0.0.0:7331")],
-            &env(&[]),
-        )
-        .expect_err("reject non-loopback bind");
+        let root = unique_test_dir("runtime-config-bind");
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
 
-        assert!(error.contains("loopback"));
-    }
+[service]
+name = "dbgflow-dev"
+display_name = "dbgflow Dev"
+install_root = "{}"
 
-    #[test]
-    fn rejects_removed_directory_options() {
-        let artifact_error = parse_options_with_env(
-            [OsString::from("--artifact-root=C:\\dbgflow\\artifacts")],
-            &env(&[]),
-        )
-        .expect_err("reject artifact-root");
-        assert!(artifact_error.contains("unknown option"));
-
-        let log_error = parse_options_with_env(
-            [OsString::from("--log-dir"), OsString::from("C:\\logs")],
-            &env(&[]),
-        )
-        .expect_err("reject log-dir");
-        assert!(log_error.contains("unknown option"));
-    }
-
-    #[test]
-    fn parses_service_process_options_with_service_name() {
-        let config = parse_service_process_options_with_env(
-            [
-                OsString::from("--service-name"),
-                OsString::from("dbgflow-dev"),
-                OsString::from("--bind"),
-                OsString::from("127.0.0.1:9001"),
-                OsString::from("--data-dir"),
-                OsString::from("C:\\dbgflow\\var"),
-            ],
-            &env(&[("HTTP_PROXY", "")]),
-        )
-        .expect("parse service process options");
-
-        assert_eq!(config.service_name, "dbgflow-dev");
-        assert_eq!(config.app.bind.to_string(), "127.0.0.1:9001");
-        assert_eq!(config.app.data_dir, PathBuf::from("C:\\dbgflow\\var"));
-    }
-
-    #[test]
-    fn parses_service_process_proxy_url_option() {
-        let config = parse_service_process_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from("C:\\dbgflow\\var"),
-                OsString::from("--proxy-url=http://127.0.0.1:7897"),
-            ],
-            &env(&[]),
-        )
-        .expect("parse service process options");
-
-        assert_eq!(
-            config
-                .app
-                .app_proxy()
-                .value_for("_NT_SYMBOL_PROXY")
-                .as_deref(),
-            Some("127.0.0.1:7897")
+[server]
+bind = "0.0.0.0:7331"
+data_dir = "{}"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+            ),
         );
+
+        let error = RuntimeConfig::load(&config_path).expect_err("reject non-loopback");
+        assert!(error.contains("bind address must be loopback"));
     }
 
     #[test]
-    fn parses_service_run_process_options_from_full_command_line() {
-        let config = service_process_options_from_command_line_with_env(
-            [
-                OsString::from("dbgflow-mcp.exe"),
-                OsString::from("service"),
-                OsString::from("run"),
-                OsString::from("--service-name"),
-                OsString::from("dbgflow-dev"),
-                OsString::from("--bind"),
-                OsString::from("127.0.0.1:9001"),
-                OsString::from("--data-dir"),
-                OsString::from("C:\\dbgflow\\var"),
-            ],
-            &env(&[("HTTP_PROXY", "")]),
-        )
-        .expect("parse service run command line");
+    fn parses_http_options_from_config() {
+        let root = unique_test_dir("runtime-http");
+        let config_path = root.join("config.toml");
+        write_minimal_config(&config_path, &root, &root.join("var"));
 
-        assert_eq!(config.service_name, "dbgflow-dev");
-        assert_eq!(config.app.bind.to_string(), "127.0.0.1:9001");
-        assert_eq!(config.app.data_dir, PathBuf::from("C:\\dbgflow\\var"));
-    }
+        let app = parse_options([OsString::from("--config"), config_path.into_os_string()])
+            .expect("parse http options");
 
-    #[test]
-    fn rejects_legacy_service_process_command_line_without_run() {
-        let error = service_process_options_from_command_line_with_env(
-            [
-                OsString::from("dbgflow-mcp.exe"),
-                OsString::from("service"),
-                OsString::from("--data-dir"),
-                OsString::from("C:\\dbgflow\\var"),
-            ],
-            &env(&[]),
-        )
-        .expect_err("reject legacy service process command line");
-
-        assert!(error.contains("expected service run"));
+        assert_eq!(app.bind.to_string(), "127.0.0.1:7331");
+        assert_eq!(app.proxy.source(), ProxySource::None);
     }
 
     #[test]
     fn parses_service_install_options() {
+        let root = unique_test_dir("runtime-install");
+        let config_path = root.join("config.toml");
+        write_minimal_config(&config_path, &root, &root.join("var"));
+
         let config = parse_service_install_options([
-            OsString::from("--service-name"),
-            OsString::from("dbgflow-dev"),
-            OsString::from("--display-name"),
-            OsString::from("dbgflow Dev"),
-            OsString::from("--bind=127.0.0.1:9002"),
-            OsString::from("--install-root"),
-            OsString::from("C:\\dbgflow"),
+            OsString::from("--config"),
+            config_path.as_os_str().to_os_string(),
         ])
         .expect("parse service install options");
 
-        assert_eq!(config.service_name, "dbgflow-dev");
-        assert_eq!(config.display_name, "dbgflow Dev");
-        assert_eq!(config.bind.to_string(), "127.0.0.1:9002");
-        assert_eq!(config.install_root, PathBuf::from("C:\\dbgflow"));
-        assert!(config.interactive);
-        assert!(!config
-            .normalized_command_args()
-            .iter()
-            .any(|arg| arg == "--repo-root"));
-    }
-
-    #[test]
-    fn service_install_launch_arguments_use_service_run_subcommand() {
-        let config = parse_service_install_options([
-            OsString::from("--service-name"),
-            OsString::from("dbgflow-dev"),
-            OsString::from("--install-root=C:\\dbgflow"),
-        ])
-        .expect("parse service install options");
-
+        assert_eq!(
+            config.normalized_command_args(),
+            vec![
+                OsString::from("service"),
+                OsString::from("install"),
+                OsString::from("--config"),
+                config_path.as_os_str().to_os_string(),
+            ]
+        );
         assert_eq!(
             config.service_launch_arguments(),
             vec![
                 OsString::from("service"),
                 OsString::from("run"),
-                OsString::from("--service-name"),
-                OsString::from("dbgflow-dev"),
-                OsString::from("--bind"),
-                OsString::from("127.0.0.1:7331"),
-                OsString::from("--data-dir"),
-                OsString::from("C:\\dbgflow\\var"),
+                OsString::from("--config"),
+                config_path.as_os_str().to_os_string(),
             ]
         );
     }
 
     #[test]
-    fn service_install_launch_arguments_include_sysinternals_dir_when_configured() {
-        let root = std::env::temp_dir().join(format!(
-            "dbgflow-install-sysinternals-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create sysinternals dir");
-
-        let config = parse_service_install_options([
-            OsString::from("--install-root=C:\\dbgflow"),
-            OsString::from("--sysinternals-dir"),
-            root.as_os_str().to_os_string(),
-        ])
-        .expect("parse service install options");
-
-        assert!(config
-            .service_launch_arguments()
-            .windows(2)
-            .any(|pair| pair[0] == "--sysinternals-dir"
-                && pair[1] == root.as_os_str().to_os_string()));
-    }
-
-    #[test]
-    fn service_install_launch_arguments_do_not_include_proxy_url() {
-        let config = parse_service_install_options_with_env(
-            [
-                OsString::from("--service-name"),
-                OsString::from("dbgflow-dev"),
-                OsString::from("--install-root=C:\\dbgflow"),
-            ],
-            &env(&[]),
-        )
-        .expect("parse service install options");
-
-        for arg in config.service_launch_arguments() {
-            let arg = arg.to_string_lossy();
-            assert!(!arg.contains("7897"));
-            assert_ne!(arg, "--proxy-url");
-            assert!(!arg.starts_with("--proxy-url="));
-            assert_ne!(arg, "--no-proxy");
-        }
-    }
-
-    #[test]
-    fn service_install_normalized_arguments_include_proxy_and_non_interactive() {
-        let config = parse_service_install_options_with_env(
-            [
-                OsString::from("--install-root=C:\\dbgflow"),
-                OsString::from("--proxy-url=http://127.0.0.1:7897"),
-            ],
-            &env(&[]),
-        )
-        .expect("parse service install options");
-
-        let args = config.normalized_command_args();
-
-        assert!(args
-            .windows(2)
-            .any(|pair| { pair[0] == "--proxy-url" && pair[1] == "http://127.0.0.1:7897" }));
-        assert!(args.iter().any(|arg| arg == "--non-interactive"));
-    }
-
-    #[test]
-    fn service_install_normalized_arguments_preserve_environment_proxy() {
-        let config = parse_service_install_options_with_env(
-            [OsString::from("--install-root=C:\\dbgflow")],
-            &env(&[
-                ("_NT_SYMBOL_PROXY", "symproxy:80"),
-                ("HTTP_PROXY", "http://proxy:8080"),
-            ]),
-        )
-        .expect("parse service install options");
-
-        let args = config.normalized_command_args();
-        let reparsed = parse_service_install_options_with_env(args.into_iter().skip(2), &env(&[]))
-            .expect("parse normalized service install options");
-
-        assert_eq!(
-            reparsed.proxy.source(),
-            dbgflow_core::proxy::ProxySource::Environment
-        );
-        assert_eq!(
-            reparsed.proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
-            Some("symproxy:80")
-        );
-        assert_eq!(
-            reparsed.proxy.value_for("HTTP_PROXY").as_deref(),
-            Some("http://proxy:8080")
-        );
-        assert!(!reparsed.interactive);
-    }
-
-    #[test]
-    fn resolves_dbgeng_dir_from_windows_kits_root() {
-        let root =
-            std::env::temp_dir().join(format!("dbgflow-install-dbgeng-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let dbgeng_dir = root.join("Debuggers").join(super::debugger_arch());
-        std::fs::create_dir_all(&dbgeng_dir).expect("create dbgeng dir");
-        std::fs::write(dbgeng_dir.join("dbgeng.dll"), b"dll").expect("write dbgeng");
-
-        assert_eq!(dbgeng_dir_from_dependency_root(&root), Some(dbgeng_dir));
-    }
-
-    #[test]
-    fn service_install_rejects_invalid_service_names() {
-        for service_name in [
-            "bad\\name",
-            "bad/name",
-            "bad*name",
-            "bad?name",
-            "bad[name]",
-            "bad\u{81}name",
-        ] {
-            let error = parse_service_install_options([
-                OsString::from("--service-name"),
-                OsString::from(service_name),
-                OsString::from("--install-root=C:\\dbgflow"),
-            ])
-            .expect_err("reject invalid service name");
-
-            assert!(
-                error.contains("--service-name"),
-                "unexpected error for {service_name:?}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn service_process_rejects_invalid_service_name() {
-        let error = parse_service_process_options_with_env(
-            [
-                OsString::from("--service-name"),
-                OsString::from("bad\\name"),
-                OsString::from("--data-dir=C:\\dbgflow\\var"),
-            ],
-            &env(&[]),
-        )
-        .expect_err("reject invalid service name");
-
-        assert!(error.contains("--service-name"));
-    }
-
-    #[test]
-    fn service_uninstall_rejects_invalid_service_name() {
-        let error = parse_service_uninstall_options([
-            OsString::from("--service-name"),
-            OsString::from("bad*name"),
-            OsString::from("--install-root=C:\\dbgflow"),
-        ])
-        .expect_err("reject invalid service name");
-
-        assert!(error.contains("--service-name"));
-    }
-
-    #[test]
-    fn service_install_rejects_removed_repo_root_option() {
-        let error = parse_service_install_options([
-            OsString::from("--install-root=C:\\dbgflow"),
-            OsString::from("--repo-root=D:\\Repos\\Project\\dbgflow"),
-        ])
-        .expect_err("reject repo-root");
-
-        assert!(error.contains("unknown option"));
-    }
-
-    #[test]
-    fn service_install_rejects_non_loopback_bind() {
-        let error = parse_service_install_options([
-            OsString::from("--bind"),
-            OsString::from("0.0.0.0:7331"),
-            OsString::from("--install-root"),
-            OsString::from("C:\\dbgflow"),
-        ])
-        .expect_err("reject non-loopback bind");
-
-        assert!(error.contains("loopback"));
-    }
-
-    #[test]
-    fn parses_service_uninstall_options() {
+    fn parses_service_uninstall_by_name() {
         let config = parse_service_uninstall_options([
             OsString::from("--service-name"),
             OsString::from("dbgflow-dev"),
-            OsString::from("--install-root=C:\\dbgflow"),
-            OsString::from("--remove-install-files"),
         ])
-        .expect("parse service uninstall options");
+        .expect("parse service uninstall");
 
         assert_eq!(config.service_name, "dbgflow-dev");
-        assert_eq!(config.install_root, PathBuf::from("C:\\dbgflow"));
-        assert!(config.remove_install_files);
+        assert!(config.config_path.is_none());
+        assert_eq!(
+            config.normalized_command_args(),
+            vec![
+                OsString::from("service"),
+                OsString::from("uninstall"),
+                OsString::from("--service-name"),
+                OsString::from("dbgflow-dev"),
+            ]
+        );
     }
 
     #[test]
-    fn service_process_uses_default_service_name() {
-        let config = parse_service_process_options_with_env(
-            [
-                OsString::from("--data-dir"),
-                OsString::from("C:\\dbgflow\\var"),
-            ],
-            &env(&[("HTTP_PROXY", "")]),
+    fn parses_service_uninstall_name_from_config() {
+        let root = unique_test_dir("runtime-uninstall-config");
+        let config_path = root.join("config.toml");
+        write_minimal_config(&config_path, &root, &root.join("var"));
+
+        let config = parse_service_uninstall_options([
+            OsString::from("--config"),
+            config_path.as_os_str().to_os_string(),
+        ])
+        .expect("parse service uninstall");
+
+        assert_eq!(config.service_name, "dbgflow-mcp");
+        assert_eq!(config.config_path, Some(config_path));
+    }
+
+    #[test]
+    fn parses_installed_service_command_line() {
+        let parsed = parse_installed_service_command(
+            r#""C:\Users\dstars\AppData\Local\dbgflow\bin\dbgflow-mcp.exe" service run --config "C:\Users\dstars\AppData\Local\dbgflow\config.toml""#,
         )
-        .expect("parse service process options");
+        .expect("parse service command line");
 
-        assert_eq!(config.service_name, SERVICE_NAME);
+        assert_eq!(
+            parsed.executable_path,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\dbgflow\bin\dbgflow-mcp.exe")
+        );
+        assert_eq!(
+            parsed.config_path,
+            PathBuf::from(r"C:\Users\dstars\AppData\Local\dbgflow\config.toml")
+        );
     }
 
     #[test]
-    fn remove_install_files_target_stays_under_install_root() {
-        let target = remove_install_files_target(PathBuf::from("C:\\dbgflow"))
-            .expect("resolve remove target");
+    fn validate_removal_rejects_exe_outside_root() {
+        let root = unique_test_dir("runtime-remove");
+        let config_path = root.join("config.toml");
+        write_minimal_config(&config_path, &root, &root.join("var"));
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+        let outside = unique_test_dir("runtime-remove-outside").join("dbgflow-mcp.exe");
 
-        assert_eq!(target, PathBuf::from("C:\\dbgflow\\bin"));
+        let error =
+            validate_install_root_removal(&config, Some(&outside)).expect_err("reject outside exe");
+
+        assert!(error.contains("service executable is outside"));
+    }
+
+    #[test]
+    fn proxy_env_rejects_unknown_key() {
+        let root = unique_test_dir("runtime-proxy-unknown");
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[proxy]
+mode = "env"
+
+[proxy.env]
+BAD_PROXY = "http://127.0.0.1:7897"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+            ),
+        );
+
+        let error = RuntimeConfig::load(&config_path).expect_err("reject proxy key");
+        assert!(error.contains("proxy.env key is not supported"));
+    }
+
+    fn write_minimal_config(path: &Path, install_root: &Path, data_dir: &Path) {
+        write_config(
+            path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(install_root),
+                toml_path(data_dir),
+            ),
+        );
+    }
+
+    fn write_config(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create config parent");
+        }
+        std::fs::write(path, contents.trim_start()).expect("write config");
+    }
+
+    fn touch(path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(path, b"").expect("touch file");
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let path = unique_test_base_dir(name).join("dbgflow");
+        std::fs::create_dir_all(&path).expect("create unique dir");
+        path
+    }
+
+    fn unique_test_base_dir(name: &str) -> PathBuf {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{name}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create unique dir");
+        path
+    }
+
+    fn toml_path(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
     }
 }

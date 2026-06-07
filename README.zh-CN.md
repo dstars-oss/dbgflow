@@ -110,11 +110,11 @@ Profile 请求示例：
 ```
 
 `procmon` collector 是可选能力，依赖 Sysinternals Process Monitor。通过
-`--sysinternals-dir <path>` 配置 service 或 HTTP runtime；dbgflow 只会从该
-目录中派生 `Procmon64.exe` 或 `Procmon.exe`。如果未配置该参数，依赖
-Sysinternals 的能力会返回明确错误，且不会启动目标进程。`run_profile` 请求
-不接受 Sysinternals 路径；这是 server runtime 配置。dbgflow 不下载 Procmon、
-不扫描全盘，也不接受单独的 Procmon exe 路径。Procmon 会写入
+`config.toml` 中的 `[tools].sysinternals_dir` 配置；dbgflow 只会从该目录中
+派生 `Procmon64.exe` 或 `Procmon.exe`。如果未配置该路径，依赖 Sysinternals
+的能力会返回明确错误，且不会启动目标进程。`run_profile` 请求不接受
+Sysinternals 路径；这是 server runtime 配置。dbgflow 不下载 Procmon、不扫描
+全盘，也不接受单独的 Procmon exe 路径。Procmon 会写入
 权威 artifact `capture.pml`，并导出 `events.csv` 以及按 target PID /
 operation / path best-effort 过滤后的 `events.jsonl`；请求 stack capture 时，
 dbgflow 也会请求带 stack 数据的 XML 导出。
@@ -125,19 +125,44 @@ dbgflow 也会请求带 stack 数据的 XML 导出。
 从仓库根目录通过本地 Streamable HTTP 启动 MCP server：
 
 ```text
-cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir .\var --proxy-url http://127.0.0.1:7897
+cargo run -p dbgflow-mcp -- http --config C:\Users\dstars\AppData\Local\dbgflow\config.toml
+```
+
+运行配置来自 TOML：
+
+```toml
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "C:\\Users\\dstars\\AppData\\Local\\dbgflow"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\var"
+
+[debugger]
+dbgeng_dir = "C:\\Program Files\\WindowsApps\\Microsoft.WinDbg_...\\amd64"
+
+[tools]
+sysinternals_dir = "C:\\Users\\dstars\\Bin\\SysinternalsSuite"
+
+[proxy]
+mode = "url"
+url = "http://127.0.0.1:7897"
 ```
 
 HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response；`GET /mcp` 打开 server-sent event stream，用于发送 MCP notifications，包括 session 状态变化对应的 `notifications/resources/updated`。`GET /healthz` 返回简单健康检查响应。
 
 HTTP transport 仅用于本机调试：dbgflow 只允许绑定 loopback 地址，并拒绝非 localhost 的 `Origin` header。`/mcp` 不需要 bearer token 认证。HTTP request body 上限为 16 MiB。
 
-代理配置是主服务级别的配置。传入 `--proxy-url http://127.0.0.1:7897`
-会为 DbgEng/SymSrv 符号下载设置 `_NT_SYMBOL_PROXY=127.0.0.1:7897`，
-并为 session worker 和 launch 出来的 debuggee 设置 `HTTP_PROXY` /
-`HTTPS_PROXY` 及小写等价变量。传入 `--no-proxy` 会清除这些已知代理
-变量。若两者都未传入，dbgflow 从主服务进程环境读取 `_NT_SYMBOL_PROXY`、
-`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 及小写等价变量。
+代理配置是主服务级别的配置，来自 `config.toml` 的 `[proxy]`。使用
+`mode = "url"` 和 `url = "http://host:port"` 会为 DbgEng/SymSrv 符号下载
+设置 `_NT_SYMBOL_PROXY`，并为 session worker 和 launch 出来的 debuggee 设置
+`HTTP_PROXY` / `HTTPS_PROXY` 及小写等价变量。使用 `mode = "disabled"` 会清除
+已知代理变量；使用 `mode = "env"` 和 `[proxy.env]` 可持久化具体代理环境变量；
+使用 `mode = "none"` 表示不配置代理。
 
 当前 server 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`、`resources/list` 和 `resources/read`。Tool 结果以 JSON text content 返回；调试命令输出会完整返回，并同时写入 session artifacts。
 最新命令 artifact 也会在 session 的 `last_operation` 中返回引用。
@@ -157,22 +182,22 @@ transcript 中。
 .\scripts\uninstall-service.ps1
 ```
 
-安装脚本只负责构建 release 版 `dbgflow-mcp`，然后调用构建出的
-`target\release\dbgflow-mcp.exe service install`。后续安装旅程全部由主程序完成：
-交互确认服务参数，按 WinDbg Store 包优先、Windows Kits / WDK Debuggers 其次、
-Windows 目录最后的顺序探测 DbgEng，并从环境变量、`PATH` 和常见 Sysinternals
-目录探测 Sysinternals，按需请求 UAC 提权，复制当前 exe 到
-`%LOCALAPPDATA%\dbgflow\bin`，以 LocalSystem 和 `service run --data-dir
-%LOCALAPPDATA%\dbgflow\var` 安装服务，写入选定的 service Environment，启动服务并
-检查 `/healthz`。服务 artifacts 和 logs 写入 `%LOCALAPPDATA%\dbgflow\var`；卸载子命令默认不删除 artifacts 或 logs。
+安装脚本会构建 release 版 `dbgflow-mcp`，探测本机 runtime 依赖，写入
+`%LOCALAPPDATA%\dbgflow\config.toml`，展示最终摘要，然后调用
+`target\release\dbgflow-mcp.exe service install --config <path>`。安装子命令会
+校验配置，按需请求 UAC 提权，复制当前 exe 到 `%LOCALAPPDATA%\dbgflow\bin`，
+以 LocalSystem 和 `service run --config <path>` 安装服务，启动服务并检查
+`/healthz`。
 
-安装过程中可接受检测到的 DbgEng 目录，也可以输入其他包含 `dbgeng.dll` 的目录。
-该路径会作为 `DBGFLOW_DBGENG_DIR` 写入 service Environment，并被 DbgEng resolver
-优先使用。Sysinternals 仍是可选依赖；如果没有配置 Sysinternals 目录，service 仍会
-正常安装运行，但 Procmon-based profiling 不可用。
+安装脚本按 Microsoft Store WinDbg 包优先、Windows Kits / WDK Debuggers 其次、
+System32 最后的顺序探测 DbgEng。Sysinternals 仍是可选依赖；如果没有配置
+Sysinternals 目录，service 仍会正常安装运行，但 Procmon-based profiling 不可用。
+使用 `-ProxyUrl <url>`、`-NoProxy` 或现有 proxy 环境变量控制生成的 `[proxy]`
+配置；使用 `-NonInteractive` 可跳过最终确认，直接写入探测值 / 默认值。
 
-交互式安装器会使用 `-ProxyUrl <url>` 或现有 proxy 环境变量作为显示的代理默认值。
-如果两者都不存在，默认不配置代理。可使用 `-NoProxy`，或在提示中输入 `none`，清空
-已知 service proxy 键；使用 `-NonInteractive` 可直接采用提供的 / 默认 CLI 值而不提示。
+卸载会从 Windows Service Control Manager 查询已安装服务命令行，找回已安装 exe
+路径和 `--config` 路径，然后删除服务并删除整个配置中的 install root，包括 `bin`、
+`config.toml`、logs 和 artifacts。如果服务已经不存在，可向
+`scripts\uninstall-service.ps1` 传入 `-ConfigPath <path>` 作为 fallback。
 
 Live process DbgEng 集成测试默认 ignored，因为 attach / launch 行为依赖本机调试权限和目标进程状态；验证进程调试能力时需要显式运行这些测试。live HTTP E2E 测试会启动 `dbgflow-mcp http`、调用 `/mcp`，并覆盖 attach / launch 的 worker 子进程链路。

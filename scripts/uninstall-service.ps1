@@ -2,8 +2,7 @@
 [CmdletBinding()]
 param(
     [string]$ServiceName = "dbgflow-mcp",
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "dbgflow"),
-    [switch]$RemoveInstallFiles
+    [string]$ConfigPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,12 +16,10 @@ $arguments = @(
     "uninstall"
     "--service-name"
     $ServiceName
-    "--install-root"
-    $InstallRoot
 )
 
-if ($RemoveInstallFiles) {
-    $arguments += "--remove-install-files"
+if ($ConfigPath) {
+    $arguments += @("--config", ([System.IO.Path]::GetFullPath($ConfigPath)))
 }
 
 Push-Location $RepoRoot
@@ -31,7 +28,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
-    if (-not (Test-Path $Exe)) {
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
         throw "Expected release binary was not found: $Exe"
     }
 
