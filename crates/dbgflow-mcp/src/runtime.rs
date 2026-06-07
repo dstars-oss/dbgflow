@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
     pub proxy: ProxyEnvironment,
+    pub sysinternals_dir: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -45,6 +46,7 @@ pub struct ServiceInstallConfig {
     pub display_name: String,
     pub bind: SocketAddr,
     pub install_root: PathBuf,
+    pub sysinternals_dir: Option<PathBuf>,
 }
 
 impl ServiceInstallConfig {
@@ -61,7 +63,7 @@ impl ServiceInstallConfig {
     }
 
     pub fn normalized_command_args(&self) -> Vec<OsString> {
-        vec![
+        let mut args = vec![
             OsString::from("service"),
             OsString::from("install"),
             OsString::from("--service-name"),
@@ -72,11 +74,16 @@ impl ServiceInstallConfig {
             OsString::from(self.bind.to_string()),
             OsString::from("--install-root"),
             self.install_root.as_os_str().to_os_string(),
-        ]
+        ];
+        if let Some(sysinternals_dir) = &self.sysinternals_dir {
+            args.push(OsString::from("--sysinternals-dir"));
+            args.push(sysinternals_dir.as_os_str().to_os_string());
+        }
+        args
     }
 
     pub fn service_launch_arguments(&self) -> Vec<OsString> {
-        vec![
+        let mut args = vec![
             OsString::from("service"),
             OsString::from("run"),
             OsString::from("--service-name"),
@@ -85,7 +92,12 @@ impl ServiceInstallConfig {
             OsString::from(self.bind.to_string()),
             OsString::from("--data-dir"),
             self.data_dir().as_os_str().to_os_string(),
-        ]
+        ];
+        if let Some(sysinternals_dir) = &self.sysinternals_dir {
+            args.push(OsString::from("--sysinternals-dir"));
+            args.push(sysinternals_dir.as_os_str().to_os_string());
+        }
+        args
     }
 }
 
@@ -129,6 +141,7 @@ where
     let mut data_dir = None;
     let mut proxy_url = None;
     let mut no_proxy = false;
+    let mut sysinternals_dir = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -148,6 +161,10 @@ where
             proxy_url = Some(parse_non_empty(value, "--proxy-url")?);
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--sysinternals-dir=") {
+            sysinternals_dir = Some(parse_existing_dir(value, "--sysinternals-dir")?);
+            continue;
+        }
 
         match arg.as_str() {
             "--bind" => {
@@ -162,6 +179,10 @@ where
                 let value = next_value(&mut args, "--proxy-url")?;
                 proxy_url = Some(parse_non_empty(&value, "--proxy-url")?);
             }
+            "--sysinternals-dir" => {
+                let value = next_value(&mut args, "--sysinternals-dir")?;
+                sysinternals_dir = Some(parse_existing_dir(&value, "--sysinternals-dir")?);
+            }
             "--no-proxy" => no_proxy = true,
             "--help" | "-h" => return Err(help_text().to_string()),
             other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
@@ -175,6 +196,7 @@ where
         bind,
         data_dir,
         proxy,
+        sysinternals_dir,
     })
 }
 
@@ -198,6 +220,7 @@ where
     let mut data_dir = None;
     let mut proxy_url = None;
     let mut no_proxy = false;
+    let mut sysinternals_dir = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -221,6 +244,10 @@ where
             proxy_url = Some(parse_non_empty(value, "--proxy-url")?);
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--sysinternals-dir=") {
+            sysinternals_dir = Some(parse_existing_dir(value, "--sysinternals-dir")?);
+            continue;
+        }
 
         match arg.as_str() {
             "--bind" => {
@@ -239,6 +266,10 @@ where
                 let value = next_value(&mut args, "--proxy-url")?;
                 proxy_url = Some(parse_non_empty(&value, "--proxy-url")?);
             }
+            "--sysinternals-dir" => {
+                let value = next_value(&mut args, "--sysinternals-dir")?;
+                sysinternals_dir = Some(parse_existing_dir(&value, "--sysinternals-dir")?);
+            }
             "--no-proxy" => no_proxy = true,
             "--help" | "-h" => return Err(help_text().to_string()),
             other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
@@ -254,6 +285,7 @@ where
             bind,
             data_dir,
             proxy,
+            sysinternals_dir,
         },
     })
 }
@@ -298,6 +330,7 @@ where
     let mut display_name = SERVICE_DISPLAY_NAME.to_string();
     let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
     let mut install_root = None;
+    let mut sysinternals_dir = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -321,6 +354,10 @@ where
             install_root = Some(PathBuf::from(value));
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--sysinternals-dir=") {
+            sysinternals_dir = Some(parse_existing_dir(value, "--sysinternals-dir")?);
+            continue;
+        }
         match arg.as_str() {
             "--service-name" => {
                 let value = next_value(&mut args, "--service-name")?;
@@ -337,6 +374,10 @@ where
             "--install-root" => {
                 let value = next_value(&mut args, "--install-root")?;
                 install_root = Some(PathBuf::from(value));
+            }
+            "--sysinternals-dir" => {
+                let value = next_value(&mut args, "--sysinternals-dir")?;
+                sysinternals_dir = Some(parse_existing_dir(&value, "--sysinternals-dir")?);
             }
             "--help" | "-h" => return Err(service_install_help_text().to_string()),
             other => {
@@ -356,6 +397,7 @@ where
             Some(path) => path,
             None => default_install_root()?,
         },
+        sysinternals_dir,
     })
 }
 
@@ -413,11 +455,11 @@ where
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]        Run local HTTP MCP transport\n  dbgflow-mcp service run --data-dir <path> [options] Run as a Windows service process\n  dbgflow-mcp service install [options]               Install and start the Windows service\n  dbgflow-mcp service uninstall [options]             Stop and uninstall the Windows service\n  dbgflow-mcp worker session                          Run an internal session worker process\n\nRuntime options:\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --data-dir <path>                                   Required. Uses <path>\\artifacts and <path>\\logs\n  --service-name <name>                               Service process name. Default: dbgflow-mcp\n  --proxy-url <url>                                   Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars for all session workers\n  --no-proxy                                         Clears known proxy vars for all session workers\n  Default proxy behavior inherits non-empty known proxy environment variables when no proxy option is passed"
+    "Usage:\n  dbgflow-mcp http --data-dir <path> [options]        Run local HTTP MCP transport\n  dbgflow-mcp service run --data-dir <path> [options] Run as a Windows service process\n  dbgflow-mcp service install [options]               Install and start the Windows service\n  dbgflow-mcp service uninstall [options]             Stop and uninstall the Windows service\n  dbgflow-mcp worker session                          Run an internal session worker process\n\nRuntime options:\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --data-dir <path>                                   Required. Uses <path>\\artifacts and <path>\\logs\n  --service-name <name>                               Service process name. Default: dbgflow-mcp\n  --proxy-url <url>                                   Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars for all session workers\n  --no-proxy                                         Clears known proxy vars for all session workers\n  --sysinternals-dir <path>                           Optional Sysinternals directory for Procmon-based features\n  Default proxy behavior inherits non-empty known proxy environment variables when no proxy option is passed"
 }
 
 pub fn service_install_help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow"
+    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --sysinternals-dir <path>                           Optional Sysinternals directory for Procmon-based features"
 }
 
 pub fn service_uninstall_help_text() -> &'static str {
@@ -461,6 +503,17 @@ fn parse_non_empty(value: &str, option: &str) -> Result<String, String> {
         return Err(format!("{option} must not be empty"));
     }
     Ok(value.to_string())
+}
+
+fn parse_existing_dir(value: &str, option: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(parse_non_empty(value, option)?);
+    if !path.is_dir() {
+        return Err(format!(
+            "{option} must point to an existing directory: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 fn parse_service_name(value: &str) -> Result<String, String> {
@@ -594,6 +647,27 @@ mod tests {
 
         assert_eq!(config.bind.to_string(), "127.0.0.1:9000");
         assert_eq!(config.data_dir, PathBuf::from("C:\\dbgflow\\var"));
+    }
+
+    #[test]
+    fn parses_sysinternals_dir_for_http_runtime() {
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-sysinternals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create sysinternals dir");
+
+        let config = parse_options_with_env(
+            [
+                OsString::from("--data-dir"),
+                OsString::from(".\\var"),
+                OsString::from("--sysinternals-dir"),
+                root.as_os_str().to_os_string(),
+            ],
+            &env(&[]),
+        )
+        .expect("parse options");
+
+        assert_eq!(config.sysinternals_dir.as_deref(), Some(root.as_path()));
     }
 
     #[test]
@@ -898,6 +972,27 @@ mod tests {
                 OsString::from("C:\\dbgflow\\var"),
             ]
         );
+    }
+
+    #[test]
+    fn service_install_launch_arguments_include_sysinternals_dir_when_configured() {
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-install-sysinternals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create sysinternals dir");
+
+        let config = parse_service_install_options([
+            OsString::from("--install-root=C:\\dbgflow"),
+            OsString::from("--sysinternals-dir"),
+            root.as_os_str().to_os_string(),
+        ])
+        .expect("parse service install options");
+
+        assert!(config
+            .service_launch_arguments()
+            .windows(2)
+            .any(|pair| pair[0] == "--sysinternals-dir"
+                && pair[1] == root.as_os_str().to_os_string()));
     }
 
     #[test]

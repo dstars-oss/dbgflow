@@ -22,6 +22,13 @@ pub struct ProfileManager {
 
 impl ProfileManager {
     pub fn new(artifact_root: impl Into<PathBuf>) -> Self {
+        Self::with_runtime(artifact_root, super::ProcmonRuntime::unavailable())
+    }
+
+    pub fn with_runtime(
+        artifact_root: impl Into<PathBuf>,
+        _procmon: super::ProcmonRuntime,
+    ) -> Self {
         Self::with_components(
             artifact_root,
             Arc::new(super::native_etw::NativeEtwCollectorFactory),
