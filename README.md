@@ -30,6 +30,7 @@ Initial tool names:
 - `close_session`
 - `eval`
 - `set_symbols`
+- `run_profile`
 
 `create_session` uses get-or-create semantics and returns quickly with a
 `Starting` session while the backend opens the target in the background. Use
@@ -72,6 +73,31 @@ are not detected from command text; session state is updated from backend
 execution-status events and final backend status.
 `set_symbols` accepts native WinDbg symbol path strings, including symbol server
 paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
+
+`run_profile` launches a local executable and records a native ETW profile trace
+as a standard `.etl` artifact. V1 supports launch targets only, uses the built-in
+`native_etw/system_overview` preset only, and stops collection when the target
+exits or when `timeout_ms` expires. Timeout stops collection but does not
+terminate the target process by default. The ETL trace, profile metadata,
+lifecycle events, and captured target stdout/stderr are written under
+`artifacts\profiles\<profile_id>`.
+
+Example profile request:
+
+```json
+{
+  "target": {
+    "kind": "launch",
+    "executable": "C:\\Windows\\System32\\cmd.exe",
+    "args": ["/C", "echo dbgflow"]
+  },
+  "timeout_ms": 10000,
+  "collector": {
+    "kind": "native_etw",
+    "preset": "system_overview"
+  }
+}
+```
 
 `eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a

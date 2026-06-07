@@ -28,6 +28,7 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - `close_session`
 - `eval`
 - `set_symbols`
+- `run_profile`
 
 `create_session` 采用 get-or-create 语义，并会快速返回 `Starting` session；后端打开 target 在后台完成。调用方可以通过 `get_session`、`list_sessions` 或 HTTP resource update stream 观察状态转为 `Ready`、`Break`、`Closed` 或 `Error`。
 `target` 现在是必填参数；MCP tool schema 不再暴露 mock target。
@@ -54,6 +55,30 @@ Target 示例：
 ```
 
 Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。session 状态不再从命令文本识别运行控制，而是由 backend execution status 事件和最终状态更新。`set_symbols` 接受原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
+
+`run_profile` 启动本地可执行文件，并直接通过 native ETW 采集标准
+`.etl` trace artifact。V1 仅支持 launch target，仅支持内置
+`native_etw/system_overview` preset，并在目标进程退出或 `timeout_ms`
+到达时停止采集。timeout 默认只停止采集，不终止目标进程。ETL trace、
+profile 元数据、生命周期事件以及目标 stdout/stderr 写入
+`artifacts\profiles\<profile_id>`。
+
+Profile 请求示例：
+
+```json
+{
+  "target": {
+    "kind": "launch",
+    "executable": "C:\\Windows\\System32\\cmd.exe",
+    "args": ["/C", "echo dbgflow"]
+  },
+  "timeout_ms": 10000,
+  "collector": {
+    "kind": "native_etw",
+    "preset": "system_overview"
+  }
+}
+```
 
 `eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。如果 DbgEng 报告目标正在运行，session state 会变为 `Running`；下一次 debug event 返回后恢复为 `Break`，如果 backend 报告 no debuggee 则变为 `Closed`。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
 如果 worker 卡住，主进程可以终止该 session 对应的 worker 子进程，不会拖垮其他 session 或 MCP server。
