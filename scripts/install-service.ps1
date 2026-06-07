@@ -172,28 +172,56 @@ function Wait-ServiceHealth {
     throw "Service health check did not report status ok at $uri within $TimeoutSeconds seconds"
 }
 
-function Set-ServiceProxyEnvironment {
+function New-ServiceProxyEnvironment {
     param(
-        [Parameter(Mandatory = $true)][string]$ServiceName,
         [Parameter(Mandatory = $true)][string]$ProxyUrl,
         [Parameter(Mandatory = $true)][string]$SymbolProxy
     )
-    Assert-ServiceName -ServiceName $ServiceName
-    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
-    $environment = @(
+    return @(
         "HTTP_PROXY=$ProxyUrl"
         "HTTPS_PROXY=$ProxyUrl"
         "http_proxy=$ProxyUrl"
         "https_proxy=$ProxyUrl"
         "_NT_SYMBOL_PROXY=$SymbolProxy"
+        "ALL_PROXY="
+        "NO_PROXY="
+        "all_proxy="
+        "no_proxy="
     )
-    New-ItemProperty -LiteralPath $key -Name Environment -PropertyType MultiString -Value $environment -Force | Out-Null
+}
+
+function New-ServiceNoProxyEnvironment {
+    return @(
+        "_NT_SYMBOL_PROXY="
+        "HTTP_PROXY="
+        "HTTPS_PROXY="
+        "ALL_PROXY="
+        "NO_PROXY="
+        "http_proxy="
+        "https_proxy="
+        "all_proxy="
+        "no_proxy="
+    )
+}
+
+function Set-ServiceEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][string[]]$Environment
+    )
+    Assert-ServiceName -ServiceName $ServiceName
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    New-ItemProperty -LiteralPath $key -Name Environment -PropertyType MultiString -Value $Environment -Force | Out-Null
 }
 
 Assert-ServiceName -ServiceName $ServiceName
-$symbolProxy = $null
-if (-not $NoProxy) {
+$serviceEnvironment = $null
+if ($NoProxy) {
+    $serviceEnvironment = New-ServiceNoProxyEnvironment
+}
+else {
     $symbolProxy = Convert-ToSymbolProxy -Url $ProxyUrl
+    $serviceEnvironment = New-ServiceProxyEnvironment -ProxyUrl $ProxyUrl -SymbolProxy $symbolProxy
 }
 
 Push-Location $RepoRoot
@@ -211,12 +239,10 @@ try {
     if ($installExitCode -ne 0) {
         exit $installExitCode
     }
-    if (-not $NoProxy) {
-        Set-ServiceProxyEnvironment -ServiceName $ServiceName -ProxyUrl $ProxyUrl -SymbolProxy $symbolProxy
-        $service = Get-ExactService -ServiceName $ServiceName
-        Restart-Service -InputObject $service -Force
-        Wait-ServiceHealth -Bind $Bind
-    }
+    Set-ServiceEnvironment -ServiceName $ServiceName -Environment $serviceEnvironment
+    $service = Get-ExactService -ServiceName $ServiceName
+    Restart-Service -InputObject $service -Force
+    Wait-ServiceHealth -Bind $Bind
     exit 0
 }
 finally {
