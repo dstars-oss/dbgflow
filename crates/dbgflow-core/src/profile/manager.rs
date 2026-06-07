@@ -1,7 +1,8 @@
 use super::{
     validate_profile_target, CollectorFactory, ProcessTargetRunner, ProfileArtifacts,
-    ProfileCollectorKind, ProfileCompletionReason, ProfileId, ProfileResult, ProfileStatus,
-    RunProfile, TargetExit, TargetRunner,
+    ProfileCollector,
+    ProfileCollectorResult, ProfileCollectorStatus, ProfileCompletionReason, ProfileId,
+    ProfileResult, ProfileStatus, RunProfile, TargetExit, TargetRunner,
 };
 use crate::artifacts::{ArtifactKind, ArtifactManager, ArtifactRef, ProfileArtifactEvent};
 use crate::{DbgFlowError, Result};
@@ -49,21 +50,6 @@ impl ProfileManager {
                 "profile timeout_ms must be greater than zero".to_string(),
             ));
         }
-        if request.collectors.len() != 1 {
-            return Err(DbgFlowError::Backend(
-                "parallel profile collectors are not implemented yet".to_string(),
-            ));
-        }
-        let collector_config = request
-            .collectors
-            .first()
-            .expect("default collector ensured above");
-        if collector_config.kind() != ProfileCollectorKind::NativeEtw {
-            return Err(DbgFlowError::Backend(
-                "unsupported profile collector kind".to_string(),
-            ));
-        }
-
         let profile_id = ProfileId::new();
         {
             let mut active = self.active_job.lock().map_err(|_| {
@@ -86,7 +72,6 @@ impl ProfileManager {
         let profile_dir = self.artifacts.initialize_profile_artifacts(profile_id)?;
         self.record_event(profile_id, "profile_created", None, None, Map::new());
 
-        let trace_path = self.artifacts.profile_trace_path(profile_id);
         let stdout_path = self.artifacts.profile_stdout_path(profile_id);
         let stderr_path = self.artifacts.profile_stderr_path(profile_id);
         ensure_empty_file(&stdout_path)?;
@@ -95,10 +80,6 @@ impl ProfileManager {
         let events_artifact = ArtifactRef {
             kind: ArtifactKind::ProfileEvents,
             path: profile_dir.join("events.jsonl"),
-        };
-        let trace_artifact = ArtifactRef {
-            kind: ArtifactKind::ProfileTrace,
-            path: trace_path.clone(),
         };
         let stdout_artifact = ArtifactRef {
             kind: ArtifactKind::ProfileStdout,
@@ -109,18 +90,59 @@ impl ProfileManager {
             path: stderr_path.clone(),
         };
 
-        self.record_event(profile_id, "collector_starting", None, None, Map::new());
-        let collector = self
-            .collector_factory
-            .create(collector_config, &trace_path)?;
-        let mut warnings = collector.start(&profile_dir)?.warnings;
-        self.record_event(
-            profile_id,
-            "collector_started",
-            Some(trace_path.clone()),
-            None,
-            Map::new(),
-        );
+        let mut warnings = Vec::new();
+        let mut started_collectors = Vec::new();
+        for config in &request.collectors {
+            let collector_dir = self
+                .artifacts
+                .profile_collector_dir(profile_id, config.artifact_name())?;
+            self.record_event(
+                profile_id,
+                "collector_starting",
+                Some(collector_dir.clone()),
+                None,
+                collector_fields(config),
+            );
+            let collector = match self.collector_factory.create(config, &collector_dir) {
+                Ok(collector) => collector,
+                Err(error) => {
+                    stop_started_collectors_for_start_failure(
+                        self,
+                        profile_id,
+                        &mut started_collectors,
+                    );
+                    return Err(error);
+                }
+            };
+            match collector.start() {
+                Ok(start) => {
+                    warnings.extend(start.warnings);
+                    self.record_event(
+                        profile_id,
+                        "collector_started",
+                        Some(collector_dir),
+                        None,
+                        collector_fields(config),
+                    );
+                    started_collectors.push(collector);
+                }
+                Err(error) => {
+                    stop_started_collectors_for_start_failure(
+                        self,
+                        profile_id,
+                        &mut started_collectors,
+                    );
+                    self.record_event(
+                        profile_id,
+                        "profile_error",
+                        None,
+                        Some(error.to_string()),
+                        collector_fields(config),
+                    );
+                    return Err(error);
+                }
+            }
+        }
 
         self.record_event(profile_id, "target_launching", None, None, Map::new());
         let target_exit = self.target_runner.launch_and_wait(
@@ -131,23 +153,52 @@ impl ProfileManager {
         );
 
         let mut stop_error = None;
-        self.record_event(profile_id, "collector_stopping", None, None, Map::new());
-        match collector.stop() {
-            Ok(stop) => {
-                warnings.extend(stop.warnings);
-                self.record_event(profile_id, "collector_stopped", None, None, Map::new());
-            }
-            Err(error) => {
-                stop_error = Some(error.to_string());
-                self.record_event(
-                    profile_id,
-                    "profile_error",
-                    None,
-                    stop_error.clone(),
-                    Map::new(),
-                );
+        let mut collector_results = Vec::new();
+        for collector in started_collectors.into_iter().rev() {
+            let name = collector.name().to_string();
+            let kind = collector.kind();
+            let mut fields = Map::new();
+            fields.insert("collector".to_string(), Value::String(name.clone()));
+            self.record_event(profile_id, "collector_stopping", None, None, fields.clone());
+            match collector.stop() {
+                Ok(stop) => {
+                    warnings.extend(stop.warnings.clone());
+                    self.record_event(profile_id, "collector_stopped", None, None, fields);
+                    collector_results.push(ProfileCollectorResult {
+                        kind,
+                        name,
+                        status: ProfileCollectorStatus::Completed,
+                        artifacts: stop.artifacts,
+                        warnings: stop.warnings,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    if stop_error.is_none() {
+                        stop_error = Some(error.clone());
+                    }
+                    warnings.push(format!("collector {name} stop failed: {error}"));
+                    self.record_event(
+                        profile_id,
+                        "profile_error",
+                        None,
+                        Some(error.clone()),
+                        fields,
+                    );
+                    collector_results.push(ProfileCollectorResult {
+                        kind,
+                        name,
+                        status: ProfileCollectorStatus::Failed,
+                        artifacts: Vec::new(),
+                        warnings: Vec::new(),
+                        error: Some(error),
+                    });
+                }
             }
         }
+        collector_results.reverse();
+        let trace_artifact = legacy_trace_artifact(&collector_results);
 
         let duration_ms = started.elapsed().as_millis();
         let (status, completion_reason, target_pid, target_exit_code, error) = match target_exit {
@@ -201,7 +252,8 @@ impl ProfileManager {
             target_exit_code,
             started_at,
             duration_ms,
-            &trace_artifact,
+            trace_artifact.as_ref(),
+            &collector_results,
             &warnings,
             error.clone(),
         )?;
@@ -214,13 +266,13 @@ impl ProfileManager {
             target_exit_code,
             duration_ms,
             artifacts: ProfileArtifacts {
-                trace: Some(trace_artifact),
+                trace: trace_artifact,
                 profile: metadata_artifact,
                 events: events_artifact,
                 stdout: stdout_artifact,
                 stderr: stderr_artifact,
             },
-            collector_results: Vec::new(),
+            collector_results,
             warnings,
             error,
         };
@@ -240,7 +292,8 @@ impl ProfileManager {
         target_exit_code: Option<i32>,
         started_at_unix_ms: u128,
         duration_ms: u128,
-        trace_artifact: &ArtifactRef,
+        trace_artifact: Option<&ArtifactRef>,
+        collector_results: &[ProfileCollectorResult],
         warnings: &[String],
         error: Option<String>,
     ) -> Result<ArtifactRef> {
@@ -256,7 +309,8 @@ impl ProfileManager {
             "completion_reason": completion_reason,
             "target_exit_code": target_exit_code,
             "collectors": request.collectors,
-            "trace": trace_artifact.path,
+            "trace": trace_artifact.map(|artifact| artifact.path.clone()),
+            "collector_results": collector_results,
             "warnings": warnings,
             "error": error,
         });
@@ -311,6 +365,54 @@ impl Drop for ActiveProfileGuard {
 
 fn ensure_empty_file(path: &PathBuf) -> Result<()> {
     fs::write(path, b"").map_err(|error| DbgFlowError::Artifact(error.to_string()))
+}
+
+fn collector_fields(config: &super::ProfileCollectorConfig) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert(
+        "collector".to_string(),
+        Value::String(config.artifact_name().to_string()),
+    );
+    fields
+}
+
+fn legacy_trace_artifact(results: &[ProfileCollectorResult]) -> Option<ArtifactRef> {
+    results
+        .iter()
+        .find(|result| result.name == "native_etw")
+        .and_then(|result| {
+            result
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.kind == ArtifactKind::ProfileCollectorTrace)
+        })
+        .map(|artifact| ArtifactRef {
+            kind: ArtifactKind::ProfileTrace,
+            path: artifact.path.clone(),
+        })
+}
+
+fn stop_started_collectors_for_start_failure(
+    manager: &ProfileManager,
+    profile_id: ProfileId,
+    started_collectors: &mut Vec<Box<dyn ProfileCollector>>,
+) {
+    while let Some(collector) = started_collectors.pop() {
+        let name = collector.name().to_string();
+        let mut fields = Map::new();
+        fields.insert("collector".to_string(), Value::String(name));
+        manager.record_event(profile_id, "collector_stopping", None, None, fields.clone());
+        match collector.stop() {
+            Ok(_) => manager.record_event(profile_id, "collector_stopped", None, None, fields),
+            Err(error) => manager.record_event(
+                profile_id,
+                "profile_error",
+                None,
+                Some(error.to_string()),
+                fields,
+            ),
+        }
+    }
 }
 
 fn now_unix_ms() -> u128 {

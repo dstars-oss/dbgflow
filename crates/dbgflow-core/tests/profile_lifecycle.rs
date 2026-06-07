@@ -1,4 +1,4 @@
-use dbgflow_core::artifacts::ArtifactKind;
+use dbgflow_core::artifacts::{ArtifactKind, ArtifactRef};
 use dbgflow_core::profile::{
     validate_profile_target, CollectorFactory, CollectorStart, CollectorStop, ProfileCollector,
     ProfileCollectorConfig, ProfileCollectorKind, ProfileCompletionReason, ProfileManager,
@@ -6,7 +6,7 @@ use dbgflow_core::profile::{
 };
 use dbgflow_core::Result;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -114,20 +114,22 @@ fn procmon_collector_config_defaults_to_no_stacks_and_empty_filters() {
 fn fake_collector_records_start_and_stop_calls() {
     let state = Arc::new(Mutex::new(Vec::new()));
     let collector = TestCollector {
+        name: "native_etw".to_string(),
+        kind: ProfileCollectorKind::NativeEtw,
+        artifact_path: None,
         state: state.clone(),
         fail_start: false,
         fail_stop: false,
     };
-    let output_dir = std::env::temp_dir();
 
-    let started = collector.start(&output_dir).expect("start collector");
+    let started = collector.start().expect("start collector");
     assert_eq!(started.warnings, Vec::<String>::new());
     let stopped = collector.stop().expect("stop collector");
     assert_eq!(stopped.warnings, Vec::<String>::new());
 
     assert_eq!(
         state.lock().expect("state").as_slice(),
-        &["start".to_string(), "stop".to_string()]
+        &["start:native_etw".to_string(), "stop:native_etw".to_string()]
     );
 }
 
@@ -152,17 +154,31 @@ fn target_runner_returns_exit_or_timeout_without_killing_target() {
 }
 
 struct TestCollector {
+    name: String,
+    kind: ProfileCollectorKind,
+    artifact_path: Option<PathBuf>,
     state: Arc<Mutex<Vec<String>>>,
     fail_start: bool,
     fail_stop: bool,
 }
 
 impl ProfileCollector for TestCollector {
-    fn start(&self, _output_dir: &Path) -> Result<CollectorStart> {
-        self.state.lock().expect("state").push("start".to_string());
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> ProfileCollectorKind {
+        self.kind
+    }
+
+    fn start(&self) -> Result<CollectorStart> {
+        self.state
+            .lock()
+            .expect("state")
+            .push(format!("start:{}", self.name));
         if self.fail_start {
             return Err(dbgflow_core::DbgFlowError::Backend(
-                "collector start failed".to_string(),
+                format!("collector start failed: {}", self.name),
             ));
         }
         Ok(CollectorStart {
@@ -171,13 +187,26 @@ impl ProfileCollector for TestCollector {
     }
 
     fn stop(&self) -> Result<CollectorStop> {
-        self.state.lock().expect("state").push("stop".to_string());
+        self.state
+            .lock()
+            .expect("state")
+            .push(format!("stop:{}", self.name));
         if self.fail_stop {
             return Err(dbgflow_core::DbgFlowError::Backend(
-                "collector stop failed".to_string(),
+                format!("collector stop failed: {}", self.name),
             ));
         }
         Ok(CollectorStop {
+            artifacts: self
+                .artifact_path
+                .clone()
+                .map(|path| {
+                    vec![ArtifactRef {
+                        kind: ArtifactKind::ProfileCollectorTrace,
+                        path,
+                    }]
+                })
+                .unwrap_or_default(),
             warnings: Vec::new(),
         })
     }
@@ -186,7 +215,7 @@ impl ProfileCollector for TestCollector {
         self.state
             .lock()
             .expect("state")
-            .push("cleanup".to_string());
+            .push(format!("cleanup:{}", self.name));
         Ok(())
     }
 }
@@ -217,6 +246,8 @@ fn run_profile_starts_collector_launches_target_stops_collector_and_writes_artif
             state: collector_state.clone(),
             fail_start: false,
             fail_stop: false,
+            fail_start_for: None,
+            fail_stop_for: None,
         }),
         Arc::new(TestTargetRunner {
             exit: TargetExit::Exited {
@@ -259,7 +290,7 @@ fn run_profile_starts_collector_launches_target_stops_collector_and_writes_artif
     assert!(result.artifacts.stderr.path.is_file());
     assert_eq!(
         collector_state.lock().expect("state").as_slice(),
-        &["start".to_string(), "stop".to_string()]
+        &["start:native_etw".to_string(), "stop:native_etw".to_string()]
     );
 
     let metadata =
@@ -309,6 +340,8 @@ fn run_profile_collector_start_failure_does_not_launch_target() {
             state: Arc::new(Mutex::new(Vec::new())),
             fail_start: true,
             fail_stop: false,
+            fail_start_for: None,
+            fail_stop_for: None,
         }),
         Arc::new(PanicTargetRunner),
     );
@@ -327,6 +360,107 @@ fn run_profile_collector_start_failure_does_not_launch_target() {
     assert!(error.to_string().contains("collector start failed"));
 }
 
+#[test]
+fn run_profile_starts_and_stops_collectors_in_reverse_stop_order() {
+    let root = test_profile_root("multi-collector");
+    let collector_state = Arc::new(Mutex::new(Vec::new()));
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory {
+            state: collector_state.clone(),
+            fail_start: false,
+            fail_stop: false,
+            fail_start_for: None,
+            fail_stop_for: None,
+        }),
+        Arc::new(TestTargetRunner {
+            exit: TargetExit::Exited {
+                pid: 1234,
+                exit_code: Some(0),
+            },
+        }),
+    );
+
+    let result = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            collectors: vec![
+                ProfileCollectorConfig::NativeEtw {
+                    preset: ProfilePreset::SystemOverview,
+                },
+                ProfileCollectorConfig::Procmon {
+                    capture_stacks: true,
+                    filters: Default::default(),
+                },
+            ],
+        })
+        .expect("run profile");
+
+    assert_eq!(result.status, ProfileStatus::Completed);
+    assert_eq!(result.collector_results.len(), 2);
+    assert_eq!(
+        collector_state.lock().expect("state").as_slice(),
+        &[
+            "start:native_etw".to_string(),
+            "start:procmon".to_string(),
+            "stop:procmon".to_string(),
+            "stop:native_etw".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn run_profile_start_failure_stops_already_started_collectors() {
+    let root = test_profile_root("multi-start-failure");
+    let collector_state = Arc::new(Mutex::new(Vec::new()));
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory {
+            state: collector_state.clone(),
+            fail_start: false,
+            fail_stop: false,
+            fail_start_for: Some("procmon".to_string()),
+            fail_stop_for: None,
+        }),
+        Arc::new(PanicTargetRunner),
+    );
+
+    let error = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            collectors: vec![
+                ProfileCollectorConfig::NativeEtw {
+                    preset: ProfilePreset::SystemOverview,
+                },
+                ProfileCollectorConfig::Procmon {
+                    capture_stacks: false,
+                    filters: Default::default(),
+                },
+            ],
+        })
+        .expect_err("collector start fails");
+
+    assert!(error
+        .to_string()
+        .contains("collector start failed: procmon"));
+    assert_eq!(
+        collector_state.lock().expect("state").as_slice(),
+        &[
+            "start:native_etw".to_string(),
+            "start:procmon".to_string(),
+            "stop:native_etw".to_string(),
+        ]
+    );
+}
+
 fn test_profile_root(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("dbgflow-profile-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
@@ -339,18 +473,31 @@ struct TestCollectorFactory {
     state: Arc<Mutex<Vec<String>>>,
     fail_start: bool,
     fail_stop: bool,
+    fail_start_for: Option<String>,
+    fail_stop_for: Option<String>,
 }
 
 impl CollectorFactory for TestCollectorFactory {
     fn create(
         &self,
         _config: &ProfileCollectorConfig,
-        _trace_path: &Path,
+        _output_dir: &Path,
     ) -> Result<Box<dyn ProfileCollector>> {
+        let name = _config.artifact_name().to_string();
+        let kind = _config.kind();
+        let artifact_path = match kind {
+            ProfileCollectorKind::NativeEtw => Some(_output_dir.join("trace.etl")),
+            ProfileCollectorKind::Procmon => Some(_output_dir.join("capture.pml")),
+        };
+        let fail_start = self.fail_start || self.fail_start_for.as_deref() == Some(name.as_str());
+        let fail_stop = self.fail_stop || self.fail_stop_for.as_deref() == Some(name.as_str());
         Ok(Box::new(TestCollector {
+            name,
+            kind,
+            artifact_path,
             state: self.state.clone(),
-            fail_start: self.fail_start,
-            fail_stop: self.fail_stop,
+            fail_start,
+            fail_stop,
         }))
     }
 }
@@ -412,6 +559,8 @@ fn target_launch_failure_after_collector_start_returns_failed_result_and_stops_c
             state: collector_state.clone(),
             fail_start: false,
             fail_stop: false,
+            fail_start_for: None,
+            fail_stop_for: None,
         }),
         Arc::new(FailingTargetRunner),
     );
@@ -438,7 +587,7 @@ fn target_launch_failure_after_collector_start_returns_failed_result_and_stops_c
         .is_some_and(|error| error.contains("target failed")));
     assert_eq!(
         collector_state.lock().expect("state").as_slice(),
-        &["start".to_string(), "stop".to_string()]
+        &["start:native_etw".to_string(), "stop:native_etw".to_string()]
     );
 }
 

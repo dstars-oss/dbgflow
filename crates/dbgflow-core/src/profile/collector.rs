@@ -1,9 +1,12 @@
-use super::ProfileCollectorConfig;
+use super::{ProfileCollectorConfig, ProfileCollectorKind};
+use crate::artifacts::ArtifactRef;
 use crate::Result;
 use std::path::Path;
 
 pub trait ProfileCollector: Send + Sync {
-    fn start(&self, output_dir: &Path) -> Result<CollectorStart>;
+    fn name(&self) -> &str;
+    fn kind(&self) -> ProfileCollectorKind;
+    fn start(&self) -> Result<CollectorStart>;
     fn stop(&self) -> Result<CollectorStop>;
     fn cleanup(&self) -> Result<()>;
 }
@@ -12,7 +15,7 @@ pub trait CollectorFactory: Send + Sync {
     fn create(
         &self,
         config: &ProfileCollectorConfig,
-        trace_path: &Path,
+        output_dir: &Path,
     ) -> Result<Box<dyn ProfileCollector>>;
 }
 
@@ -23,5 +26,6 @@ pub struct CollectorStart {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectorStop {
+    pub artifacts: Vec<ArtifactRef>,
     pub warnings: Vec<String>,
 }

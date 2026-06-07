@@ -16,7 +16,7 @@ impl CollectorFactory for NativeEtwCollectorFactory {
     fn create(
         &self,
         config: &ProfileCollectorConfig,
-        _trace_path: &Path,
+        _output_dir: &Path,
     ) -> Result<Box<dyn ProfileCollector>> {
         if !matches!(
             config,
@@ -37,8 +37,10 @@ impl CollectorFactory for NativeEtwCollectorFactory {
 #[cfg(windows)]
 use super::{
     CollectorFactory, CollectorStart, CollectorStop, ProfileCollector, ProfileCollectorConfig,
-    ProfilePreset,
+    ProfileCollectorKind, ProfilePreset,
 };
+#[cfg(windows)]
+use crate::artifacts::{ArtifactKind, ArtifactRef};
 #[cfg(windows)]
 use crate::{DbgFlowError, Result};
 #[cfg(windows)]
@@ -79,7 +81,7 @@ impl CollectorFactory for NativeEtwCollectorFactory {
     fn create(
         &self,
         config: &ProfileCollectorConfig,
-        trace_path: &Path,
+        output_dir: &Path,
     ) -> Result<Box<dyn ProfileCollector>> {
         if !matches!(
             config,
@@ -91,7 +93,9 @@ impl CollectorFactory for NativeEtwCollectorFactory {
                 "unsupported native ETW profile collector configuration".to_string(),
             ));
         }
-        Ok(Box::new(NativeEtwCollector::new(trace_path.to_path_buf())))
+        Ok(Box::new(NativeEtwCollector::new(
+            output_dir.join("trace.etl"),
+        )))
     }
 }
 
@@ -119,7 +123,15 @@ impl NativeEtwCollector {
 
 #[cfg(windows)]
 impl ProfileCollector for NativeEtwCollector {
-    fn start(&self, _output_dir: &Path) -> Result<CollectorStart> {
+    fn name(&self) -> &str {
+        "native_etw"
+    }
+
+    fn kind(&self) -> ProfileCollectorKind {
+        ProfileCollectorKind::NativeEtw
+    }
+
+    fn start(&self) -> Result<CollectorStart> {
         let mut state = self
             .state
             .lock()
@@ -145,13 +157,20 @@ impl ProfileCollector for NativeEtwCollector {
             .map_err(|_| DbgFlowError::Backend("native ETW collector lock poisoned".to_string()))?;
         let Some(session_name) = state.session_name.clone() else {
             return Ok(CollectorStop {
+                artifacts: Vec::new(),
                 warnings: vec!["native ETW collector was not started".to_string()],
             });
         };
 
         let warnings = stop_trace_session(&session_name, &self.trace_path)?;
         state.session_name = None;
-        Ok(CollectorStop { warnings })
+        Ok(CollectorStop {
+            artifacts: vec![ArtifactRef {
+                kind: ArtifactKind::ProfileCollectorTrace,
+                path: self.trace_path.clone(),
+            }],
+            warnings,
+        })
     }
 
     fn cleanup(&self) -> Result<()> {
