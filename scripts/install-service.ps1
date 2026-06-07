@@ -6,11 +6,13 @@ param(
     [string]$Bind = "127.0.0.1:7331",
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "dbgflow"),
     [string]$ProxyUrl = "http://127.0.0.1:7897",
+    [string]$SysinternalsDir,
     [switch]$NoProxy
 )
 
 $ErrorActionPreference = "Stop"
 $proxyUrlWasBound = $PSBoundParameters.ContainsKey("ProxyUrl")
+$sysinternalsDirWasBound = $PSBoundParameters.ContainsKey("SysinternalsDir")
 
 function Convert-ToPowerShellLiteral {
     param([AllowNull()][string]$Value)
@@ -43,6 +45,12 @@ if (-not (Test-IsAdministrator)) {
         $command += @(
             "-ProxyUrl"
             (Convert-ToPowerShellLiteral -Value $ProxyUrl)
+        )
+    }
+    if ($sysinternalsDirWasBound) {
+        $command += @(
+            "-SysinternalsDir"
+            (Convert-ToPowerShellLiteral -Value $SysinternalsDir)
         )
     }
     if ($NoProxy) {
@@ -79,6 +87,42 @@ $arguments = @(
     "--install-root"
     $InstallRoot
 )
+
+function Test-SysinternalsDir {
+    param([AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $false
+    }
+    return (
+        (Test-Path -LiteralPath (Join-Path $Path "Procmon64.exe") -PathType Leaf) -or
+        (Test-Path -LiteralPath (Join-Path $Path "Procmon.exe") -PathType Leaf)
+    )
+}
+
+function Find-SysinternalsDir {
+    param([Parameter(Mandatory = $true)][string]$RepoRoot)
+    $candidates = @(
+        (Join-Path (Split-Path -Parent $RepoRoot) "Sysinternals"),
+        "C:\Tools\Sysinternals",
+        "C:\Sysinternals",
+        "C:\Program Files\Sysinternals"
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-SysinternalsDir -Path $candidate) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    return $null
+}
+
+function Confirm-SysinternalsDir {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $answer = Read-Host "Use Sysinternals directory '$Path' for optional Procmon features? [Y/n]"
+    return [string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(y|yes)$'
+}
 
 function Assert-NoControlCharacters {
     param(
@@ -232,6 +276,23 @@ function Set-ServiceEnvironment {
 }
 
 Assert-ServiceName -ServiceName $ServiceName
+$resolvedSysinternalsDir = $null
+if ($sysinternalsDirWasBound) {
+    if (-not (Test-SysinternalsDir -Path $SysinternalsDir)) {
+        throw "SysinternalsDir must contain Procmon64.exe or Procmon.exe: $SysinternalsDir"
+    }
+    $resolvedSysinternalsDir = (Resolve-Path -LiteralPath $SysinternalsDir).Path
+}
+else {
+    $candidateSysinternalsDir = Find-SysinternalsDir -RepoRoot $RepoRoot
+    if ($candidateSysinternalsDir -and (Confirm-SysinternalsDir -Path $candidateSysinternalsDir)) {
+        $resolvedSysinternalsDir = $candidateSysinternalsDir
+    }
+}
+if ($resolvedSysinternalsDir) {
+    $arguments += @("--sysinternals-dir", $resolvedSysinternalsDir)
+}
+
 $serviceEnvironment = $null
 if ($NoProxy) {
     $serviceEnvironment = New-ServiceNoProxyEnvironment
