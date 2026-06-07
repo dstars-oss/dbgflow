@@ -1,5 +1,4 @@
 use crate::{DbgFlowError, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
@@ -25,7 +24,7 @@ const ALL_PROXY_KEYS: &[&str] = &[
     LOWER_NO_PROXY_KEY,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxySource {
     Cli,
     Environment,
@@ -33,7 +32,7 @@ pub enum ProxySource {
     None,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxyEnvironment {
     source: ProxySource,
     vars: BTreeMap<String, String>,
@@ -193,6 +192,11 @@ fn symbol_proxy_from_url(value: &str) -> Result<String> {
             "--proxy-url must not include query or fragment".to_string(),
         ));
     }
+    if rest.contains('/') {
+        return Err(DbgFlowError::Backend(
+            "--proxy-url must not include a path".to_string(),
+        ));
+    }
     let authority = rest.split('/').next().unwrap_or(rest);
     if authority.is_empty() {
         return Err(DbgFlowError::Backend(
@@ -210,7 +214,20 @@ fn symbol_proxy_from_url(value: &str) -> Result<String> {
             "--proxy-url must include host and port".to_string(),
         ));
     }
+    validate_proxy_port(port)?;
     Ok(authority.to_string())
+}
+
+fn validate_proxy_port(port: &str) -> Result<()> {
+    match port.parse::<u16>() {
+        Ok(0) => Err(DbgFlowError::Backend(
+            "--proxy-url port must be a nonzero u16".to_string(),
+        )),
+        Ok(_) => Ok(()),
+        Err(_) => Err(DbgFlowError::Backend(
+            "--proxy-url port must be a nonzero u16".to_string(),
+        )),
+    }
 }
 
 fn split_authority_host_port(authority: &str) -> Result<(&str, &str)> {
@@ -392,5 +409,10 @@ mod tests {
         assert!(ProxyEnvironment::from_cli_proxy_url("http://host:7897#frag").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://host:7897 ").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://host:7897:extra").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://host:abc").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://host:65536").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://host:0").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://[::1]:abc").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://host:7897/path").is_err());
     }
 }
