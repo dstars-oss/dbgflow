@@ -129,7 +129,10 @@ fn fake_collector_records_start_and_stop_calls() {
 
     assert_eq!(
         state.lock().expect("state").as_slice(),
-        &["start:native_etw".to_string(), "stop:native_etw".to_string()]
+        &[
+            "start:native_etw".to_string(),
+            "stop:native_etw".to_string()
+        ]
     );
 }
 
@@ -177,9 +180,10 @@ impl ProfileCollector for TestCollector {
             .expect("state")
             .push(format!("start:{}", self.name));
         if self.fail_start {
-            return Err(dbgflow_core::DbgFlowError::Backend(
-                format!("collector start failed: {}", self.name),
-            ));
+            return Err(dbgflow_core::DbgFlowError::Backend(format!(
+                "collector start failed: {}",
+                self.name
+            )));
         }
         Ok(CollectorStart {
             warnings: Vec::new(),
@@ -192,9 +196,10 @@ impl ProfileCollector for TestCollector {
             .expect("state")
             .push(format!("stop:{}", self.name));
         if self.fail_stop {
-            return Err(dbgflow_core::DbgFlowError::Backend(
-                format!("collector stop failed: {}", self.name),
-            ));
+            return Err(dbgflow_core::DbgFlowError::Backend(format!(
+                "collector stop failed: {}",
+                self.name
+            )));
         }
         Ok(CollectorStop {
             artifacts: self
@@ -290,7 +295,10 @@ fn run_profile_starts_collector_launches_target_stops_collector_and_writes_artif
     assert!(result.artifacts.stderr.path.is_file());
     assert_eq!(
         collector_state.lock().expect("state").as_slice(),
-        &["start:native_etw".to_string(), "stop:native_etw".to_string()]
+        &[
+            "start:native_etw".to_string(),
+            "stop:native_etw".to_string()
+        ]
     );
 
     let metadata =
@@ -615,7 +623,10 @@ fn target_launch_failure_after_collector_start_returns_failed_result_and_stops_c
         .is_some_and(|error| error.contains("target failed")));
     assert_eq!(
         collector_state.lock().expect("state").as_slice(),
-        &["start:native_etw".to_string(), "stop:native_etw".to_string()]
+        &[
+            "start:native_etw".to_string(),
+            "stop:native_etw".to_string()
+        ]
     );
 }
 

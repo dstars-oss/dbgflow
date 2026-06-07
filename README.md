@@ -21,6 +21,7 @@ endpoint, and Windows service install / uninstall subcommands:
 - native Windows service mode
 - native Windows service install / uninstall subcommands
 - main-service proxy configuration for session workers and SymSrv symbol downloads
+- launch-only profiling with native ETW and optional Sysinternals Procmon collectors
 
 Initial tool names:
 
@@ -74,12 +75,14 @@ execution-status events and final backend status.
 `set_symbols` accepts native WinDbg symbol path strings, including symbol server
 paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
 
-`run_profile` launches a local executable and records a native ETW profile trace
-as a standard `.etl` artifact. V1 supports launch targets only, uses the built-in
-`native_etw/system_overview` preset only, and stops collection when the target
-exits or when `timeout_ms` expires. Timeout stops collection but does not
-terminate the target process by default. The ETL trace, profile metadata,
-lifecycle events, and captured target stdout/stderr are written under
+`run_profile` launches a local executable and records one or more profiling
+collectors around the same target lifetime. The default collector is
+`native_etw/system_overview`, which writes a standard `.etl` trace. The tool
+also accepts `collectors[]` for parallel collection; the legacy single
+`collector` field remains accepted for compatibility. Collection stops when the
+target exits or when `timeout_ms` expires. Timeout stops collection but does not
+terminate the target process by default. Profile metadata, lifecycle events,
+collector artifacts, and captured target stdout/stderr are written under
 `artifacts\profiles\<profile_id>`.
 
 Example profile request:
@@ -98,6 +101,40 @@ Example profile request:
   }
 }
 ```
+
+Parallel collectors example:
+
+```json
+{
+  "target": {
+    "kind": "launch",
+    "executable": "C:\\app\\read-file.exe",
+    "args": ["C:\\data\\large_input.bin"]
+  },
+  "timeout_ms": 10000,
+  "collectors": [
+    {
+      "kind": "native_etw",
+      "preset": "system_overview"
+    },
+    {
+      "kind": "procmon",
+      "capture_stacks": true,
+      "filters": {
+        "operations": ["CreateFile", "ReadFile", "WriteFile"],
+        "paths": ["C:\\data\\large_input.bin"]
+      }
+    }
+  ]
+}
+```
+
+The `procmon` collector is optional and depends on Sysinternals Process Monitor.
+Configure the service or HTTP runtime with `--sysinternals-dir <path>`; dbgflow
+derives `Procmon64.exe` or `Procmon.exe` from that directory. If the option is
+not configured, Sysinternals-dependent features return a clear error and the
+target is not launched. dbgflow does not download Procmon, does not scan the
+whole machine, and does not accept a standalone Procmon executable path.
 
 `eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a
@@ -161,6 +198,12 @@ service parameters. The install subcommand copies its current executable to
 --data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks `/healthz`.
 Service artifacts and logs are written under `%LOCALAPPDATA%\dbgflow\var`.
 Uninstall does not delete artifacts or logs by default.
+
+During installation, the script tries to detect a local Sysinternals directory
+and asks whether to write it as `--sysinternals-dir` for optional Procmon
+features. You can also pass `-SysinternalsDir <path>` explicitly. If no
+Sysinternals directory is configured, the service still installs and runs, but
+Procmon-based profiling is unavailable.
 
 The install script configures the Windows service environment with
 `http://127.0.0.1:7897` by default, including `_NT_SYMBOL_PROXY=127.0.0.1:7897`.

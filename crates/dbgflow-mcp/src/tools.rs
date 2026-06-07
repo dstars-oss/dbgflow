@@ -650,7 +650,10 @@ mod tests {
         let request: RunProfileRequest = decode_arguments(value).expect("decode request");
         assert_eq!(request.timeout_ms, 1000);
         assert_eq!(request.collectors.len(), 1);
-        assert_eq!(request.collectors[0].kind(), ProfileCollectorKind::NativeEtw);
+        assert_eq!(
+            request.collectors[0].kind(),
+            ProfileCollectorKind::NativeEtw
+        );
         assert!(matches!(
             request.collectors[0],
             ProfileCollectorConfig::NativeEtw {

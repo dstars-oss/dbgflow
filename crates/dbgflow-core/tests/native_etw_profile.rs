@@ -38,8 +38,7 @@ fn native_etw_run_profile_writes_etl_for_cmd() {
         .expect("legacy trace artifact");
     assert!(trace.path.is_file());
     assert!(
-        trace.path.metadata().expect("trace metadata").len()
-            > 0,
+        trace.path.metadata().expect("trace metadata").len() > 0,
         "expected non-empty ETL"
     );
 

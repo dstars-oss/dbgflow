@@ -1,8 +1,7 @@
 use super::{
     validate_profile_target, CollectorFactory, ProcessTargetRunner, ProfileArtifacts,
-    ProfileCollector,
-    ProfileCollectorResult, ProfileCollectorStatus, ProfileCompletionReason, ProfileId,
-    ProfileResult, ProfileStatus, RunProfile, TargetExit, TargetRunner,
+    ProfileCollector, ProfileCollectorResult, ProfileCollectorStatus, ProfileCompletionReason,
+    ProfileId, ProfileResult, ProfileStatus, RunProfile, TargetExit, TargetRunner,
 };
 use crate::artifacts::{ArtifactKind, ArtifactManager, ArtifactRef, ProfileArtifactEvent};
 use crate::{DbgFlowError, Result};
@@ -25,10 +24,7 @@ impl ProfileManager {
         Self::with_runtime(artifact_root, super::ProcmonRuntime::unavailable())
     }
 
-    pub fn with_runtime(
-        artifact_root: impl Into<PathBuf>,
-        procmon: super::ProcmonRuntime,
-    ) -> Self {
+    pub fn with_runtime(artifact_root: impl Into<PathBuf>, procmon: super::ProcmonRuntime) -> Self {
         Self::with_components(
             artifact_root,
             Arc::new(super::DefaultProfileCollectorFactory::new(procmon)),

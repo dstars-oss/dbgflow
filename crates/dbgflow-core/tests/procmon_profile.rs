@@ -11,8 +11,7 @@ fn procmon_run_profile_writes_pml_for_cmd() {
     let sysinternals_dir = std::env::var_os("DBGFLOW_SYSINTERNALS_DIR")
         .map(std::path::PathBuf::from)
         .expect("set DBGFLOW_SYSINTERNALS_DIR to a Sysinternals directory");
-    let root =
-        std::env::temp_dir().join(format!("dbgflow-procmon-profile-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("dbgflow-procmon-profile-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create root");
 

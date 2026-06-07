@@ -207,9 +207,7 @@ impl ProcmonCommandRunner for ProcessProcmonCommandRunner {
 
 fn procmon_warnings(capture_stacks: bool) -> Vec<String> {
     if capture_stacks {
-        vec![
-            "procmon stack capture depends on local Procmon configuration and symbols".to_string(),
-        ]
+        vec!["procmon stack capture depends on local Procmon configuration and symbols".to_string()]
     } else {
         Vec::new()
     }

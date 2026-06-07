@@ -976,8 +976,10 @@ mod tests {
 
     #[test]
     fn service_install_launch_arguments_include_sysinternals_dir_when_configured() {
-        let root =
-            std::env::temp_dir().join(format!("dbgflow-install-sysinternals-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "dbgflow-install-sysinternals-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create sysinternals dir");
 
