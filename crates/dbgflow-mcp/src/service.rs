@@ -575,6 +575,9 @@ fn find_sysinternals_dir() -> Option<PathBuf> {
     push_env_path(&mut candidates, "DBGFLOW_SYSINTERNALS_DIR");
     push_env_path(&mut candidates, "SysinternalsDir");
     push_path_entries(&mut candidates);
+    if let Some(user_profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        candidates.push(user_profile.join("Bin"));
+    }
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir.join("Sysinternals"));
         if let Some(parent) = current_dir.parent() {
@@ -586,12 +589,21 @@ fn find_sysinternals_dir() -> Option<PathBuf> {
     candidates.push(PathBuf::from(r"C:\Program Files\Sysinternals"));
 
     first_resolved_candidate(candidates, |path| {
-        if is_sysinternals_dir(path) {
-            Some(path.to_path_buf())
-        } else {
-            None
-        }
+        sysinternals_dir_from_dependency_root(path)
     })
+}
+
+fn sysinternals_dir_from_dependency_root(path: &Path) -> Option<PathBuf> {
+    if is_sysinternals_dir(path) {
+        return Some(path.to_path_buf());
+    }
+    for child in ["SysinternalsSuite", "Sysinternals"] {
+        let candidate = path.join(child);
+        if is_sysinternals_dir(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn first_resolved_candidate(
@@ -1232,6 +1244,19 @@ mod tests {
             ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897").expect("parse proxy");
 
         assert_eq!(proxy_prompt_default_label(&proxy), "http://127.0.0.1:7897");
+    }
+
+    #[test]
+    fn sysinternals_detection_accepts_suite_child_under_dependency_root() {
+        let root = unique_test_dir("dbgflow-install-sysinternals-child");
+        let bin = root.join("Bin");
+        let suite = bin.join("SysinternalsSuite");
+        touch(suite.join("Procmon64.exe"));
+
+        let detected = super::sysinternals_dir_from_dependency_root(&bin)
+            .expect("detect child sysinternals dir");
+
+        assert_eq!(detected, suite);
     }
 
     #[test]

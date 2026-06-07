@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunProfile {
     pub target: ProfileTarget,
     pub timeout_ms: u64,
@@ -21,7 +22,7 @@ impl RunProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProfileTarget {
     Launch {
         executable: PathBuf,
@@ -31,7 +32,7 @@ pub enum ProfileTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProfileCollectorConfig {
     NativeEtw {
         preset: ProfilePreset,
@@ -69,6 +70,7 @@ impl Default for ProfileCollectorConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcmonFilterConfig {
     #[serde(default)]
     pub operations: Vec<String>,

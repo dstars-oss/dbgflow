@@ -8,6 +8,11 @@ use serde_json::json;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+const PROCMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCMON_START_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProcmonRuntime {
@@ -34,7 +39,7 @@ impl ProcmonRuntime {
     pub fn procmon_exe(&self) -> Result<PathBuf> {
         let dir = self.sysinternals_dir.as_ref().ok_or_else(|| {
             DbgFlowError::Backend(
-                "procmon collector requires service --sysinternals-dir".to_string(),
+                "procmon collector is unavailable because this server runtime was not configured with a Sysinternals directory".to_string(),
             )
         })?;
         for name in ["Procmon64.exe", "Procmon.exe"] {
@@ -126,7 +131,7 @@ impl ProfileCollector for ProcmonCollector {
     }
 
     fn start(&self) -> Result<CollectorStart> {
-        self.runner.run(
+        self.runner.start_capture(
             &self.procmon_exe,
             &[
                 OsString::from("/AcceptEula"),
@@ -135,6 +140,7 @@ impl ProfileCollector for ProcmonCollector {
                 OsString::from("/BackingFile"),
                 self.pml_path.as_os_str().to_os_string(),
             ],
+            &self.pml_path,
         )?;
         Ok(CollectorStart {
             warnings: procmon_warnings(self.capture_stacks),
@@ -288,11 +294,56 @@ impl ProcmonCollector {
 
 trait ProcmonCommandRunner: Send + Sync {
     fn run(&self, exe: &Path, args: &[OsString]) -> Result<()>;
+
+    fn start_capture(&self, exe: &Path, args: &[OsString], _pml_path: &Path) -> Result<()> {
+        self.run(exe, args)
+    }
 }
 
 struct ProcessProcmonCommandRunner;
 
 impl ProcmonCommandRunner for ProcessProcmonCommandRunner {
+    fn start_capture(&self, exe: &Path, args: &[OsString], pml_path: &Path) -> Result<()> {
+        let mut child = std::process::Command::new(exe)
+            .args(args)
+            .spawn()
+            .map_err(|error| DbgFlowError::Backend(format!("start procmon: {error}")))?;
+        let deadline = Instant::now() + PROCMON_START_TIMEOUT;
+        let mut exit_status = None;
+        loop {
+            if procmon_backing_file_ready(pml_path) {
+                return Ok(());
+            }
+            if exit_status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        exit_status = Some(status);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        cleanup_procmon_start_failure(exe, &mut child, exit_status.is_none());
+                        return Err(DbgFlowError::Backend(format!(
+                            "query procmon startup status: {error}"
+                        )));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                cleanup_procmon_start_failure(exe, &mut child, exit_status.is_none());
+                let exit_note = exit_status
+                    .map(|status| format!("; procmon launcher exited with status {status}"))
+                    .unwrap_or_default();
+                return Err(DbgFlowError::Backend(format!(
+                    "procmon did not create non-empty backing file {} within {} seconds{}",
+                    pml_path.display(),
+                    PROCMON_START_TIMEOUT.as_secs(),
+                    exit_note
+                )));
+            }
+            thread::sleep(PROCMON_START_POLL_INTERVAL);
+        }
+    }
+
     fn run(&self, exe: &Path, args: &[OsString]) -> Result<()> {
         let output = std::process::Command::new(exe)
             .args(args)
@@ -308,6 +359,37 @@ impl ProcmonCommandRunner for ProcessProcmonCommandRunner {
             String::from_utf8_lossy(&output.stderr)
         )))
     }
+}
+
+fn procmon_backing_file_ready(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
+
+fn cleanup_procmon_start_failure(
+    exe: &Path,
+    child: &mut std::process::Child,
+    child_may_be_running: bool,
+) {
+    let _ = terminate_procmon(exe);
+    if child_may_be_running {
+        let _ = child.kill();
+    }
+}
+
+fn terminate_procmon(exe: &Path) -> Result<()> {
+    let output = std::process::Command::new(exe)
+        .args([OsString::from("/AcceptEula"), OsString::from("/Terminate")])
+        .output()
+        .map_err(|error| DbgFlowError::Backend(format!("terminate procmon: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(DbgFlowError::Backend(format!(
+        "terminate procmon failed with exit code {:?}: {}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 fn procmon_warnings(capture_stacks: bool) -> Vec<String> {
@@ -426,7 +508,45 @@ mod tests {
             .procmon_exe()
             .expect_err("procmon unavailable");
 
-        assert!(error.to_string().contains("--sysinternals-dir"));
+        assert!(error.to_string().contains("Sysinternals directory"));
+    }
+
+    #[test]
+    fn procmon_start_uses_start_capture_runner() {
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-procmon-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let collector = ProcmonCollector {
+            procmon_exe: root.join("Procmon64.exe"),
+            pml_path: root.join("capture.pml"),
+            csv_path: root.join("events.csv"),
+            jsonl_path: root.join("events.jsonl"),
+            stack_xml_path: root.join("events.xml"),
+            summary_path: root.join("summary.json"),
+            capture_stacks: false,
+            filters: Default::default(),
+            runner: Arc::new(StartCaptureRunner),
+        };
+
+        collector.start().expect("start procmon capture");
+
+        assert!(root.join("capture.pml").is_file());
+    }
+
+    #[test]
+    fn procmon_backing_file_ready_requires_non_empty_file() {
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-procmon-readiness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let pml = root.join("capture.pml");
+
+        assert!(!super::procmon_backing_file_ready(&pml));
+        std::fs::write(&pml, b"").expect("write empty pml");
+        assert!(!super::procmon_backing_file_ready(&pml));
+        std::fs::write(&pml, b"pml").expect("write pml");
+        assert!(super::procmon_backing_file_ready(&pml));
     }
 
     #[test]
@@ -529,6 +649,27 @@ mod tests {
                 )
                 .expect("write fake csv");
             }
+            Ok(())
+        }
+    }
+
+    struct StartCaptureRunner;
+
+    impl ProcmonCommandRunner for StartCaptureRunner {
+        fn run(&self, _exe: &std::path::Path, _args: &[OsString]) -> Result<()> {
+            Err(crate::DbgFlowError::Backend(
+                "start should not call blocking run".to_string(),
+            ))
+        }
+
+        fn start_capture(
+            &self,
+            _exe: &std::path::Path,
+            args: &[OsString],
+            pml_path: &std::path::Path,
+        ) -> Result<()> {
+            assert!(args.iter().any(|arg| arg == "/BackingFile"));
+            std::fs::write(pml_path, b"pml").expect("write pml");
             Ok(())
         }
     }

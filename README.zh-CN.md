@@ -112,8 +112,9 @@ Profile 请求示例：
 `procmon` collector 是可选能力，依赖 Sysinternals Process Monitor。通过
 `--sysinternals-dir <path>` 配置 service 或 HTTP runtime；dbgflow 只会从该
 目录中派生 `Procmon64.exe` 或 `Procmon.exe`。如果未配置该参数，依赖
-Sysinternals 的能力会返回明确错误，且不会启动目标进程。dbgflow 不下载
-Procmon、不扫描全盘，也不接受单独的 Procmon exe 路径。Procmon 会写入
+Sysinternals 的能力会返回明确错误，且不会启动目标进程。`run_profile` 请求
+不接受 Sysinternals 路径；这是 server runtime 配置。dbgflow 不下载 Procmon、
+不扫描全盘，也不接受单独的 Procmon exe 路径。Procmon 会写入
 权威 artifact `capture.pml`，并导出 `events.csv` 以及按 target PID /
 operation / path best-effort 过滤后的 `events.jsonl`；请求 stack capture 时，
 dbgflow 也会请求带 stack 数据的 XML 导出。

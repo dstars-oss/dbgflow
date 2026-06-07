@@ -393,7 +393,7 @@ fn run_profile_procmon_without_sysinternals_dir_does_not_launch_target() {
         })
         .expect_err("procmon unavailable");
 
-    assert!(error.to_string().contains("--sysinternals-dir"));
+    assert!(error.to_string().contains("Sysinternals directory"));
 }
 
 #[test]

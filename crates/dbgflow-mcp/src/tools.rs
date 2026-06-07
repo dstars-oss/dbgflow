@@ -204,7 +204,7 @@ impl ToolService {
             ToolDescriptor {
                 name: RUN_PROFILE,
                 description:
-                    "Launch a process and record a native ETW profile trace as a standard ETL artifact.",
+                    "Launch a process and record a native ETW profile trace as a standard ETL artifact. Procmon collectors use the server runtime's configured Sysinternals directory.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -511,6 +511,7 @@ impl From<RunProfileRequest> for RunProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRunProfileRequest {
     target: dbgflow_core::profile::ProfileTarget,
     timeout_ms: u64,
@@ -766,5 +767,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("collectors must contain at least one collector"));
+    }
+
+    #[test]
+    fn run_profile_arguments_reject_top_level_sysinternals_dir() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "sysinternals_dir": "C:\\Sysinternals"
+        });
+
+        let error = decode_arguments::<RunProfileRequest>(value)
+            .expect_err("reject top-level sysinternals_dir");
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("sysinternals_dir"));
+    }
+
+    #[test]
+    fn run_profile_arguments_reject_procmon_sysinternals_dir() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collector": {
+                "kind": "procmon",
+                "sysinternals_dir": "C:\\Sysinternals"
+            }
+        });
+
+        let error = decode_arguments::<RunProfileRequest>(value)
+            .expect_err("reject procmon sysinternals_dir");
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("sysinternals_dir"));
     }
 }
