@@ -128,24 +128,24 @@ function Convert-ToSymbolProxy {
         throw "ProxyUrl credentials are not supported for _NT_SYMBOL_PROXY"
     }
 
-    $host = $null
+    $proxyHost = $null
     $portText = $null
     $symbolHost = $null
     if ($authority -match "^\[(?<host>[^\]]+)\]:(?<port>[0-9]+)$") {
-        $host = $Matches["host"]
+        $proxyHost = $Matches["host"]
         $portText = $Matches["port"]
-        $symbolHost = "[$host]"
+        $symbolHost = "[$proxyHost]"
     }
     elseif ($authority -match "^(?<host>[^:]+):(?<port>[0-9]+)$") {
-        $host = $Matches["host"]
+        $proxyHost = $Matches["host"]
         $portText = $Matches["port"]
-        $symbolHost = $host
+        $symbolHost = $proxyHost
     }
     else {
         throw "ProxyUrl must include host and numeric port"
     }
 
-    if ([string]::IsNullOrWhiteSpace($host)) {
+    if ([string]::IsNullOrWhiteSpace($proxyHost)) {
         throw "ProxyUrl must include host and port"
     }
 
