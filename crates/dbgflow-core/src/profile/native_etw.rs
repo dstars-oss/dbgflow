@@ -18,9 +18,12 @@ impl CollectorFactory for NativeEtwCollectorFactory {
         config: &ProfileCollectorConfig,
         _trace_path: &Path,
     ) -> Result<Box<dyn ProfileCollector>> {
-        if config.kind != ProfileCollectorKind::NativeEtw
-            || config.preset != ProfilePreset::SystemOverview
-        {
+        if !matches!(
+            config,
+            ProfileCollectorConfig::NativeEtw {
+                preset: ProfilePreset::SystemOverview
+            }
+        ) {
             return Err(DbgFlowError::Backend(
                 "unsupported native ETW profile collector configuration".to_string(),
             ));
@@ -34,7 +37,7 @@ impl CollectorFactory for NativeEtwCollectorFactory {
 #[cfg(windows)]
 use super::{
     CollectorFactory, CollectorStart, CollectorStop, ProfileCollector, ProfileCollectorConfig,
-    ProfileCollectorKind, ProfilePreset,
+    ProfilePreset,
 };
 #[cfg(windows)]
 use crate::{DbgFlowError, Result};
@@ -78,9 +81,12 @@ impl CollectorFactory for NativeEtwCollectorFactory {
         config: &ProfileCollectorConfig,
         trace_path: &Path,
     ) -> Result<Box<dyn ProfileCollector>> {
-        if config.kind != ProfileCollectorKind::NativeEtw
-            || config.preset != ProfilePreset::SystemOverview
-        {
+        if !matches!(
+            config,
+            ProfileCollectorConfig::NativeEtw {
+                preset: ProfilePreset::SystemOverview
+            }
+        ) {
             return Err(DbgFlowError::Backend(
                 "unsupported native ETW profile collector configuration".to_string(),
             ));

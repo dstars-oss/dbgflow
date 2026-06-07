@@ -9,7 +9,8 @@ pub use collector::{CollectorFactory, CollectorStart, CollectorStop, ProfileColl
 pub use id::ProfileId;
 pub use manager::ProfileManager;
 pub use model::{
-    ProfileArtifacts, ProfileCollectorConfig, ProfileCollectorKind, ProfileCompletionReason,
-    ProfilePreset, ProfileResult, ProfileStatus, ProfileTarget, RunProfile,
+    ProcmonFilterConfig, ProfileArtifacts, ProfileCollectorConfig, ProfileCollectorKind,
+    ProfileCollectorResult, ProfileCollectorStatus, ProfileCompletionReason, ProfilePreset,
+    ProfileResult, ProfileStatus, ProfileTarget, RunProfile,
 };
 pub use target::{validate_profile_target, ProcessTargetRunner, TargetExit, TargetRunner};

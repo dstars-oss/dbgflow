@@ -21,7 +21,7 @@ fn native_etw_run_profile_writes_etl_for_cmd() {
                 args: vec!["/C".to_string(), "echo dbgflow-etw".to_string()],
             },
             timeout_ms: 10_000,
-            collector: ProfileCollectorConfig::default(),
+            collectors: vec![ProfileCollectorConfig::default()],
         })
         .expect("run profile");
 

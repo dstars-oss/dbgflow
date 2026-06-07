@@ -435,7 +435,7 @@ impl From<RunProfileRequest> for RunProfile {
         Self {
             target: value.target,
             timeout_ms: value.timeout_ms,
-            collector: value.collector,
+            collectors: vec![value.collector],
         }
     }
 }
@@ -546,7 +546,12 @@ mod tests {
 
         let request: RunProfileRequest = decode_arguments(value).expect("decode request");
         assert_eq!(request.timeout_ms, 1000);
-        assert_eq!(request.collector.kind, ProfileCollectorKind::NativeEtw);
-        assert_eq!(request.collector.preset, ProfilePreset::SystemOverview);
+        assert_eq!(request.collector.kind(), ProfileCollectorKind::NativeEtw);
+        assert!(matches!(
+            request.collector,
+            ProfileCollectorConfig::NativeEtw {
+                preset: ProfilePreset::SystemOverview
+            }
+        ));
     }
 }

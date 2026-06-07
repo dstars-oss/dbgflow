@@ -43,12 +43,22 @@ impl ProfileManager {
 
     pub fn run_profile(&self, mut request: RunProfile) -> Result<ProfileResult> {
         request.target = validate_profile_target(request.target)?;
+        request = request.with_default_collectors();
         if request.timeout_ms == 0 {
             return Err(DbgFlowError::Backend(
                 "profile timeout_ms must be greater than zero".to_string(),
             ));
         }
-        if request.collector.kind != ProfileCollectorKind::NativeEtw {
+        if request.collectors.len() != 1 {
+            return Err(DbgFlowError::Backend(
+                "parallel profile collectors are not implemented yet".to_string(),
+            ));
+        }
+        let collector_config = request
+            .collectors
+            .first()
+            .expect("default collector ensured above");
+        if collector_config.kind() != ProfileCollectorKind::NativeEtw {
             return Err(DbgFlowError::Backend(
                 "unsupported profile collector kind".to_string(),
             ));
@@ -102,7 +112,7 @@ impl ProfileManager {
         self.record_event(profile_id, "collector_starting", None, None, Map::new());
         let collector = self
             .collector_factory
-            .create(&request.collector, &trace_path)?;
+            .create(collector_config, &trace_path)?;
         let mut warnings = collector.start(&profile_dir)?.warnings;
         self.record_event(
             profile_id,
@@ -204,12 +214,13 @@ impl ProfileManager {
             target_exit_code,
             duration_ms,
             artifacts: ProfileArtifacts {
-                trace: trace_artifact,
+                trace: Some(trace_artifact),
                 profile: metadata_artifact,
                 events: events_artifact,
                 stdout: stdout_artifact,
                 stderr: stderr_artifact,
             },
+            collector_results: Vec::new(),
             warnings,
             error,
         };
@@ -244,7 +255,7 @@ impl ProfileManager {
             "status": status,
             "completion_reason": completion_reason,
             "target_exit_code": target_exit_code,
-            "collector": request.collector,
+            "collectors": request.collectors,
             "trace": trace_artifact.path,
             "warnings": warnings,
             "error": error,

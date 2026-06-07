@@ -60,8 +60,54 @@ fn profile_launch_target_canonicalizes_existing_executable_and_rejects_nul_args(
 fn default_profile_collector_is_native_etw_system_overview() {
     let config = ProfileCollectorConfig::default();
 
-    assert_eq!(config.kind, ProfileCollectorKind::NativeEtw);
-    assert_eq!(config.preset, ProfilePreset::SystemOverview);
+    assert_eq!(config.kind(), ProfileCollectorKind::NativeEtw);
+    assert!(matches!(
+        config,
+        ProfileCollectorConfig::NativeEtw {
+            preset: ProfilePreset::SystemOverview
+        }
+    ));
+}
+
+#[test]
+fn default_run_profile_collectors_is_native_etw_system_overview() {
+    let request = RunProfile {
+        target: ProfileTarget::Launch {
+            executable: std::env::current_exe().expect("current exe"),
+            args: Vec::new(),
+        },
+        timeout_ms: 1000,
+        collectors: Vec::new(),
+    }
+    .with_default_collectors();
+
+    assert_eq!(request.collectors.len(), 1);
+    assert!(matches!(
+        request.collectors[0],
+        ProfileCollectorConfig::NativeEtw {
+            preset: ProfilePreset::SystemOverview
+        }
+    ));
+}
+
+#[test]
+fn procmon_collector_config_defaults_to_no_stacks_and_empty_filters() {
+    let config = ProfileCollectorConfig::Procmon {
+        capture_stacks: false,
+        filters: Default::default(),
+    };
+
+    assert_eq!(config.kind(), ProfileCollectorKind::Procmon);
+    let ProfileCollectorConfig::Procmon {
+        capture_stacks,
+        filters,
+    } = config
+    else {
+        panic!("expected procmon config");
+    };
+    assert!(!capture_stacks);
+    assert!(filters.operations.is_empty());
+    assert!(filters.paths.is_empty());
 }
 
 #[test]
@@ -186,7 +232,7 @@ fn run_profile_starts_collector_launches_target_stops_collector_and_writes_artif
             args: Vec::new(),
         },
         timeout_ms: 1000,
-        collector: ProfileCollectorConfig::default(),
+        collectors: vec![ProfileCollectorConfig::default()],
     };
 
     let result = manager.run_profile(request).expect("run profile");
@@ -198,7 +244,15 @@ fn run_profile_starts_collector_launches_target_stops_collector_and_writes_artif
     );
     assert_eq!(result.target_pid, Some(1234));
     assert_eq!(result.target_exit_code, Some(7));
-    assert_eq!(result.artifacts.trace.kind, ArtifactKind::ProfileTrace);
+    assert_eq!(
+        result
+            .artifacts
+            .trace
+            .as_ref()
+            .expect("legacy trace artifact")
+            .kind,
+        ArtifactKind::ProfileTrace
+    );
     assert!(result.artifacts.profile.path.is_file());
     assert!(result.artifacts.events.path.is_file());
     assert!(result.artifacts.stdout.path.is_file());
@@ -236,7 +290,7 @@ fn run_profile_timeout_stops_collector_without_target_exit_code() {
                 args: Vec::new(),
             },
             timeout_ms: 1,
-            collector: ProfileCollectorConfig::default(),
+            collectors: vec![ProfileCollectorConfig::default()],
         })
         .expect("run profile");
 
@@ -266,7 +320,7 @@ fn run_profile_collector_start_failure_does_not_launch_target() {
                 args: Vec::new(),
             },
             timeout_ms: 1,
-            collector: ProfileCollectorConfig::default(),
+            collectors: vec![ProfileCollectorConfig::default()],
         })
         .expect_err("collector start fails");
 
@@ -332,7 +386,7 @@ fn run_profile_rejects_concurrent_profile_job() {
             args: Vec::new(),
         },
         timeout_ms: 1000,
-        collector: ProfileCollectorConfig::default(),
+        collectors: vec![ProfileCollectorConfig::default()],
     };
     let first_manager = manager.clone();
     let first_request = request.clone();
@@ -369,7 +423,7 @@ fn target_launch_failure_after_collector_start_returns_failed_result_and_stops_c
                 args: Vec::new(),
             },
             timeout_ms: 1000,
-            collector: ProfileCollectorConfig::default(),
+            collectors: vec![ProfileCollectorConfig::default()],
         })
         .expect("failed profile result");
 
@@ -412,7 +466,7 @@ fn run_profile_allows_new_job_after_failed_profile() {
             args: Vec::new(),
         },
         timeout_ms: 1000,
-        collector: ProfileCollectorConfig::default(),
+        collectors: vec![ProfileCollectorConfig::default()],
     };
 
     let first = manager
