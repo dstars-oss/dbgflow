@@ -214,7 +214,7 @@ where
             continue;
         }
         if let Some(value) = arg.strip_prefix("--service-name=") {
-            service_name = parse_non_empty(value, "--service-name")?;
+            service_name = parse_service_name(value)?;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--proxy-url=") {
@@ -233,7 +233,7 @@ where
             }
             "--service-name" => {
                 let value = next_value(&mut args, "--service-name")?;
-                service_name = parse_non_empty(&value, "--service-name")?;
+                service_name = parse_service_name(&value)?;
             }
             "--proxy-url" => {
                 let value = next_value(&mut args, "--proxy-url")?;
@@ -306,7 +306,7 @@ where
             .map_err(|_| "arguments must be valid UTF-8".to_string())?;
 
         if let Some(value) = arg.strip_prefix("--service-name=") {
-            service_name = parse_non_empty(value, "--service-name")?;
+            service_name = parse_service_name(value)?;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--display-name=") {
@@ -324,7 +324,7 @@ where
         match arg.as_str() {
             "--service-name" => {
                 let value = next_value(&mut args, "--service-name")?;
-                service_name = parse_non_empty(&value, "--service-name")?;
+                service_name = parse_service_name(&value)?;
             }
             "--display-name" => {
                 let value = next_value(&mut args, "--display-name")?;
@@ -374,7 +374,7 @@ where
             .map_err(|_| "arguments must be valid UTF-8".to_string())?;
 
         if let Some(value) = arg.strip_prefix("--service-name=") {
-            service_name = parse_non_empty(value, "--service-name")?;
+            service_name = parse_service_name(value)?;
             continue;
         }
         if let Some(value) = arg.strip_prefix("--install-root=") {
@@ -385,7 +385,7 @@ where
         match arg.as_str() {
             "--service-name" => {
                 let value = next_value(&mut args, "--service-name")?;
-                service_name = parse_non_empty(&value, "--service-name")?;
+                service_name = parse_service_name(&value)?;
             }
             "--install-root" => {
                 let value = next_value(&mut args, "--install-root")?;
@@ -461,6 +461,20 @@ fn parse_non_empty(value: &str, option: &str) -> Result<String, String> {
         return Err(format!("{option} must not be empty"));
     }
     Ok(value.to_string())
+}
+
+fn parse_service_name(value: &str) -> Result<String, String> {
+    let service_name = parse_non_empty(value, "--service-name")?;
+    if service_name
+        .chars()
+        .any(|ch| matches!(ch, '/' | '\\' | '*' | '?' | '[' | ']') || ch.is_control())
+    {
+        return Err(
+            "--service-name must not contain path separators, wildcards, or control characters"
+                .to_string(),
+        );
+    }
+    Ok(service_name)
 }
 
 fn parse_bind(value: &str) -> Result<SocketAddr, String> {
@@ -906,6 +920,57 @@ mod tests {
             assert!(!arg.starts_with("--proxy-url="));
             assert_ne!(arg, "--no-proxy");
         }
+    }
+
+    #[test]
+    fn service_install_rejects_invalid_service_names() {
+        for service_name in [
+            "bad\\name",
+            "bad/name",
+            "bad*name",
+            "bad?name",
+            "bad[name]",
+            "bad\u{81}name",
+        ] {
+            let error = parse_service_install_options([
+                OsString::from("--service-name"),
+                OsString::from(service_name),
+                OsString::from("--install-root=C:\\dbgflow"),
+            ])
+            .expect_err("reject invalid service name");
+
+            assert!(
+                error.contains("--service-name"),
+                "unexpected error for {service_name:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_process_rejects_invalid_service_name() {
+        let error = parse_service_process_options_with_env(
+            [
+                OsString::from("--service-name"),
+                OsString::from("bad\\name"),
+                OsString::from("--data-dir=C:\\dbgflow\\var"),
+            ],
+            &env(&[]),
+        )
+        .expect_err("reject invalid service name");
+
+        assert!(error.contains("--service-name"));
+    }
+
+    #[test]
+    fn service_uninstall_rejects_invalid_service_name() {
+        let error = parse_service_uninstall_options([
+            OsString::from("--service-name"),
+            OsString::from("bad*name"),
+            OsString::from("--install-root=C:\\dbgflow"),
+        ])
+        .expect_err("reject invalid service name");
+
+        assert!(error.contains("--service-name"));
     }
 
     #[test]

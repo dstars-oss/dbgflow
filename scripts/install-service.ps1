@@ -10,6 +10,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$proxyUrlWasBound = $PSBoundParameters.ContainsKey("ProxyUrl")
 
 function Convert-ToPowerShellLiteral {
     param([AllowNull()][string]$Value)
@@ -37,9 +38,13 @@ if (-not (Test-IsAdministrator)) {
         (Convert-ToPowerShellLiteral -Value $Bind)
         "-InstallRoot"
         (Convert-ToPowerShellLiteral -Value $InstallRoot)
-        "-ProxyUrl"
-        (Convert-ToPowerShellLiteral -Value $ProxyUrl)
     )
+    if ($proxyUrlWasBound) {
+        $command += @(
+            "-ProxyUrl"
+            (Convert-ToPowerShellLiteral -Value $ProxyUrl)
+        )
+    }
     if ($NoProxy) {
         $command += "-NoProxy"
     }
@@ -52,6 +57,10 @@ if (-not (Test-IsAdministrator)) {
         $encodedCommand
     )
     exit $process.ExitCode
+}
+
+if ($NoProxy -and $proxyUrlWasBound) {
+    throw "-NoProxy and -ProxyUrl cannot be used together."
 }
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
