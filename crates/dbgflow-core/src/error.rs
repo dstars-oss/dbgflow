@@ -17,9 +17,6 @@ pub enum DbgFlowError {
     #[error("session is closed: {0}")]
     SessionClosed(SessionId),
 
-    #[error("command denied by policy: {command}; reason: {reason}")]
-    CommandDenied { command: String, reason: String },
-
     #[error("artifact error: {0}")]
     Artifact(String),
 }

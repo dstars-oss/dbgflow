@@ -55,7 +55,6 @@ fn dbgeng_can_attach_to_process_and_query_modules() {
 #[ignore = "live DbgEng process debugging is environment-sensitive; run explicitly when validating launch"]
 fn dbgeng_can_launch_process_and_continue_to_exit() {
     let _guard = live_debug_lock().lock().expect("live debug test lock");
-    let _launch_env = EnvVarGuard::set("DBGFLOW_ENABLE_LAUNCH", "1");
     let ping = ping_exe();
     let artifact_root = test_artifact_root("dbgeng-launch");
     let manager = dbgeng_manager(&artifact_root);
@@ -152,29 +151,6 @@ fn wait_for_break(
             "session did not break: {session:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = &self.previous {
-            std::env::set_var(self.key, previous);
-        } else {
-            std::env::remove_var(self.key);
-        }
     }
 }
 

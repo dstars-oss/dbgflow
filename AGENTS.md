@@ -13,7 +13,7 @@ dbgflow 是面向 Windows 调试自动化的 MCP server / skills 工具链。
 * 管理调试 session 生命周期。
 * 对外暴露安全、可审计的调试工具接口。
 * 对内适配 Windows 调试后端。
-* 支持受控文本调试命令和受控高级调试能力。
+* 支持可信本机环境中的原生文本调试命令和受控高级调试能力。
 * 管理调试日志、输出和 artifacts。
 
 本项目不是 shell wrapper，也不是无限制本地命令执行器。
@@ -25,7 +25,7 @@ dbgflow 是面向 Windows 调试自动化的 MCP server / skills 工具链。
 ```text
 MCP Tool Layer
   -> Session Manager
-  -> Policy Layer
+  -> Target Validation
   -> Artifact Manager
   -> DebugBackend
 ```
@@ -35,7 +35,7 @@ MCP Tool Layer
 * MCP tool 表达调试意图，不直接绑定具体后端。
 * 调试后端必须通过 `DebugBackend` 抽象接入。
 * backend 选择属于内部实现细节，不作为常规公开 tool 暴露。
-* tool handler 保持薄层，业务逻辑放入 session / backend / policy / artifacts 等核心层。
+* tool handler 保持薄层，业务逻辑放入 session / backend / validation / artifacts 等核心层。
 * 新增能力优先扩展抽象层和核心层，不在 tool handler 中堆积逻辑。
 
 ## 3. Tool API 原则
@@ -61,13 +61,13 @@ continue_until_event
 break_execution
 ```
 
-谨慎开放文本命令接口，例如：
+文本命令接口用于可信本机调试，例如：
 
 ```text
 eval
 ```
 
-文本命令接口必须经过 policy 检查。不得默认提供无限制 debugger command、shell、脚本或文件访问能力。
+`eval` 透传原生 debugger command，除空命令外不做 denylist 过滤；调用方必须把它视为可信本机能力。
 
 工具返回应包含 session 状态、结果、warnings 和 artifact 引用。`eval` 可以返回调试器原始输出，但必须同时写入 artifact 并记录审计信息。
 
@@ -100,19 +100,17 @@ Error
 
 ## 5. 安全规则
 
-本项目会访问进程、dump、trace、符号、扩展 DLL 和调试输出，默认按敏感能力处理。
+本项目会访问进程、dump、trace、符号和调试输出，默认按敏感能力处理。
 
-默认禁止：
+默认安全边界：
 
 ```text
-.shell
-任意 .load
-任意 .scriptload
-任意脚本文件执行
-任意 dump 写出
-任意内存写出
-任意外部进程执行
-任意未授权路径访问
+HTTP 仅绑定 loopback
+HTTP 拒绝非 localhost Origin
+运行时必须显式传入 --data-dir
+每个真实 session 使用独立 worker 子进程
+同一 session 内操作串行化
+所有 eval 输出写入 artifact
 ```
 
 要求：
@@ -122,22 +120,21 @@ Error
 * 不允许默认访问任意用户目录。
 * artifacts 必须位于受控 workspace。
 * dump、TTD trace、transcript 和内存输出均视为敏感数据。
-* 如需支持扩展加载，必须通过专门接口，并限制为 allowlisted extension。
+* `eval` 可以执行原生调试器命令，包括具备文件、脚本或进程副作用的命令；仅应在可信本机环境使用。
 
 ## 6. 文本命令规则
 
-文本命令能力用于兼容 WinDbg 命令生态，但必须受控。
+文本命令能力用于兼容 WinDbg 命令生态。
 
 要求：
 
-* 当前默认使用 denylist policy，后续可按能力收紧为 allowlist。
-* 对危险命令使用 denylist。
+* 除空命令外，`eval` 原样传递命令给调试后端。
 * 区分查询命令与运行控制命令。
 * 记录原始命令、输出、状态变化和错误。
 * 对输出大小设置限制。
 * 完整输出写入 artifact；当前 `eval` 响应返回完整输出和 artifact 引用。
 
-允许命令优先是查询类，例如：
+常用命令示例：
 
 ```text
 !analyze -v
@@ -154,8 +151,6 @@ r
 .sympath
 dx
 ```
-
-危险命令不得通过普通文本接口开放。
 
 ## 7. Artifacts 与日志
 
@@ -198,11 +193,10 @@ crates/
 
 要求：
 
-* `dbgflow-core` 承载 session、backend、policy、artifacts、error 等核心逻辑。
+* `dbgflow-core` 承载 session、backend、validation、artifacts、error 等核心逻辑。
 * `dbgflow-mcp` 承载 MCP-facing tool facade，不污染核心层。
 * backend 实现不得污染 MCP schema。
-* policy 逻辑集中管理。
-* path 处理集中管理。
+* target/path 处理集中管理。
 * error type 应明确，不滥用字符串错误。
 * 异步任务必须有关闭和清理路径。
 
@@ -214,8 +208,7 @@ crates/
 * session 状态转换
 * 同 session 命令串行化
 * 多 session 并发
-* command policy
-* path policy
+* target/path validation
 * artifact 写入
 * timeout
 * 后端错误处理

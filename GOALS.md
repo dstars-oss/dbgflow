@@ -15,7 +15,7 @@ dbgflow
 
 ## 2. 项目愿景
 
-构建一套面向 Windows 的自动化调试 MCP server / skills 工具链，使 AI agent 能够安全、稳定、可追踪地执行调试任务，包括 dump 分析、进程 attach、程序 launch、异常分析、栈分析、模块分析、符号分析、插件调用，以及未来的 TTD 时间旅行调试。
+构建一套面向 Windows 的自动化调试 MCP server / skills 工具链，使 AI agent 能够安全、稳定、可追踪地执行调试任务，包括 dump 分析、进程 attach、程序 launch、异常分析、栈分析、模块分析、符号分析，以及未来的 TTD 时间旅行调试。
 
 项目目标不是简单封装命令行调试器，而是构建一个可持续演进的调试编排平台。
 
@@ -51,26 +51,23 @@ dbgflow
 lm
 .reload
 dx
-!custom_extension.command
 ```
 
 文本接口用于：
 
 * 复用现有 WinDbg 知识。
-* 复用调试器扩展。
 * 方便专家介入。
 * 支持快速 MVP。
 
 ### G4. 安全可控的调试执行
 
-所有调试能力必须经过权限策略控制：
+调试能力面向可信本机环境，必须保留清晰的运行边界和审计链路：
 
-* 默认禁止危险命令。
 * 外部输入路径必须校验、规范化并记录。
-* 插件加载必须 allowlist。
 * dump、trace、transcript 视为敏感文件。
 * 所有工具调用必须可审计。
 * 所有 session 必须可关闭、可清理、可追踪。
+* HTTP transport 必须保持 loopback-only。
 
 ### G5. 支持 TTD 时间旅行调试
 
@@ -94,7 +91,6 @@ TTD trace 必须作为敏感 artifact 管理。
 * 支持 kernel debugging。
 * 自动修复所有 bug。
 * 对未校验或未记录的任意本地路径开放调试器能力。
-* 将 AI agent 暴露为不受限制的 shell。
 * 默认上传 dump、trace 或内存内容到外部服务。
 
 这些能力如需引入，必须单独设计和评审。
@@ -108,7 +104,7 @@ Rust MCP Server
   |
   |-- MCP Tool Layer
   |-- Session Manager
-  |-- Policy Layer
+  |-- Target Validation
   |-- Artifact Manager
   |-- SessionWorker launcher
         |
@@ -149,16 +145,7 @@ Rust MCP Server
 * 支持 WaitForEvent。
 * 支持 Close / EndSession。
 
-### M2. Extension 管理
-
-支持受控加载调试扩展：
-
-* extension allowlist
-* extension path sandbox
-* extension command policy
-* extension output capture
-
-### M3. TTD Recorder
+### M2. TTD Recorder
 
 支持：
 
@@ -167,7 +154,7 @@ Rust MCP Server
 * record monitor
 * trace artifact 管理
 
-### M4. TTD Analyzer
+### M3. TTD Analyzer
 
 支持：
 
@@ -177,7 +164,7 @@ Rust MCP Server
 * navigate positions
 * query memory access
 
-### M5. 报告生成
+### M4. 报告生成
 
 支持生成调试报告：
 
@@ -199,21 +186,20 @@ Rust MCP Server
 原因：
 
 * 兼容 WinDbg 命令生态。
-* 复用现有扩展。
 * 方便专家用户。
 * 有利于快速 MVP。
 
-### D-002: 不默认开放任意命令
+### D-002: eval 透传原生调试命令
 
 决定：
 
-文本命令接口必须经过 policy 检查。
+`eval` 除空命令外透传原生 WinDbg / DbgEng 命令。
 
 原因：
 
-* 调试器命令能力过强。
-* 可能访问文件、加载 DLL、执行脚本或影响进程。
-* MCP tool 会被 agent 调用，必须有安全边界。
+* 兼容 WinDbg 命令生态和专家工作流。
+* 避免维护不完整 denylist 造成误判。
+* 本项目当前定位为可信本机调试工具，主要边界是 loopback HTTP、worker 隔离、显式 data-dir 和 artifacts 审计。
 
 ### D-003: 运行控制单独建模
 
@@ -272,7 +258,7 @@ Rust MCP Server
 
 原因：
 
-* DbgEng、符号加载或扩展命令可能长期阻塞且无法可靠中断线程。
+* DbgEng、符号加载或运行控制命令可能长期阻塞且无法可靠中断线程。
 * 子进程是更可靠的调试 session 隔离和回收边界。
 * 主进程可以继续处理 MCP 消息、维护状态和关闭其他 session。
 * artifacts 和日志仍由主进程统一写入，便于审计和后续 redaction。
@@ -289,7 +275,7 @@ Rust MCP Server
 * [x] 定义 `SessionManager`。
 * [x] 实现测试用 fake worker。
 * [x] 实现基础 artifact manager。
-* [x] 实现 command policy 框架。
+* [x] 实现基础命令审计和 artifact 写入。
 
 ### P1
 
@@ -313,9 +299,8 @@ Rust MCP Server
 
 ### P3
 
-* [x] 明确本地 HTTP 不使用 token / auth，依赖 loopback-only bind、Origin 限制和 policy 层。
+* [x] 明确本地 HTTP 不使用 token / auth，依赖 loopback-only bind、Origin 限制和可信本机环境。
 * [x] 支持 Streamable HTTP SSE stream。
-* [ ] 支持 extension allowlist。
 * [ ] 支持 TTD recording。
 * [ ] 支持 TTD trace artifact。
 * [ ] 支持调试报告生成。
@@ -325,10 +310,10 @@ Rust MCP Server
 下一轮建议执行顺序：
 
 ```text
-1. 增强 command policy 的参数、安全边界和测试覆盖
+1. 增强 target/path validation、安全边界和测试覆盖
 2. 继续在更多真实目标上验证 live attach / launch ignored integration tests
 3. 完善 transcript.log / events.jsonl 的 redaction 与报告消费格式
-4. 扩展受控 extension allowlist
+4. 支持调试报告生成 MVP
 5. 在状态机稳定后扩展 breakpoint / step / break_execution 等运行控制
 ```
 

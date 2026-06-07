@@ -79,7 +79,7 @@ impl ToolService {
                                         "kind": { "type": "string", "const": "launch" },
                                         "executable": {
                                             "type": "string",
-                                            "description": "Path to a local executable. Disabled unless DBGFLOW_ENABLE_LAUNCH=1."
+                                            "description": "Path to a local executable."
                                         },
                                         "args": {
                                             "type": "array",
@@ -138,7 +138,7 @@ impl ToolService {
             },
             ToolDescriptor {
                 name: EVAL,
-                description: "Evaluate a debugger command in a session. Dangerous commands are denied by policy.",
+                description: "Evaluate a native debugger command in a session.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -148,7 +148,7 @@ impl ToolService {
                         },
                         "command": {
                             "type": "string",
-                            "description": "Debugger command. Dangerous commands and command separators are denied by policy."
+                            "description": "Native debugger command."
                         }
                     },
                     "required": ["session_id", "command"],
@@ -157,7 +157,7 @@ impl ToolService {
             },
             ToolDescriptor {
                 name: SET_SYMBOLS,
-                description: "Set or append debugger symbol paths after validating local paths.",
+                description: "Set or append a native debugger symbol path.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -169,7 +169,7 @@ impl ToolService {
                             "type": "array",
                             "items": { "type": "string" },
                             "minItems": 1,
-                            "description": "Local symbol directories."
+                            "description": "Debugger symbol path entries. Raw WinDbg symbol path strings are accepted."
                         },
                         "append": {
                             "type": "boolean",
@@ -211,29 +211,7 @@ impl ToolService {
     }
 
     pub fn set_symbols(&self, request: SetSymbolsRequest) -> Result<EvalSessionResult> {
-        let mut validated = Vec::with_capacity(request.paths.len());
-        for path in request.paths {
-            let path_text = path.to_string_lossy();
-            if path_text.chars().any(|ch| {
-                matches!(ch, ';' | '\r' | '\n' | '\u{2028}' | '\u{2029}') || ch.is_control()
-            }) {
-                return Err(DbgFlowError::Backend(format!(
-                    "symbol path contains unsupported control or command separator characters: {}",
-                    path.display()
-                )));
-            }
-            let path = path
-                .canonicalize()
-                .map_err(|error| DbgFlowError::Backend(format!("invalid symbol path: {error}")))?;
-            if !path.is_dir() {
-                return Err(DbgFlowError::Backend(format!(
-                    "symbol path is not a directory: {}",
-                    path.display()
-                )));
-            }
-            validated.push(path);
-        }
-        if validated.is_empty() {
+        if request.paths.is_empty() {
             return Err(DbgFlowError::Backend(
                 "at least one symbol path is required".to_string(),
             ));
@@ -241,11 +219,25 @@ impl ToolService {
 
         let append = request.append.unwrap_or(false);
         let mut result = None;
-        for (index, path) in validated.iter().enumerate() {
+        for (index, path) in request.paths.iter().enumerate() {
+            let path = path.as_os_str().to_string_lossy();
+            if path.trim().is_empty() {
+                return Err(DbgFlowError::Backend(
+                    "symbol path must not be empty".to_string(),
+                ));
+            }
+            if path
+                .chars()
+                .any(|ch| matches!(ch, '\r' | '\n' | '\u{2028}' | '\u{2029}') || ch.is_control())
+            {
+                return Err(DbgFlowError::Backend(
+                    "symbol path contains unsupported control characters".to_string(),
+                ));
+            }
             let command = if append || index > 0 {
-                format!(".sympath+ {}", path.display())
+                format!(".sympath+ {path}")
             } else {
-                format!(".sympath {}", path.display())
+                format!(".sympath {path}")
             };
             result = Some(self.eval(EvalRequest {
                 session_id: request.session_id,

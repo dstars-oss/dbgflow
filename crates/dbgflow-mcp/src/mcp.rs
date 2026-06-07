@@ -111,7 +111,7 @@ impl McpServer {
                 "name": "dbgflow",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Use dbgflow tools to create debug sessions and run denylist-protected debugger commands."
+            "instructions": "Use dbgflow tools to create debug sessions and run audited native debugger commands in trusted local environments."
         }))
     }
 
@@ -466,6 +466,95 @@ mod tests {
     }
 
     #[test]
+    fn tools_call_set_symbols_accepts_raw_symbol_path() {
+        let server = test_server();
+        let dump_path = test_dump_path("mcp-set-symbols-raw");
+        let create_response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_session",
+                    "arguments": {
+                        "target": { "kind": "dump", "path": dump_path }
+                    }
+                }
+            }))
+            .expect("create response");
+
+        let session = tool_text_json(&create_response);
+        let session_id = session["id"].as_str().expect("session id");
+        wait_for_break(&server, session_id);
+
+        let symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols";
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_symbols",
+                    "arguments": {
+                        "session_id": session_id,
+                        "paths": [symbol_path]
+                    }
+                }
+            }))
+            .expect("set symbols response");
+
+        let result = tool_text_json(&response);
+        assert!(result["output"]
+            .as_str()
+            .expect("output")
+            .contains(&format!(".sympath {symbol_path}")));
+    }
+
+    #[test]
+    fn tools_call_set_symbols_rejects_line_separators() {
+        let server = test_server();
+        let dump_path = test_dump_path("mcp-set-symbols-line-separator");
+        let create_response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_session",
+                    "arguments": {
+                        "target": { "kind": "dump", "path": dump_path }
+                    }
+                }
+            }))
+            .expect("create response");
+
+        let session = tool_text_json(&create_response);
+        let session_id = session["id"].as_str().expect("session id");
+        wait_for_break(&server, session_id);
+
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_symbols",
+                    "arguments": {
+                        "session_id": session_id,
+                        "paths": ["srv*C:\\symbols\r\n.shell dir"]
+                    }
+                }
+            }))
+            .expect("set symbols response");
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool error text")
+            .contains("symbol path contains unsupported control characters"));
+    }
+
+    #[test]
     fn tools_call_returns_protocol_error_for_unknown_tool() {
         let server = test_server();
         let response = server
@@ -559,9 +648,9 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_returns_tool_error_for_execution_failure() {
+    fn tools_call_returns_tool_error_for_empty_eval_command() {
         let server = test_server();
-        let dump_path = test_dump_path("mcp-policy");
+        let dump_path = test_dump_path("mcp-empty-command");
         let create_response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
@@ -585,7 +674,7 @@ mod tests {
                     "name": "eval",
                     "arguments": {
                         "session_id": session_id,
-                        "command": ".shell dir"
+                        "command": " "
                     }
                 }
             }))
@@ -595,7 +684,7 @@ mod tests {
         assert!(response["result"]["content"][0]["text"]
             .as_str()
             .expect("tool error text")
-            .contains("command denied"));
+            .contains("empty command"));
     }
 
     #[test]

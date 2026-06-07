@@ -7,7 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::Duration;
 
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +363,11 @@ mod tests {
         )));
         assert!(!content_type_is_json(Some(&"text/plain".to_string())));
         assert!(!content_type_is_json(None));
+    }
+
+    #[test]
+    fn request_body_limit_is_sixteen_mib() {
+        assert_eq!(super::MAX_REQUEST_BYTES, 16 * 1024 * 1024);
     }
 
     #[test]

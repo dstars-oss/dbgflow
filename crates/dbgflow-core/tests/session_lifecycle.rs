@@ -222,15 +222,54 @@ fn session_eval_writes_output_artifact() {
 }
 
 #[test]
-fn eval_rejects_denied_command() {
-    let root = test_artifact_root("deny-command");
+fn eval_passes_native_debugger_commands_without_filtering() {
+    let root = test_artifact_root("native-command");
     let manager = SessionManager::with_worker_launcher(
         Arc::new(TestWorkerLauncher::new(WorkerBehavior::Normal)),
         &root,
     );
     let session = manager
         .create_session(CreateSession {
-            target: test_dump_target("deny-command-target"),
+            target: test_dump_target("native-command-target"),
+            startup_timeout_ms: None,
+        })
+        .expect("create session");
+    let session = wait_for_break(&manager, session.id);
+
+    let command = ".shell dir; .load evil.dll\n$>< C:\\temp\\commands.txt";
+    let result = manager
+        .eval(EvalSession {
+            session_id: session.id,
+            command: command.to_string(),
+            timeout_ms: None,
+        })
+        .expect("pass native command");
+
+    let session_dir = root.join("sessions").join(session.id.to_string());
+    let commands = read_jsonl(&session_dir.join("commands.jsonl"));
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["command"], command);
+    assert_eq!(commands[0]["status"], "Finished");
+    assert!(result.output.contains(command));
+    let output = fs::read_to_string(result.artifact.path).expect("read command output");
+    assert!(output.contains(command));
+    let events = read_jsonl(&session_dir.join("events.jsonl"));
+    assert!(events.iter().any(|event| event["event"] == "eval_finished"));
+    let transcript =
+        fs::read_to_string(session_dir.join("transcript.log")).expect("read transcript");
+    assert!(transcript.contains(command));
+}
+
+#[test]
+fn eval_rejects_empty_command() {
+    let root = test_artifact_root("empty-command");
+    let manager = SessionManager::with_worker_launcher(
+        Arc::new(TestWorkerLauncher::new(WorkerBehavior::Normal)),
+        &root,
+    );
+    let session = manager
+        .create_session(CreateSession {
+            target: test_dump_target("empty-command-target"),
             startup_timeout_ms: None,
         })
         .expect("create session");
@@ -238,28 +277,28 @@ fn eval_rejects_denied_command() {
     let error = manager
         .eval(EvalSession {
             session_id: session.id,
-            command: ".shell dir".to_string(),
+            command: " \t ".to_string(),
             timeout_ms: None,
         })
-        .expect_err("deny shell");
+        .expect_err("reject empty command");
 
-    assert!(error.to_string().contains("command denied"));
+    assert!(error.to_string().contains("empty command"));
 
     let session_dir = root.join("sessions").join(session.id.to_string());
     let commands = read_jsonl(&session_dir.join("commands.jsonl"));
     assert!(commands.iter().any(|command| {
-        command["command"] == ".shell dir"
+        command["command"] == " \t "
             && command["status"] == "Rejected"
             && command["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("command denied"))
+                .is_some_and(|error| error.contains("empty command"))
     }));
     let events = read_jsonl(&session_dir.join("events.jsonl"));
     assert!(events.iter().any(|event| event["event"] == "eval_rejected"));
     let transcript =
         fs::read_to_string(session_dir.join("transcript.log")).expect("read transcript");
     assert!(transcript.contains("eval rejected"));
-    assert!(transcript.contains(".shell dir"));
+    assert!(transcript.contains("empty command"));
 }
 
 #[test]
@@ -304,6 +343,40 @@ fn eval_sets_observable_operation_state() {
     assert_eq!(last.status, OperationStatus::Finished);
     assert!(last.artifact.is_some());
     assert_eq!(last.output_bytes, Some(result.output.len()));
+}
+
+#[test]
+fn compound_run_control_command_sets_running_state() {
+    let manager = test_manager(
+        "compound-run-control",
+        WorkerBehavior::SlowExecute(Duration::from_millis(250)),
+    );
+    let session = manager
+        .create_session(CreateSession {
+            target: test_dump_target("compound-run-control-target"),
+            startup_timeout_ms: None,
+        })
+        .expect("create session");
+    let session = wait_for_break(&manager, session.id);
+    let session_id = session.id;
+
+    let eval_manager = manager.clone();
+    let eval = std::thread::spawn(move || {
+        eval_manager
+            .eval(EvalSession {
+                session_id,
+                command: "g; k".to_string(),
+                timeout_ms: None,
+            })
+            .expect("eval compound run-control command")
+    });
+
+    let running = wait_for_current_operation(&manager, session_id);
+    assert_eq!(running.state, SessionState::Running);
+    assert_eq!(running.current_operation.as_deref(), Some("g; k"));
+
+    let result = eval.join().expect("eval thread");
+    assert_eq!(result.session.state, SessionState::Break);
 }
 
 #[test]
@@ -442,8 +515,8 @@ fn attach_target_rejects_invalid_pid() {
 }
 
 #[test]
-fn launch_target_is_disabled_by_default() {
-    let manager = test_manager("launch-disabled", WorkerBehavior::Normal);
+fn launch_target_is_allowed_by_default_but_executable_must_exist() {
+    let manager = test_manager("launch-missing-executable", WorkerBehavior::Normal);
     let missing = std::env::temp_dir()
         .join(format!("dbgflow-missing-{}", std::process::id()))
         .join("missing.exe");
@@ -456,9 +529,27 @@ fn launch_target_is_disabled_by_default() {
             },
             startup_timeout_ms: None,
         })
-        .expect_err("reject disabled launch");
+        .expect_err("reject missing executable");
 
-    assert!(error.to_string().contains("launch targets are disabled"));
+    assert!(error.to_string().contains("invalid launch executable"));
+}
+
+#[test]
+fn dump_target_allows_any_existing_file_extension() {
+    let manager = test_manager("dump-any-extension", WorkerBehavior::Normal);
+    let root = test_artifact_root("dump-any-extension-target");
+    let path = root.join("input.notadmp");
+    fs::write(&path, b"not a real dump").expect("write fake dump");
+
+    let session = manager
+        .create_session(CreateSession {
+            target: DebugTarget::Dump { path },
+            startup_timeout_ms: None,
+        })
+        .expect("create session with nonstandard dump extension");
+
+    let session = wait_for_break(&manager, session.id);
+    assert_eq!(session.state, SessionState::Break);
 }
 
 #[test]

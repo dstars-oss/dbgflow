@@ -11,12 +11,11 @@ endpoint, and Windows service install / uninstall subcommands:
 - backend abstraction
 - session lifecycle management
 - per-session debug worker subprocess isolation
-- command policy
 - artifact manager
 - per-session transcript, event, command, and output artifacts
 - DbgEng backend for dump targets
 - DbgEng backend for process attach and launch targets
-- denylist-protected `eval` command support
+- native WinDbg / DbgEng command passthrough with audited `eval` output
 - MCP-facing tool facade
 - Streamable HTTP MCP endpoint at `/mcp` with resource update SSE
 - native Windows service mode
@@ -43,7 +42,7 @@ WinDbg Preview app package, Windows SDK Debuggers, then System32 fallback.
 DbgEng targets currently support dump files, process attach by PID, and process
 launch by executable path plus argument list. Each real debug session runs in
 its own worker subprocess; the main MCP process handles message dispatch,
-session state, policy, artifacts, logs, and worker lifecycle control.
+session state, target validation, artifacts, logs, and worker lifecycle control.
 
 Example targets:
 
@@ -59,18 +58,18 @@ Example targets:
 { "kind": "launch", "executable": "C:\\app\\app.exe", "args": ["--flag"] }
 ```
 
-Dump targets may point to any existing local dump file with a supported dump
-extension. Launch targets are disabled by default; set `DBGFLOW_ENABLE_LAUNCH=1`
-only in a trusted local environment to allow controlled process launch. Launch
-uses a suspended Win32 process creation path and attaches DbgEng before resuming
-the target. The executable must be an existing path; shell invocation, custom
-current directories, and custom environments are not part of this MVP.
+Dump targets may point to any existing local file; DbgEng reports an error if
+the file is not a supported dump. Launch uses a suspended Win32 process creation
+path and attaches DbgEng before resuming the target. The executable must be an
+existing path; shell invocation, custom current directories, and custom
+environments are not part of this MVP.
 Command output, transcripts, command records, event records, and logs are still
 written under controlled runtime directories.
-`eval` no longer uses an allowlist, but dangerous commands such as shell
-execution, script loading, extension loading, dump writing, and memory writing
-remain denied by policy. Run-control commands update session state separately
-from ordinary queries.
+`eval` passes native debugger commands through to DbgEng except for empty
+commands. Use it only in a trusted local environment. Run-control commands
+update session state separately from ordinary queries.
+`set_symbols` accepts native WinDbg symbol path strings, including symbol server
+paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
 
 `eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a
@@ -95,7 +94,7 @@ including `notifications/resources/updated` for session state changes. `GET
 
 The HTTP transport is local-only: dbgflow only accepts loopback bind addresses
 and rejects non-localhost `Origin` headers. `/mcp` does not require bearer token
-authentication.
+authentication. HTTP request bodies are limited to 16 MiB.
 
 The server supports `initialize`, `notifications/initialized`, `ping`,
 `tools/list`, `tools/call`, `resources/list`, and `resources/read`. Tool

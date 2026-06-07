@@ -9,12 +9,11 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - backend 抽象
 - session 生命周期管理
 - 每个调试 session 独立 worker 子进程隔离
-- command policy
 - artifact manager
 - 每个 session 独立的 transcript、event、command 和 output artifacts
 - 面向 dump target 的 DbgEng backend
 - 面向进程 attach / launch target 的 DbgEng backend
-- 受 denylist 保护的 `eval` 命令
+- 透传原生 WinDbg / DbgEng 命令并审计输出的 `eval`
 - 面向 MCP 的 tool facade
 - 带 resource update SSE 的 `/mcp` Streamable HTTP MCP endpoint
 - 原生 Windows service 运行模式
@@ -37,7 +36,7 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 在 Windows 上，DbgEng session 会按 WinDbg / WinDbg Preview 应用包、Windows SDK Debuggers、System32 fallback 的顺序解析 `dbgeng.dll`。
 
 DbgEng target 当前支持 dump 文件、按 PID attach 进程，以及按 executable path + args launch 进程。
-每个真实调试 session 会运行在独立 worker 子进程中；主 MCP 进程负责消息分发、session 状态、policy、artifacts、logs 和 worker 生命周期控制。
+每个真实调试 session 会运行在独立 worker 子进程中；主 MCP 进程负责消息分发、session 状态、target 校验、artifacts、logs 和 worker 生命周期控制。
 
 Target 示例：
 
@@ -53,7 +52,7 @@ Target 示例：
 { "kind": "launch", "executable": "C:\\app\\app.exe", "args": ["--flag"] }
 ```
 
-Dump target 可以指向任意已存在的本地 dump 文件，只要扩展名受支持。Launch target 默认关闭；仅在可信本地环境中设置 `DBGFLOW_ENABLE_LAUNCH=1` 后才允许受控启动进程。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`eval` 不再使用 allowlist，但 `.shell`、脚本加载、扩展加载、dump 写出和内存写出等危险命令仍会被 policy 拒绝。运行控制命令会单独更新 session 状态。
+Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。运行控制命令会单独更新 session 状态。`set_symbols` 接受原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
 
 `eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
 如果 worker 卡住，主进程可以终止该 session 对应的 worker 子进程，不会拖垮其他 session 或 MCP server。
@@ -66,7 +65,7 @@ cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir .\var
 
 HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response；`GET /mcp` 打开 server-sent event stream，用于发送 MCP notifications，包括 session 状态变化对应的 `notifications/resources/updated`。`GET /healthz` 返回简单健康检查响应。
 
-HTTP transport 仅用于本机调试：dbgflow 只允许绑定 loopback 地址，并拒绝非 localhost 的 `Origin` header。`/mcp` 不需要 bearer token 认证。
+HTTP transport 仅用于本机调试：dbgflow 只允许绑定 loopback 地址，并拒绝非 localhost 的 `Origin` header。`/mcp` 不需要 bearer token 认证。HTTP request body 上限为 16 MiB。
 
 当前 server 支持 `initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`、`resources/list` 和 `resources/read`。Tool 结果以 JSON text content 返回；调试命令输出会完整返回，并同时写入 session artifacts。
 最新命令 artifact 也会在 session 的 `last_operation` 中返回引用。

@@ -75,8 +75,7 @@ fn http_worker_can_launch_process_and_continue_to_exit() {
     let _guard = live_debug_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let launch_env = [("DBGFLOW_ENABLE_LAUNCH", "1")];
-    let mut server = TestServer::start("launch", &launch_env);
+    let mut server = TestServer::start("launch", &[]);
     initialize(&server.addr);
 
     let created = tool_call(

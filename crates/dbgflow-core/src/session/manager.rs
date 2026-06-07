@@ -2,7 +2,6 @@ use super::{SessionId, SessionState};
 use crate::artifacts::{ArtifactManager, ArtifactRef, CommandArtifactRecord, SessionArtifactEvent};
 use crate::backend::{CreateBackendSession, DebugTarget};
 use crate::logging::{noop_logger, LogEvent, LogLevel, LogSink};
-use crate::policy::CommandPolicy;
 use crate::session::worker::{ProcessWorkerLauncher, SessionWorker, SessionWorkerLauncher};
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
@@ -66,7 +65,6 @@ pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<SessionId, Session>>>,
     operation_locks: Arc<Mutex<HashMap<SessionId, Arc<Mutex<()>>>>>,
     artifacts: ArtifactManager,
-    command_policy: CommandPolicy,
     event_subscribers: Arc<Mutex<Vec<mpsc::Sender<SessionId>>>>,
     logger: Arc<dyn LogSink>,
 }
@@ -151,7 +149,6 @@ impl SessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             artifacts: ArtifactManager::new(artifact_root),
-            command_policy: CommandPolicy::default_query_policy(),
             event_subscribers: Arc::new(Mutex::new(Vec::new())),
             logger,
         }
@@ -413,11 +410,12 @@ impl SessionManager {
     }
 
     pub fn eval(&self, request: EvalSession) -> Result<EvalSessionResult> {
-        if let Err(error) = self.command_policy.check_command(&request.command) {
+        if request.command.trim().is_empty() {
+            let error = DbgFlowError::Backend("empty command".to_string());
             self.audit_rejected_eval(&request, &error);
             return Err(error);
         }
-        let is_run_control = self.command_policy.is_run_control_command(&request.command);
+        let is_run_control = is_run_control_command(&request.command);
 
         let operation_lock = self.operation_lock(request.session_id)?;
         let _operation_guard = operation_lock
@@ -1551,6 +1549,25 @@ fn operation_status_label(status: OperationStatus) -> &'static str {
     }
 }
 
+fn is_run_control_command(command: &str) -> bool {
+    let normalized = command
+        .split(|ch| matches!(ch, ';' | '\r' | '\n' | '\u{2028}' | '\u{2029}'))
+        .next()
+        .unwrap_or(command)
+        .trim();
+    matches!(normalized, "g" | "p" | "t")
+        || has_command_prefix(normalized, "g")
+        || has_command_prefix(normalized, "p")
+        || has_command_prefix(normalized, "t")
+}
+
+fn has_command_prefix(command: &str, prefix: &str) -> bool {
+    command == prefix
+        || command
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalSession {
     pub session_id: SessionId,
@@ -1568,18 +1585,6 @@ pub struct EvalSessionResult {
 }
 
 fn validate_dump_target(path: &Path) -> Result<PathBuf> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(extension.as_str(), "dmp" | "mdmp" | "hdmp" | "kdmp") {
-        return Err(DbgFlowError::Backend(format!(
-            "dump path has unsupported extension: {}",
-            path.display()
-        )));
-    }
-
     let canonical_path = path
         .canonicalize()
         .map_err(|error| DbgFlowError::Backend(format!("invalid dump path: {error}")))?;
@@ -1608,12 +1613,6 @@ fn validate_attach_target(pid: u32) -> Result<DebugTarget> {
 }
 
 fn validate_launch_target(executable: &Path, args: Vec<String>) -> Result<DebugTarget> {
-    if !launch_enabled() {
-        return Err(DbgFlowError::Backend(
-            "launch targets are disabled; set DBGFLOW_ENABLE_LAUNCH=1 to enable controlled process launch".to_string(),
-        ));
-    }
-
     let executable = executable
         .canonicalize()
         .map_err(|error| DbgFlowError::Backend(format!("invalid launch executable: {error}")))?;
@@ -1630,10 +1629,4 @@ fn validate_launch_target(executable: &Path, args: Vec<String>) -> Result<DebugT
     }
 
     Ok(DebugTarget::Launch { executable, args })
-}
-
-fn launch_enabled() -> bool {
-    std::env::var("DBGFLOW_ENABLE_LAUNCH")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
