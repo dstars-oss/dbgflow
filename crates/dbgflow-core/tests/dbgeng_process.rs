@@ -4,6 +4,7 @@ use dbgflow_core::backend::dbgeng::DbgEngBackend;
 use dbgflow_core::backend::{
     CreateBackendSession, DebugBackend, DebugTarget, ExecuteBackendResult,
 };
+use dbgflow_core::proxy::ProxyEnvironment;
 use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
 use dbgflow_core::session::{CreateSession, EvalSession, SessionManager, SessionState};
 use dbgflow_core::Result;
@@ -157,6 +158,7 @@ impl SessionWorkerLauncher for InProcessDbgEngWorkerLauncher {
         &self,
         _session_id: dbgflow_core::session::SessionId,
         _logger: Arc<dyn dbgflow_core::logging::LogSink>,
+        _proxy: ProxyEnvironment,
     ) -> Result<Arc<dyn SessionWorker>> {
         Ok(Arc::new(InProcessDbgEngWorker {
             backend: DbgEngBackend::new(),

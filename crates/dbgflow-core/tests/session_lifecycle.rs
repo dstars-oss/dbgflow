@@ -3,6 +3,7 @@ use dbgflow_core::backend::{
     DebugTarget, ExecuteBackendResult,
 };
 use dbgflow_core::logging::{LogEvent, LogSink};
+use dbgflow_core::proxy::{ProxyEnvironment, ProxySource};
 use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
 use dbgflow_core::session::{
     CreateSession, EvalSession, OperationStatus, SessionId, SessionManager, SessionState,
@@ -533,6 +534,41 @@ fn dropping_manager_kills_active_workers() {
 }
 
 #[test]
+fn session_manager_passes_proxy_environment_to_worker_launcher() {
+    let observed_proxy = Arc::new(Mutex::new(None));
+    let launcher = RecordingProxyWorkerLauncher {
+        observed_proxy: observed_proxy.clone(),
+    };
+    let proxy = ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897").expect("parse proxy");
+    let manager = SessionManager::with_worker_launcher_proxy_and_logger(
+        Arc::new(launcher),
+        test_artifact_root("proxy-worker-env"),
+        proxy,
+        Arc::new(RecordingLogSink::default()),
+    );
+
+    let session = manager
+        .create_session(CreateSession {
+            target: test_dump_target("proxy-worker-env-target"),
+            startup_timeout_ms: None,
+        })
+        .expect("create session");
+    let session = wait_for_break(&manager, session.id);
+    assert_eq!(session.state, SessionState::Break);
+
+    let observed = observed_proxy
+        .lock()
+        .expect("observed proxy lock")
+        .clone()
+        .expect("proxy observed");
+    assert_eq!(observed.source(), ProxySource::Cli);
+    assert_eq!(
+        observed.value_for("_NT_SYMBOL_PROXY").as_deref(),
+        Some("127.0.0.1:7897")
+    );
+}
+
+#[test]
 fn attach_target_rejects_invalid_pid() {
     let manager = test_manager("invalid-attach", WorkerBehavior::Normal);
 
@@ -821,11 +857,32 @@ impl TestWorkerLauncher {
     }
 }
 
+struct RecordingProxyWorkerLauncher {
+    observed_proxy: Arc<Mutex<Option<ProxyEnvironment>>>,
+}
+
+impl SessionWorkerLauncher for RecordingProxyWorkerLauncher {
+    fn spawn(
+        &self,
+        _session_id: SessionId,
+        _logger: Arc<dyn LogSink>,
+        proxy: ProxyEnvironment,
+    ) -> Result<Arc<dyn SessionWorker>> {
+        *self.observed_proxy.lock().expect("observed proxy lock") = Some(proxy);
+        Ok(Arc::new(TestWorker {
+            backend_session_id: "proxy-observer".to_string(),
+            behavior: WorkerBehavior::Normal,
+            closed: AtomicBool::new(false),
+        }))
+    }
+}
+
 impl SessionWorkerLauncher for TestWorkerLauncher {
     fn spawn(
         &self,
         _session_id: SessionId,
         _logger: Arc<dyn LogSink>,
+        _proxy: ProxyEnvironment,
     ) -> Result<Arc<dyn SessionWorker>> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(TestWorker {

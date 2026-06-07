@@ -5,6 +5,7 @@ use crate::backend::{
     ExecuteBackendRequest, ExecuteBackendResult,
 };
 use crate::logging::{LogEvent, LogLevel, LogSink};
+use crate::proxy::ProxyEnvironment;
 use crate::session::SessionId;
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ pub trait SessionWorkerLauncher: Send + Sync {
         &self,
         session_id: SessionId,
         logger: Arc<dyn LogSink>,
+        proxy: ProxyEnvironment,
     ) -> Result<Arc<dyn SessionWorker>>;
 }
 
@@ -71,6 +73,7 @@ impl SessionWorkerLauncher for ProcessWorkerLauncher {
         &self,
         session_id: SessionId,
         logger: Arc<dyn LogSink>,
+        proxy: ProxyEnvironment,
     ) -> Result<Arc<dyn SessionWorker>> {
         let executable = match &self.executable {
             Some(executable) => executable.clone(),
@@ -78,7 +81,7 @@ impl SessionWorkerLauncher for ProcessWorkerLauncher {
                 DbgFlowError::Backend(format!("resolve session worker executable failed: {error}"))
             })?,
         };
-        let worker = ProcessSessionWorker::spawn(session_id, executable, logger)?;
+        let worker = ProcessSessionWorker::spawn(session_id, executable, logger, proxy)?;
         Ok(Arc::new(worker))
     }
 }
@@ -128,20 +131,26 @@ impl Drop for ProcessSessionWorkerInner {
 }
 
 impl ProcessSessionWorker {
-    fn spawn(session_id: SessionId, executable: PathBuf, logger: Arc<dyn LogSink>) -> Result<Self> {
-        let mut child = Command::new(&executable)
+    fn spawn(
+        session_id: SessionId,
+        executable: PathBuf,
+        logger: Arc<dyn LogSink>,
+        proxy: ProxyEnvironment,
+    ) -> Result<Self> {
+        let mut command = Command::new(&executable);
+        command
             .arg(SESSION_WORKER_COMMAND)
             .arg(SESSION_WORKER_KIND_SESSION)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| {
-                DbgFlowError::Backend(format!(
-                    "spawn session worker {} failed: {error}",
-                    executable.display()
-                ))
-            })?;
+            .stderr(Stdio::null());
+        apply_proxy_environment(&mut command, &proxy);
+        let mut child = command.spawn().map_err(|error| {
+            DbgFlowError::Backend(format!(
+                "spawn session worker {} failed: {error}",
+                executable.display()
+            ))
+        })?;
         let pid = child.id();
         let stdin = child.stdin.take().ok_or_else(|| {
             DbgFlowError::Backend("session worker stdin was not captured".to_string())
@@ -154,7 +163,9 @@ impl ProcessSessionWorker {
             LogEvent::new(LogLevel::Info, "session_worker", "worker_spawned")
                 .session_id(session_id)
                 .field("pid", pid)
-                .field("executable", executable.display().to_string()),
+                .field("executable", executable.display().to_string())
+                .field("proxy_source", format!("{:?}", proxy.source()))
+                .field("proxy_keys", proxy.proxy_keys()),
         );
 
         Ok(Self {
@@ -318,6 +329,15 @@ impl ProcessSessionWorker {
             }
             thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+fn apply_proxy_environment(command: &mut Command, proxy: &ProxyEnvironment) {
+    for key in proxy.removed_keys() {
+        command.env_remove(key);
+    }
+    for (key, value) in proxy.env_vars() {
+        command.env(key, value);
     }
 }
 

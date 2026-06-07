@@ -5,6 +5,7 @@ use crate::backend::{
     DebugTarget,
 };
 use crate::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use crate::proxy::ProxyEnvironment;
 use crate::session::worker::{ProcessWorkerLauncher, SessionWorker, SessionWorkerLauncher};
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,7 @@ pub struct SessionManager {
     artifacts: ArtifactManager,
     event_subscribers: Arc<Mutex<Vec<mpsc::Sender<SessionId>>>>,
     logger: Arc<dyn LogSink>,
+    proxy: ProxyEnvironment,
 }
 
 #[derive(Default)]
@@ -146,6 +148,21 @@ impl SessionManager {
         artifact_root: impl Into<PathBuf>,
         logger: Arc<dyn LogSink>,
     ) -> Self {
+        Self::with_worker_launcher_proxy_and_logger(
+            worker_launcher,
+            artifact_root,
+            ProxyEnvironment::from_current_environment()
+                .unwrap_or_else(|_| ProxyEnvironment::none()),
+            logger,
+        )
+    }
+
+    pub fn with_worker_launcher_proxy_and_logger(
+        worker_launcher: Arc<dyn SessionWorkerLauncher>,
+        artifact_root: impl Into<PathBuf>,
+        proxy: ProxyEnvironment,
+        logger: Arc<dyn LogSink>,
+    ) -> Self {
         Self {
             worker_launcher,
             workers: Arc::new(WorkerRegistry::default()),
@@ -154,6 +171,7 @@ impl SessionManager {
             artifacts: ArtifactManager::new(artifact_root),
             event_subscribers: Arc::new(Mutex::new(Vec::new())),
             logger,
+            proxy,
         }
     }
 
@@ -227,7 +245,9 @@ impl SessionManager {
                 .session_id(session.id)
                 .operation("create_session")
                 .field("backend", "worker")
-                .field("target", &session.target),
+                .field("target", &session.target)
+                .field("proxy_source", format!("{:?}", self.proxy.source()))
+                .field("proxy_keys", self.proxy.proxy_keys()),
         );
         if let Some(startup_timeout_ms) = request.startup_timeout_ms {
             self.log(
@@ -1126,6 +1146,7 @@ impl SessionManager {
 
     fn spawn_worker_startup(&self, session_id: SessionId, target: DebugTarget) {
         let manager = self.clone();
+        let proxy = self.proxy.clone();
         thread::spawn(move || {
             let startup_started = Instant::now();
             manager.log(
@@ -1134,20 +1155,21 @@ impl SessionManager {
                     .operation("create_session"),
             );
 
-            let worker = match manager
-                .worker_launcher
-                .spawn(session_id, manager.logger.clone())
-            {
-                Ok(worker) => worker,
-                Err(error) => {
-                    manager.finish_worker_startup(
-                        session_id,
-                        Err(error),
-                        startup_started.elapsed().as_millis(),
-                    );
-                    return;
-                }
-            };
+            let worker =
+                match manager
+                    .worker_launcher
+                    .spawn(session_id, manager.logger.clone(), proxy)
+                {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        manager.finish_worker_startup(
+                            session_id,
+                            Err(error),
+                            startup_started.elapsed().as_millis(),
+                        );
+                        return;
+                    }
+                };
 
             if let Err(error) = manager.insert_worker(session_id, worker.clone()) {
                 let _ = worker.kill("insert_worker_failed");

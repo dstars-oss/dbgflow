@@ -308,6 +308,7 @@ mod tests {
     use super::McpServer;
     use crate::tools::ToolService;
     use dbgflow_core::backend::{CreateBackendSession, ExecuteBackendResult};
+    use dbgflow_core::proxy::ProxyEnvironment;
     use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
     use dbgflow_core::session::{SessionId, SessionManager};
     use dbgflow_core::Result;
@@ -789,6 +790,7 @@ mod tests {
             &self,
             _session_id: SessionId,
             _logger: Arc<dyn dbgflow_core::logging::LogSink>,
+            _proxy: ProxyEnvironment,
         ) -> Result<Arc<dyn SessionWorker>> {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             Ok(Arc::new(TestWorker {
