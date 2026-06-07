@@ -71,16 +71,6 @@ $arguments = @(
     $InstallRoot
 )
 
-function Assert-ServiceName {
-    param([Parameter(Mandatory = $true)][string]$ServiceName)
-    if ([string]::IsNullOrWhiteSpace($ServiceName)) {
-        throw "ServiceName must not be empty"
-    }
-    if ($ServiceName -match "[\\/\\*\\?\\[\\]\x00-\x1F\x7F]") {
-        throw "ServiceName must not contain path separators, wildcards, or control characters"
-    }
-}
-
 function Assert-NoControlCharacters {
     param(
         [Parameter(Mandatory = $true)][string]$Value,
@@ -91,6 +81,24 @@ function Assert-NoControlCharacters {
             throw "$Name must not contain control characters"
         }
     }
+}
+
+function Assert-ServiceName {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    if ([string]::IsNullOrWhiteSpace($ServiceName)) {
+        throw "ServiceName must not be empty"
+    }
+    if (
+        $ServiceName.Contains("\") -or
+        $ServiceName.Contains("/") -or
+        $ServiceName.Contains("*") -or
+        $ServiceName.Contains("?") -or
+        $ServiceName.Contains("[") -or
+        $ServiceName.Contains("]")
+    ) {
+        throw "ServiceName must not contain path separators, wildcards, or control characters"
+    }
+    Assert-NoControlCharacters -Value $ServiceName -Name "ServiceName"
 }
 
 function Convert-ToSymbolProxy {
