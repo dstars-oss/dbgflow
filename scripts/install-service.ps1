@@ -81,14 +81,24 @@ function Assert-ServiceName {
     }
 }
 
+function Assert-NoControlCharacters {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    foreach ($ch in $Value.ToCharArray()) {
+        if ([char]::IsControl($ch)) {
+            throw "$Name must not contain control characters"
+        }
+    }
+}
+
 function Convert-ToSymbolProxy {
     param([Parameter(Mandatory = $true)][string]$Url)
     if ([string]::IsNullOrWhiteSpace($Url)) {
         throw "ProxyUrl must not be empty. Use -NoProxy to skip service proxy configuration."
     }
-    if ($Url -match "[\x00-\x1F\x7F]") {
-        throw "ProxyUrl must not contain control characters"
-    }
+    Assert-NoControlCharacters -Value $Url -Name "ProxyUrl"
     if ($Url -match "\s") {
         throw "ProxyUrl must not contain whitespace"
     }
