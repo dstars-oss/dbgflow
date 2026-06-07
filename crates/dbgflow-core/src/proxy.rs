@@ -1,6 +1,7 @@
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
 const SYMBOL_PROXY_KEY: &str = "_NT_SYMBOL_PROXY";
 const HTTP_PROXY_KEY: &str = "HTTP_PROXY";
@@ -32,7 +33,7 @@ pub enum ProxySource {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyEnvironment {
     source: ProxySource,
     vars: BTreeMap<String, String>,
@@ -133,6 +134,15 @@ impl Default for ProxyEnvironment {
     }
 }
 
+impl fmt::Debug for ProxyEnvironment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyEnvironment")
+            .field("source", &self.source)
+            .field("proxy_keys", &self.proxy_keys())
+            .finish()
+    }
+}
+
 fn insert_env_pair(
     env: &HashMap<String, String>,
     vars: &mut BTreeMap<String, String>,
@@ -169,10 +179,20 @@ fn validate_proxy_value(value: &str, label: &str) -> Result<()> {
 }
 
 fn symbol_proxy_from_url(value: &str) -> Result<String> {
+    if value.chars().any(char::is_whitespace) {
+        return Err(DbgFlowError::Backend(
+            "--proxy-url must not contain whitespace".to_string(),
+        ));
+    }
     let rest = value
         .strip_prefix("http://")
         .or_else(|| value.strip_prefix("https://"))
         .ok_or_else(|| DbgFlowError::Backend("--proxy-url must use http:// or https://".into()))?;
+    if rest.contains('?') || rest.contains('#') {
+        return Err(DbgFlowError::Backend(
+            "--proxy-url must not include query or fragment".to_string(),
+        ));
+    }
     let authority = rest.split('/').next().unwrap_or(rest);
     if authority.is_empty() {
         return Err(DbgFlowError::Backend(
@@ -202,11 +222,22 @@ fn split_authority_host_port(authority: &str) -> Result<(&str, &str)> {
         };
         let host = &bracketed_host[..end];
         let port = bracketed_host[end + 1..].strip_prefix(':').unwrap_or("");
+        if port.contains(':') {
+            return Err(DbgFlowError::Backend(
+                "--proxy-url must include host and port".to_string(),
+            ));
+        }
         return Ok((host, port));
     }
-    authority
-        .rsplit_once(':')
-        .ok_or_else(|| DbgFlowError::Backend("--proxy-url must include host and port".to_string()))
+    let (host, port) = authority.rsplit_once(':').ok_or_else(|| {
+        DbgFlowError::Backend("--proxy-url must include host and port".to_string())
+    })?;
+    if host.contains(':') {
+        return Err(DbgFlowError::Backend(
+            "--proxy-url must include host and port".to_string(),
+        ));
+    }
+    Ok((host, port))
 }
 
 #[cfg(test)]
@@ -255,6 +286,28 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_redacts_proxy_values() {
+        let proxy =
+            ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897").expect("parse proxy");
+
+        let debug = format!("{proxy:?}");
+
+        assert!(debug.contains("_NT_SYMBOL_PROXY"));
+        assert!(!debug.contains("127.0.0.1:7897"));
+        assert!(!debug.contains("http://127.0.0.1:7897"));
+    }
+
+    #[test]
+    fn proxy_url_accepts_bracketed_ipv6_with_explicit_port() {
+        let proxy = ProxyEnvironment::from_cli_proxy_url("http://[::1]:7897").expect("parse proxy");
+
+        assert_eq!(
+            proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
+            Some("[::1]:7897")
+        );
+    }
+
+    #[test]
     fn environment_prefers_nt_symbol_proxy_and_uppercase_http() {
         let proxy = ProxyEnvironment::from_environment_map(&env(&[
             ("_NT_SYMBOL_PROXY", "symproxy:80"),
@@ -299,6 +352,20 @@ mod tests {
     }
 
     #[test]
+    fn environment_rejects_control_characters() {
+        assert!(ProxyEnvironment::from_environment_map(&env(&[(
+            "HTTPS_PROXY",
+            "http://secure:8080\u{2028}x"
+        )]))
+        .is_err());
+        assert!(ProxyEnvironment::from_environment_map(&env(&[(
+            "HTTPS_PROXY",
+            "http://secure:8080\0x"
+        )]))
+        .is_err());
+    }
+
+    #[test]
     fn disabled_proxy_removes_all_known_proxy_vars() {
         let proxy = ProxyEnvironment::disabled();
 
@@ -316,8 +383,14 @@ mod tests {
         assert!(ProxyEnvironment::from_cli_proxy_url("socks5://127.0.0.1:7897").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897\nx").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897\u{2028}x").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://:7897").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://[::1]").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://user:pass@127.0.0.1:7897").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897?x=1").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://host:7897#frag").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://host:7897 ").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://host:7897:extra").is_err());
     }
 }
