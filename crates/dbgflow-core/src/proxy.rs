@@ -141,8 +141,7 @@ fn insert_env_pair(
 ) -> Result<()> {
     let value = env
         .get(upper)
-        .filter(|value| !value.is_empty())
-        .or_else(|| lower.and_then(|lower| env.get(lower).filter(|value| !value.is_empty())));
+        .or_else(|| lower.and_then(|lower| env.get(lower)));
     let Some(value) = value else {
         return Ok(());
     };
@@ -175,7 +174,7 @@ fn symbol_proxy_from_url(value: &str) -> Result<String> {
         .or_else(|| value.strip_prefix("https://"))
         .ok_or_else(|| DbgFlowError::Backend("--proxy-url must use http:// or https://".into()))?;
     let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() || !authority.contains(':') {
+    if authority.is_empty() {
         return Err(DbgFlowError::Backend(
             "--proxy-url must include host and port".to_string(),
         ));
@@ -185,7 +184,29 @@ fn symbol_proxy_from_url(value: &str) -> Result<String> {
             "--proxy-url credentials are not supported for _NT_SYMBOL_PROXY".to_string(),
         ));
     }
+    let (host, port) = split_authority_host_port(authority)?;
+    if host.is_empty() || port.is_empty() {
+        return Err(DbgFlowError::Backend(
+            "--proxy-url must include host and port".to_string(),
+        ));
+    }
     Ok(authority.to_string())
+}
+
+fn split_authority_host_port(authority: &str) -> Result<(&str, &str)> {
+    if let Some(bracketed_host) = authority.strip_prefix('[') {
+        let Some(end) = bracketed_host.find(']') else {
+            return Err(DbgFlowError::Backend(
+                "--proxy-url must include host and port".to_string(),
+            ));
+        };
+        let host = &bracketed_host[..end];
+        let port = bracketed_host[end + 1..].strip_prefix(':').unwrap_or("");
+        return Ok((host, port));
+    }
+    authority
+        .rsplit_once(':')
+        .ok_or_else(|| DbgFlowError::Backend("--proxy-url must include host and port".to_string()))
 }
 
 #[cfg(test)]
@@ -264,6 +285,20 @@ mod tests {
     }
 
     #[test]
+    fn environment_rejects_empty_proxy_values() {
+        assert!(ProxyEnvironment::from_environment_map(&env(&[("HTTP_PROXY", "")])).is_err());
+    }
+
+    #[test]
+    fn environment_rejects_empty_uppercase_before_lowercase_fallback() {
+        assert!(ProxyEnvironment::from_environment_map(&env(&[
+            ("HTTP_PROXY", ""),
+            ("http_proxy", "http://lower:8080")
+        ]))
+        .is_err());
+    }
+
+    #[test]
     fn disabled_proxy_removes_all_known_proxy_vars() {
         let proxy = ProxyEnvironment::disabled();
 
@@ -281,5 +316,8 @@ mod tests {
         assert!(ProxyEnvironment::from_cli_proxy_url("socks5://127.0.0.1:7897").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1").is_err());
         assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897\nx").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://:7897").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:").is_err());
+        assert!(ProxyEnvironment::from_cli_proxy_url("http://[::1]").is_err());
     }
 }
