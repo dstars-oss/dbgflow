@@ -8,3 +8,4 @@ artifacts/*
 *.run
 *.trace
 issue/
+docs/superpowers/
