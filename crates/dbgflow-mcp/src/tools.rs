@@ -1,4 +1,5 @@
 use dbgflow_core::backend::DebugTarget;
+use dbgflow_core::profile::{ProfileCollectorConfig, ProfileManager, ProfileResult, RunProfile};
 use dbgflow_core::session::{
     CreateSession, EvalSession, EvalSessionResult, Session, SessionId, SessionManager,
 };
@@ -15,6 +16,7 @@ pub const LIST_SESSIONS: &str = "list_sessions";
 pub const CLOSE_SESSION: &str = "close_session";
 pub const EVAL: &str = "eval";
 pub const SET_SYMBOLS: &str = "set_symbols";
+pub const RUN_PROFILE: &str = "run_profile";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -27,11 +29,30 @@ pub struct ToolDescriptor {
 #[derive(Clone)]
 pub struct ToolService {
     sessions: SessionManager,
+    profiles: ProfileManager,
 }
 
 impl ToolService {
     pub fn new(sessions: SessionManager) -> Self {
-        Self { sessions }
+        Self {
+            sessions,
+            profiles: ProfileManager::new("artifacts"),
+        }
+    }
+
+    pub fn with_profiles(sessions: SessionManager, profiles: ProfileManager) -> Self {
+        Self { sessions, profiles }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests() -> Self {
+        let root = std::env::temp_dir().join(format!("dbgflow-mcp-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        Self {
+            sessions: SessionManager::with_artifact_root(&root),
+            profiles: ProfileManager::new(&root),
+        }
     }
 
     pub fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
@@ -180,6 +201,49 @@ impl ToolService {
                     "additionalProperties": false
                 }),
             },
+            ToolDescriptor {
+                name: RUN_PROFILE,
+                description:
+                    "Launch a process and record a native ETW profile trace as a standard ETL artifact.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "const": "launch" },
+                                "executable": {
+                                    "type": "string",
+                                    "description": "Path to a local executable."
+                                },
+                                "args": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Command-line arguments. Omit for no arguments."
+                                }
+                            },
+                            "required": ["kind", "executable"],
+                            "additionalProperties": false
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Stop collection when the target exits or this timeout expires."
+                        },
+                        "collector": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "const": "native_etw" },
+                                "preset": { "type": "string", "const": "system_overview" }
+                            },
+                            "required": ["kind", "preset"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["target", "timeout_ms", "collector"],
+                    "additionalProperties": false
+                }),
+            },
         ]
     }
 
@@ -249,6 +313,10 @@ impl ToolService {
         result.ok_or_else(|| DbgFlowError::Backend("no symbol paths were applied".to_string()))
     }
 
+    pub fn run_profile(&self, request: RunProfileRequest) -> Result<ProfileResult> {
+        self.profiles.run_profile(request.into())
+    }
+
     pub fn subscribe_session_updates(&self) -> mpsc::Receiver<SessionId> {
         self.sessions.subscribe_session_updates()
     }
@@ -285,6 +353,10 @@ impl ToolService {
                 .and_then(to_value),
             SET_SYMBOLS => self
                 .set_symbols(decode_arguments(arguments)?)
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            RUN_PROFILE => self
+                .run_profile(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             _ => Err(ToolCallError::invalid_request(format!(
@@ -349,6 +421,23 @@ pub struct SetSymbolsRequest {
     pub paths: Vec<PathBuf>,
     pub append: Option<bool>,
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RunProfileRequest {
+    pub target: dbgflow_core::profile::ProfileTarget,
+    pub timeout_ms: u64,
+    pub collector: ProfileCollectorConfig,
+}
+
+impl From<RunProfileRequest> for RunProfile {
+    fn from(value: RunProfileRequest) -> Self {
+        Self {
+            target: value.target,
+            timeout_ms: value.timeout_ms,
+            collector: value.collector,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -418,5 +507,46 @@ impl<'de> Deserialize<'de> for CreateSessionRequest {
         D: serde::Deserializer<'de>,
     {
         McpCreateSessionRequest::deserialize(deserializer).map(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbgflow_core::profile::{ProfileCollectorKind, ProfilePreset};
+
+    #[test]
+    fn tool_descriptors_include_run_profile() {
+        let service = ToolService::new_for_tests();
+
+        let descriptors = service.tool_descriptors();
+        let run_profile = descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == RUN_PROFILE)
+            .expect("run_profile descriptor");
+
+        assert!(run_profile.description.contains("profile"));
+        assert_eq!(run_profile.input_schema["type"], "object");
+    }
+
+    #[test]
+    fn run_profile_arguments_decode_to_launch_target_and_native_etw() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe",
+                "args": ["/C", "echo dbgflow"]
+            },
+            "timeout_ms": 1000,
+            "collector": {
+                "kind": "native_etw",
+                "preset": "system_overview"
+            }
+        });
+
+        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
+        assert_eq!(request.timeout_ms, 1000);
+        assert_eq!(request.collector.kind, ProfileCollectorKind::NativeEtw);
+        assert_eq!(request.collector.preset, ProfilePreset::SystemOverview);
     }
 }
