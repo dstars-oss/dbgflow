@@ -1,8 +1,10 @@
 use dbgflow_core::artifacts::{ArtifactKind, ArtifactRef};
+use dbgflow_core::logging::{LogEvent, LogSink};
 use dbgflow_core::profile::{
-    validate_profile_target, CollectorFactory, CollectorStart, CollectorStop, ProfileCollector,
-    ProfileCollectorConfig, ProfileCollectorKind, ProfileCompletionReason, ProfileManager,
-    ProfilePreset, ProfileStatus, ProfileTarget, RunProfile, TargetExit, TargetRunner,
+    validate_profile_target, CollectorFactory, CollectorStart, CollectorStop, NoopTargetEventSink,
+    ProfileCollector, ProfileCollectorConfig, ProfileCollectorKind, ProfileCompletionReason,
+    ProfileManager, ProfilePreset, ProfileStatus, ProfileTarget, RunProfile, TargetEventSink,
+    TargetExit, TargetRunner,
 };
 use dbgflow_core::Result;
 use std::fs;
@@ -150,6 +152,7 @@ fn target_runner_returns_exit_or_timeout_without_killing_target() {
             Duration::from_millis(1),
             Path::new("stdout.txt"),
             Path::new("stderr.txt"),
+            Arc::new(NoopTargetEventSink),
         )
         .expect("launch target");
 
@@ -236,7 +239,13 @@ impl TargetRunner for TestTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
+        match &self.exit {
+            TargetExit::Exited { pid, .. } | TargetExit::TimedOut { pid } => {
+                event_sink.target_started(*pid);
+            }
+        }
         Ok(self.exit.clone())
     }
 }
@@ -340,6 +349,48 @@ fn run_profile_timeout_stops_collector_without_target_exit_code() {
 }
 
 #[test]
+fn run_profile_logs_lifecycle_events() {
+    let root = test_profile_root("logs-lifecycle");
+    let logger = Arc::new(RecordingLogSink::default());
+    let manager = ProfileManager::with_components_and_logger(
+        &root,
+        Arc::new(TestCollectorFactory::default()),
+        Arc::new(TestTargetRunner {
+            exit: TargetExit::Exited {
+                pid: 77,
+                exit_code: Some(0),
+            },
+        }),
+        logger.clone(),
+    );
+
+    let result = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            collectors: vec![ProfileCollectorConfig::default()],
+        })
+        .expect("run profile");
+
+    assert_eq!(result.target_pid, Some(77));
+    let events = logger.events();
+    assert!(events
+        .iter()
+        .any(|event| event.component == "profile" && event.event == "run_profile_started"));
+    assert!(events
+        .iter()
+        .any(|event| event.component == "profile" && event.event == "target_started"));
+    assert!(events.iter().any(|event| {
+        event.component == "profile"
+            && event.event == "run_profile_finished"
+            && event.fields["profile_id"] == result.profile_id.to_string()
+    }));
+}
+
+#[test]
 fn run_profile_collector_start_failure_does_not_launch_target() {
     let root = test_profile_root("collector-start-failure");
     let manager = ProfileManager::with_components(
@@ -366,6 +417,10 @@ fn run_profile_collector_start_failure_does_not_launch_target() {
         .expect_err("collector start fails");
 
     assert!(error.to_string().contains("collector start failed"));
+    let metadata = only_profile_metadata(&root);
+    assert!(metadata.contains("\"status\": \"failed\""));
+    assert!(metadata.contains("\"completion_reason\": \"collector_error\""));
+    assert!(metadata.contains("collector start failed"));
 }
 
 #[test]
@@ -394,6 +449,10 @@ fn run_profile_procmon_without_sysinternals_dir_does_not_launch_target() {
         .expect_err("procmon unavailable");
 
     assert!(error.to_string().contains("Sysinternals directory"));
+    let metadata = only_profile_metadata(&root);
+    assert!(metadata.contains("\"status\": \"failed\""));
+    assert!(metadata.contains("\"completion_reason\": \"collector_error\""));
+    assert!(metadata.contains("Sysinternals directory"));
 }
 
 #[test]
@@ -576,6 +635,37 @@ fn test_profile_root(name: &str) -> std::path::PathBuf {
     root
 }
 
+fn only_profile_metadata(root: &Path) -> String {
+    let profiles = root.join("profiles");
+    let entries = fs::read_dir(&profiles)
+        .expect("read profiles")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected one profile dir under {profiles:?}"
+    );
+    let profile_dir = entries[0].as_ref().expect("profile entry").path();
+    fs::read_to_string(profile_dir.join("profile.json")).expect("read profile metadata")
+}
+
+#[derive(Default)]
+struct RecordingLogSink {
+    events: Mutex<Vec<LogEvent>>,
+}
+
+impl RecordingLogSink {
+    fn events(&self) -> Vec<LogEvent> {
+        self.events.lock().expect("events lock").clone()
+    }
+}
+
+impl LogSink for RecordingLogSink {
+    fn log(&self, event: LogEvent) {
+        self.events.lock().expect("events lock").push(event);
+    }
+}
+
 #[derive(Default)]
 struct TestCollectorFactory {
     state: Arc<Mutex<Vec<String>>>,
@@ -619,6 +709,7 @@ impl TargetRunner for PanicTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        _event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         panic!("target runner must not be called when collector start fails");
     }
@@ -750,10 +841,12 @@ impl TargetRunner for BlockingTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         let (lock, cvar) = &*self.blocker;
         let mut state = lock.lock().expect("blocker lock");
         state.started = true;
+        event_sink.target_started(1);
         cvar.notify_all();
         while !state.released {
             state = cvar.wait(state).expect("blocker wait");
@@ -780,6 +873,7 @@ impl TargetRunner for FailingTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        _event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         Err(dbgflow_core::DbgFlowError::Backend(
             "target failed".to_string(),
@@ -798,10 +892,15 @@ impl TargetRunner for SequenceTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         let mut exits = self.exits.lock().expect("sequence lock");
         assert!(!exits.is_empty(), "sequence target runner exhausted");
-        exits.remove(0)
+        let exit = exits.remove(0);
+        if let Ok(TargetExit::Exited { pid, .. } | TargetExit::TimedOut { pid }) = &exit {
+            event_sink.target_started(*pid);
+        }
+        exit
     }
 }
 

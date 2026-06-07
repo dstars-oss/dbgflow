@@ -1,14 +1,17 @@
 use crate::mcp::{session_resource_uri, McpServer};
+use dbgflow_core::logging::{LogEvent, LogLevel};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpConfig {
@@ -18,9 +21,18 @@ pub struct HttpConfig {
 pub fn run_http(server: McpServer, config: HttpConfig, shutdown: Receiver<()>) -> io::Result<()> {
     let listener = TcpListener::bind(config.bind)?;
     listener.set_nonblocking(true)?;
+    server.log(
+        LogEvent::new(LogLevel::Info, "http", "http_server_started")
+            .field("bind", config.bind.to_string()),
+    );
 
     loop {
         if shutdown.try_recv().is_ok() {
+            server.log(
+                LogEvent::new(LogLevel::Info, "http", "http_server_stopped")
+                    .field("bind", config.bind.to_string())
+                    .field("reason", "shutdown_requested"),
+            );
             return Ok(());
         }
 
@@ -34,16 +46,35 @@ pub fn run_http(server: McpServer, config: HttpConfig, shutdown: Receiver<()>) -
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                server.log(
+                    LogEvent::new(LogLevel::Error, "http", "http_accept_failed")
+                        .field("bind", config.bind.to_string())
+                        .error(error.to_string()),
+                );
+                return Err(error);
+            }
         }
     }
 }
 
 fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()> {
+    let request_id = NEXT_HTTP_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let peer = stream
+        .peer_addr()
+        .map(|peer| peer.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
     stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT))?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
+            server.log(
+                LogEvent::new(LogLevel::Error, "http", "http_request_rejected")
+                    .field("http_request_id", request_id)
+                    .field("peer", peer)
+                    .field("status", 400)
+                    .error(error.to_string()),
+            );
             write_response(
                 &mut stream,
                 HttpResponse::json(400, json!({ "error": error.to_string() })),
@@ -51,17 +82,46 @@ fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()>
             return Ok(());
         }
     };
+    let method = request.method.clone();
+    let path = request.path.clone();
+    let body_bytes = request.body.len();
+    let started = Instant::now();
+    server.log(
+        LogEvent::new(LogLevel::Info, "http", "http_request_started")
+            .field("http_request_id", request_id)
+            .field("peer", peer.clone())
+            .field("method", method.clone())
+            .field("path", path.clone())
+            .field("body_bytes", body_bytes),
+    );
 
     if is_mcp_sse_request(&request) {
-        return handle_mcp_sse(server, request, stream);
+        return handle_mcp_sse(server, request_id, request, stream, started);
     }
 
-    let response = route_request(server, request);
+    let response = route_request(server.clone(), request, request_id);
+    let status = response.status;
+    let response_bytes = response.body.len();
+    server.log(
+        LogEvent::new(LogLevel::Info, "http", "http_request_finished")
+            .duration_ms(started.elapsed().as_millis())
+            .field("http_request_id", request_id)
+            .field("peer", peer)
+            .field("method", method)
+            .field("path", path)
+            .field("status", status)
+            .field("response_bytes", response_bytes),
+    );
     write_response(&mut stream, response)
 }
 
-fn route_request(server: McpServer, request: HttpRequest) -> HttpResponse {
+fn route_request(server: McpServer, request: HttpRequest, request_id: u64) -> HttpResponse {
     if !origin_is_allowed(request.headers.get("origin")) {
+        server.log(
+            LogEvent::new(LogLevel::Warn, "http", "http_origin_rejected")
+                .field("http_request_id", request_id)
+                .field("origin", request.headers.get("origin").cloned()),
+        );
         return HttpResponse::json(403, json!({ "error": "forbidden origin" }));
     }
 
@@ -74,7 +134,7 @@ fn route_request(server: McpServer, request: HttpRequest) -> HttpResponse {
     match (request.method.as_str(), path) {
         ("GET", "/healthz") => HttpResponse::json(200, json!({ "status": "ok" })),
         ("GET", "/mcp") => HttpResponse::empty(405),
-        ("POST", "/mcp") => handle_mcp_post(server, request),
+        ("POST", "/mcp") => handle_mcp_post(server, request, request_id),
         _ => HttpResponse::json(404, json!({ "error": "not found" })),
     }
 }
@@ -90,10 +150,17 @@ fn is_mcp_sse_request(request: &HttpRequest) -> bool {
 
 fn handle_mcp_sse(
     server: McpServer,
+    request_id: u64,
     request: HttpRequest,
     mut stream: TcpStream,
+    started: Instant,
 ) -> io::Result<()> {
     if !origin_is_allowed(request.headers.get("origin")) {
+        server.log(
+            LogEvent::new(LogLevel::Warn, "http", "http_origin_rejected")
+                .field("http_request_id", request_id)
+                .field("origin", request.headers.get("origin").cloned()),
+        );
         write_response(
             &mut stream,
             HttpResponse::json(403, json!({ "error": "forbidden origin" })),
@@ -106,6 +173,11 @@ fn handle_mcp_sse(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
     )?;
     stream.flush()?;
+    server.log(
+        LogEvent::new(LogLevel::Info, "http", "http_sse_opened")
+            .field("http_request_id", request_id)
+            .field("path", request.path.clone()),
+    );
 
     let updates = server.session_update_receiver();
     loop {
@@ -118,13 +190,45 @@ fn handle_mcp_sse(
                         "uri": session_resource_uri(session_id)
                     }
                 });
-                write_sse_json(&mut stream, &notification)?;
+                if let Err(error) = write_sse_json(&mut stream, &notification) {
+                    server.log(
+                        LogEvent::new(LogLevel::Warn, "http", "http_sse_closed")
+                            .duration_ms(started.elapsed().as_millis())
+                            .field("http_request_id", request_id)
+                            .error(error.to_string()),
+                    );
+                    return Err(error);
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                stream.write_all(b": keepalive\n\n")?;
-                stream.flush()?;
+                if let Err(error) = stream.write_all(b": keepalive\n\n") {
+                    server.log(
+                        LogEvent::new(LogLevel::Warn, "http", "http_sse_closed")
+                            .duration_ms(started.elapsed().as_millis())
+                            .field("http_request_id", request_id)
+                            .error(error.to_string()),
+                    );
+                    return Err(error);
+                }
+                if let Err(error) = stream.flush() {
+                    server.log(
+                        LogEvent::new(LogLevel::Warn, "http", "http_sse_closed")
+                            .duration_ms(started.elapsed().as_millis())
+                            .field("http_request_id", request_id)
+                            .error(error.to_string()),
+                    );
+                    return Err(error);
+                }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                server.log(
+                    LogEvent::new(LogLevel::Info, "http", "http_sse_closed")
+                        .duration_ms(started.elapsed().as_millis())
+                        .field("http_request_id", request_id)
+                        .field("reason", "updates_disconnected"),
+                );
+                return Ok(());
+            }
         }
     }
 }
@@ -135,8 +239,13 @@ fn write_sse_json(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
     stream.flush()
 }
 
-fn handle_mcp_post(server: McpServer, request: HttpRequest) -> HttpResponse {
+fn handle_mcp_post(server: McpServer, request: HttpRequest, request_id: u64) -> HttpResponse {
     if !content_type_is_json(request.headers.get("content-type")) {
+        server.log(
+            LogEvent::new(LogLevel::Warn, "http", "http_request_invalid_content_type")
+                .field("http_request_id", request_id)
+                .field("content_type", request.headers.get("content-type").cloned()),
+        );
         return HttpResponse::json(
             415,
             json!({ "error": "content type must be application/json" }),
@@ -146,22 +255,42 @@ fn handle_mcp_post(server: McpServer, request: HttpRequest) -> HttpResponse {
     let message = match serde_json::from_slice::<Value>(&request.body) {
         Ok(message) => message,
         Err(error) => {
+            server.log(
+                LogEvent::new(LogLevel::Error, "http", "http_json_parse_failed")
+                    .field("http_request_id", request_id)
+                    .field("body_bytes", request.body.len())
+                    .error(error.to_string()),
+            );
             return HttpResponse::json(400, json!({ "error": format!("parse error: {error}") }));
         }
     };
 
     if is_jsonrpc_response(&message) {
+        server.log(
+            LogEvent::new(LogLevel::Info, "http", "http_mcp_response_accepted")
+                .field("http_request_id", request_id),
+        );
         return HttpResponse::empty(202);
     }
 
     if is_jsonrpc_notification(&message) {
-        if message.get("method").and_then(Value::as_str) == Some("notifications/initialized") {
-            let _ = server.handle_message(message);
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("<invalid>")
+            .to_string();
+        if method == "notifications/initialized" {
+            let _ = server.handle_message_with_http_request_id(message, request_id);
         }
+        server.log(
+            LogEvent::new(LogLevel::Info, "http", "http_mcp_notification_accepted")
+                .field("http_request_id", request_id)
+                .field("method", method),
+        );
         return HttpResponse::empty(202);
     }
 
-    match server.handle_message(message) {
+    match server.handle_message_with_http_request_id(message, request_id) {
         Some(response) => HttpResponse::json(200, response),
         None => HttpResponse::empty(202),
     }
@@ -351,9 +480,11 @@ mod tests {
     };
     use crate::mcp::McpServer;
     use crate::tools::ToolService;
+    use dbgflow_core::logging::{LogEvent, LogSink};
     use dbgflow_core::session::SessionManager;
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn validates_json_content_type() {
@@ -386,6 +517,7 @@ mod tests {
         let response = route_request(
             test_server(),
             request("GET", "/healthz", HashMap::new(), Vec::new()),
+            1,
         );
 
         assert_eq!(response.status, 200);
@@ -397,6 +529,7 @@ mod tests {
         let response = route_request(
             test_server(),
             request("GET", "/mcp", HashMap::new(), Vec::new()),
+            1,
         );
 
         assert_eq!(response.status, 405);
@@ -414,7 +547,7 @@ mod tests {
         }))
         .expect("serialize body");
 
-        let response = route_request(test_server(), request("POST", "/mcp", headers, body));
+        let response = route_request(test_server(), request("POST", "/mcp", headers, body), 1);
 
         assert_eq!(response.status, 200);
         assert_eq!(json_body(response)["id"], 1);
@@ -430,7 +563,7 @@ mod tests {
         }))
         .expect("serialize body");
 
-        let response = route_request(test_server(), request("POST", "/mcp", headers, body));
+        let response = route_request(test_server(), request("POST", "/mcp", headers, body), 1);
 
         assert_eq!(response.status, 202);
         assert!(response.body.is_empty());
@@ -448,7 +581,7 @@ mod tests {
         }))
         .expect("serialize body");
 
-        let response = route_request(test_server(), request("POST", "/mcp", headers, body));
+        let response = route_request(test_server(), request("POST", "/mcp", headers, body), 1);
 
         assert_eq!(response.status, 200);
     }
@@ -462,15 +595,76 @@ mod tests {
         let response = route_request(
             test_server(),
             request("POST", "/mcp", headers, b"{}".to_vec()),
+            1,
         );
 
         assert_eq!(response.status, 403);
+    }
+
+    #[test]
+    fn mcp_post_logs_http_and_mcp_events() {
+        let logger = Arc::new(RecordingLogSink::default());
+        let server = test_server_with_logger(logger.clone());
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "method": "tools/call",
+            "params": {
+                "name": "missing_tool",
+                "arguments": {}
+            }
+        }))
+        .expect("serialize body");
+
+        let response = route_request(server, request("POST", "/mcp", headers, body), 42);
+
+        assert_eq!(response.status, 200);
+        let events = logger.events();
+        assert!(events.iter().any(|event| {
+            event.component == "mcp"
+                && event.event == "mcp_request_started"
+                && event.fields["method"] == "tools/call"
+                && event.fields["jsonrpc_id"] == "tools"
+                && event.fields["http_request_id"] == json!(42)
+        }));
+        assert!(events.iter().any(|event| {
+            event.component == "mcp"
+                && event.event == "mcp_request_finished"
+                && event.fields["method"] == "tools/call"
+                && event.fields["jsonrpc_id"] == "tools"
+                && event.fields["http_request_id"] == json!(42)
+        }));
+        assert!(events.iter().any(|event| {
+            event.component == "mcp"
+                && event.event == "mcp_tool_call_started"
+                && event.fields["tool_name"] == "missing_tool"
+                && event.fields["jsonrpc_id"] == "tools"
+                && event.fields["http_request_id"] == json!(42)
+        }));
+        assert!(events.iter().any(|event| {
+            event.component == "mcp"
+                && event.event == "mcp_tool_call_finished"
+                && event.fields["tool_name"] == "missing_tool"
+                && event.fields["jsonrpc_id"] == "tools"
+                && event.fields["http_request_id"] == json!(42)
+        }));
     }
 
     fn test_server() -> McpServer {
         McpServer::new(ToolService::new(SessionManager::with_artifact_root(
             std::env::temp_dir().join(format!("dbgflow-http-test-{}", std::process::id())),
         )))
+    }
+
+    fn test_server_with_logger(logger: Arc<dyn LogSink>) -> McpServer {
+        McpServer::new_with_logger(
+            ToolService::new(SessionManager::with_artifact_root(
+                std::env::temp_dir().join(format!("dbgflow-http-test-{}", std::process::id())),
+            )),
+            logger,
+        )
     }
 
     fn request(
@@ -489,5 +683,22 @@ mod tests {
 
     fn json_body(response: HttpResponse) -> Value {
         serde_json::from_slice(&response.body).expect("json response")
+    }
+
+    #[derive(Default)]
+    struct RecordingLogSink {
+        events: Mutex<Vec<LogEvent>>,
+    }
+
+    impl RecordingLogSink {
+        fn events(&self) -> Vec<LogEvent> {
+            self.events.lock().expect("events lock").clone()
+        }
+    }
+
+    impl LogSink for RecordingLogSink {
+        fn log(&self, event: LogEvent) {
+            self.events.lock().expect("events lock").push(event);
+        }
     }
 }

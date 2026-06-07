@@ -626,6 +626,34 @@ fn attach_target_rejects_invalid_pid() {
 }
 
 #[test]
+fn create_session_validation_failure_is_logged() {
+    let logger = Arc::new(RecordingLogSink::default());
+    let manager = SessionManager::with_worker_launcher_and_logger(
+        Arc::new(TestWorkerLauncher::new(WorkerBehavior::Normal)),
+        test_artifact_root("invalid-attach-logged"),
+        logger.clone(),
+    );
+
+    let error = manager
+        .create_session(CreateSession {
+            target: DebugTarget::Attach { pid: 0 },
+            startup_timeout_ms: None,
+        })
+        .expect_err("reject invalid pid");
+
+    assert!(error.to_string().contains("attach pid"));
+    let events = logger.events();
+    assert!(events.iter().any(|event| {
+        event.component == "session"
+            && event.event == "create_session_rejected"
+            && event
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("attach pid"))
+    }));
+}
+
+#[test]
 fn launch_target_is_allowed_by_default_but_executable_must_exist() {
     let manager = test_manager("launch-missing-executable", WorkerBehavior::Normal);
     let missing = std::env::temp_dir()

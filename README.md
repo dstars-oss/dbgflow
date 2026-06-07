@@ -189,6 +189,13 @@ artifacts under `<data-dir>\artifacts`. Each session writes
 `outputs\<command_id>.txt`. Runtime logs are retained for 7 days; artifacts are
 not automatically removed.
 
+For troubleshooting, start with the daily runtime log to correlate HTTP/MCP
+requests, tool calls, worker lifecycle, DbgEng operations, profile jobs, service
+startup/shutdown, durations, errors, and artifact paths. Then inspect the
+session or profile artifact directory referenced by the log. Runtime logs do not
+include debugger command output or full HTTP request bodies; command output is
+kept in the per-command output artifacts and session transcript.
+
 Build and install or uninstall the Windows service from the repository scripts:
 
 ```text

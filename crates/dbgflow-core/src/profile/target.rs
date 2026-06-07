@@ -3,6 +3,7 @@ use crate::{DbgFlowError, Result};
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub fn validate_profile_target(target: ProfileTarget) -> Result<ProfileTarget> {
@@ -42,7 +43,19 @@ pub trait TargetRunner: Send + Sync {
         timeout: Duration,
         stdout_path: &Path,
         stderr_path: &Path,
+        event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit>;
+}
+
+pub trait TargetEventSink: Send + Sync {
+    fn target_started(&self, pid: u32);
+}
+
+#[derive(Debug, Default)]
+pub struct NoopTargetEventSink;
+
+impl TargetEventSink for NoopTargetEventSink {
+    fn target_started(&self, _pid: u32) {}
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +68,7 @@ impl TargetRunner for ProcessTargetRunner {
         timeout: Duration,
         stdout_path: &Path,
         stderr_path: &Path,
+        event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         let ProfileTarget::Launch { executable, args } = target;
         let stdout = File::create(stdout_path).map_err(|error| {
@@ -72,6 +86,7 @@ impl TargetRunner for ProcessTargetRunner {
                 DbgFlowError::Backend(format!("launch profile target failed: {error}"))
             })?;
         let pid = child.id();
+        event_sink.target_started(pid);
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = child.try_wait().map_err(|error| {

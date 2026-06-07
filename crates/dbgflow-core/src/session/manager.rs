@@ -199,7 +199,19 @@ impl SessionManager {
     }
 
     pub fn create_session(&self, mut request: CreateSession) -> Result<Session> {
-        request.target = self.validate_target(request.target)?;
+        let requested_target = request.target.clone();
+        request.target = match self.validate_target(request.target) {
+            Ok(target) => target,
+            Err(error) => {
+                self.log(
+                    LogEvent::new(LogLevel::Error, "session", "create_session_rejected")
+                        .operation("create_session")
+                        .field("target", requested_target)
+                        .error(error.to_string()),
+                );
+                return Err(error);
+            }
+        };
 
         let mut sessions = self
             .sessions
@@ -211,6 +223,15 @@ impl SessionManager {
             .find(|session| session.target == request.target && session.state.is_reusable())
             .cloned()
         {
+            self.log(
+                LogEvent::new(LogLevel::Info, "session", "create_session_reused")
+                    .session_id(existing.id)
+                    .operation("create_session")
+                    .field("backend", existing.backend.clone())
+                    .field("backend_session_id", existing.backend_session_id.clone())
+                    .field("state", format!("{:?}", existing.state))
+                    .field("target", &existing.target),
+            );
             return Ok(existing);
         }
 
@@ -435,6 +456,12 @@ impl SessionManager {
         if request.command.trim().is_empty() {
             let error = DbgFlowError::Backend("empty command".to_string());
             self.audit_rejected_eval(&request, &error);
+            self.log(
+                LogEvent::new(LogLevel::Warn, "session", "eval_rejected")
+                    .session_id(request.session_id)
+                    .operation(request.command.clone())
+                    .error(error.to_string()),
+            );
             return Err(error);
         }
         let operation_lock = self.operation_lock(request.session_id)?;
@@ -444,17 +471,64 @@ impl SessionManager {
 
         let session = self.query_session(request.session_id)?;
         if session.state.is_terminal() {
-            return Err(DbgFlowError::SessionClosed(request.session_id));
+            let error = DbgFlowError::SessionClosed(request.session_id);
+            self.audit_rejected_eval(&request, &error);
+            self.log(
+                LogEvent::new(LogLevel::Warn, "session", "eval_rejected")
+                    .session_id(request.session_id)
+                    .backend_session_id(
+                        session
+                            .backend_session_id
+                            .clone()
+                            .unwrap_or_else(|| "worker".to_string()),
+                    )
+                    .operation(request.command.clone())
+                    .field("state", format!("{:?}", session.state))
+                    .error(error.to_string()),
+            );
+            return Err(error);
         }
         if !matches!(session.state, SessionState::Ready | SessionState::Break) {
-            return Err(DbgFlowError::Backend(format!(
-                "session is not ready: {:?}",
-                session.state
-            )));
+            let error = DbgFlowError::Backend(format!("session is not ready: {:?}", session.state));
+            self.audit_rejected_eval(&request, &error);
+            self.log(
+                LogEvent::new(LogLevel::Warn, "session", "eval_rejected")
+                    .session_id(request.session_id)
+                    .backend_session_id(
+                        session
+                            .backend_session_id
+                            .clone()
+                            .unwrap_or_else(|| "worker".to_string()),
+                    )
+                    .operation(request.command.clone())
+                    .field("state", format!("{:?}", session.state))
+                    .error(error.to_string()),
+            );
+            return Err(error);
         }
-        let worker = self.worker(request.session_id).ok_or_else(|| {
-            DbgFlowError::Backend("session worker is not initialized".to_string())
-        })?;
+        let worker = self
+            .worker(request.session_id)
+            .ok_or_else(|| DbgFlowError::Backend("session worker is not initialized".to_string()));
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.audit_rejected_eval(&request, &error);
+                self.log(
+                    LogEvent::new(LogLevel::Warn, "session", "eval_rejected")
+                        .session_id(request.session_id)
+                        .backend_session_id(
+                            session
+                                .backend_session_id
+                                .clone()
+                                .unwrap_or_else(|| "worker".to_string()),
+                        )
+                        .operation(request.command.clone())
+                        .field("state", format!("{:?}", session.state))
+                        .error(error.to_string()),
+                );
+                return Err(error);
+            }
+        };
 
         let started_at_unix_ms = now_unix_ms();
         let started = Instant::now();
@@ -493,9 +567,16 @@ impl SessionManager {
         self.log(
             LogEvent::new(LogLevel::Info, "session", "eval_started")
                 .session_id(request.session_id)
+                .backend_session_id(
+                    session
+                        .backend_session_id
+                        .clone()
+                        .unwrap_or_else(|| "worker".to_string()),
+                )
                 .operation(command.clone())
                 .field("command_id", command_id.clone())
-                .field("backend", session.backend.clone()),
+                .field("backend", session.backend.clone())
+                .field("state", format!("{:?}", session.state)),
         );
         let backend_result = worker.execute(
             command.clone(),
@@ -513,6 +594,12 @@ impl SessionManager {
                 self.log(
                     LogEvent::new(LogLevel::Error, "session", "eval_failed")
                         .session_id(request.session_id)
+                        .backend_session_id(
+                            session
+                                .backend_session_id
+                                .clone()
+                                .unwrap_or_else(|| "worker".to_string()),
+                        )
                         .operation(command.clone())
                         .duration_ms(duration_ms)
                         .field("command_id", command_id.clone())
@@ -561,6 +648,12 @@ impl SessionManager {
                 self.log(
                     LogEvent::new(LogLevel::Error, "session", "eval_artifact_failed")
                         .session_id(request.session_id)
+                        .backend_session_id(
+                            session
+                                .backend_session_id
+                                .clone()
+                                .unwrap_or_else(|| "worker".to_string()),
+                        )
                         .operation(command.clone())
                         .duration_ms(duration_ms)
                         .field("command_id", command_id.clone())
@@ -623,10 +716,22 @@ impl SessionManager {
         self.log(
             LogEvent::new(LogLevel::Info, "session", "eval_finished")
                 .session_id(request.session_id)
+                .backend_session_id(
+                    session
+                        .backend_session_id
+                        .clone()
+                        .unwrap_or_else(|| "worker".to_string()),
+                )
                 .operation(command)
                 .duration_ms(duration_ms)
                 .field("command_id", command_id)
-                .field("output_bytes", backend_result.output.len()),
+                .field("artifact_path", artifact.path.display().to_string())
+                .field("output_bytes", backend_result.output.len())
+                .field(
+                    "final_state",
+                    backend_result.final_state.map(|state| format!("{state:?}")),
+                )
+                .field("warnings_count", backend_result.warnings.len()),
         );
 
         Ok(EvalSessionResult {
@@ -1507,6 +1612,8 @@ fn mark_worker_unavailable(
     };
     let mut should_notify = false;
     let mut audit_event = None;
+    let mut operation_event = None;
+    let mut command_record = None;
     let mut transcript = None;
     if let Ok(mut sessions) = sessions.lock() {
         if let Some(session) = sessions.get_mut(&session_id) {
@@ -1514,7 +1621,8 @@ fn mark_worker_unavailable(
                 return;
             }
             let previous_state = session.state;
-            finalize_canceled_operation(session, OperationStatus::Failed, error.clone());
+            let finalized_operation =
+                finalize_canceled_operation(session, OperationStatus::Failed, error.clone());
             session.state = SessionState::Error;
             session.updated_at_unix_ms = now_unix_ms();
             session.current_operation = None;
@@ -1530,6 +1638,18 @@ fn mark_worker_unavailable(
                 Some(error.clone()),
                 Map::new(),
             ));
+            if let Some(operation) = finalized_operation {
+                command_record = Some(command_record_from_operation(
+                    &operation,
+                    updated.backend_session_id.clone(),
+                ));
+                operation_event = Some(operation_artifact_event(
+                    &updated,
+                    Some(previous_state),
+                    &operation,
+                    "eval_failed",
+                ));
+            }
             transcript = Some(format!(
                 "[{}] worker unavailable new_state={:?} error={}\n",
                 now_unix_ms(),
@@ -1553,6 +1673,26 @@ fn mark_worker_unavailable(
                 logger.log(
                     LogEvent::new(LogLevel::Warn, "session", "session_artifact_event_failed")
                         .session_id(session_id)
+                        .error(error.to_string()),
+                );
+            }
+        }
+        if let Some(record) = command_record {
+            if let Err(error) = artifacts.append_command_record(session_id, &record) {
+                logger.log(
+                    LogEvent::new(LogLevel::Warn, "session", "command_artifact_record_failed")
+                        .session_id(session_id)
+                        .field("command_id", record.command_id)
+                        .error(error.to_string()),
+                );
+            }
+        }
+        if let Some(event) = operation_event {
+            if let Err(error) = artifacts.append_event(session_id, &event) {
+                logger.log(
+                    LogEvent::new(LogLevel::Warn, "session", "session_artifact_event_failed")
+                        .session_id(session_id)
+                        .field("event", event.event)
                         .error(error.to_string()),
                 );
             }

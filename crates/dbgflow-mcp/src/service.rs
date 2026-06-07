@@ -72,11 +72,21 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
         FileLogSink::new(data_dir.join("logs"), 7)
             .map_err(|error| format!("initialize log directory: {error}"))?,
     );
-    log(
-        &logger,
-        LogLevel::Info,
-        "service_starting",
-        "service starting",
+    logger.log(
+        LogEvent::new(LogLevel::Info, "service", "service_starting")
+            .message("service starting")
+            .field("service_name", config.service_name.clone())
+            .field("bind", config.app.bind.to_string())
+            .field("data_dir", config.app.data_dir.display().to_string())
+            .field("proxy_source", format!("{:?}", config.app.proxy.source()))
+            .field(
+                "sysinternals_dir",
+                config
+                    .app
+                    .sysinternals_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            ),
     );
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -120,17 +130,16 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
         false,
     )?;
     match &result {
-        Ok(()) => log(
-            &logger,
-            LogLevel::Info,
-            "service_stopped",
-            "service stopped",
+        Ok(()) => logger.log(
+            LogEvent::new(LogLevel::Info, "service", "service_stopped")
+                .message("service stopped")
+                .field("service_name", config.service_name.clone()),
         ),
-        Err(error) => log(
-            &logger,
-            LogLevel::Error,
-            "service_stopped_with_error",
-            &format!("service stopped with error: {error}"),
+        Err(error) => logger.log(
+            LogEvent::new(LogLevel::Error, "service", "service_stopped_with_error")
+                .message(format!("service stopped with error: {error}"))
+                .field("service_name", config.service_name.clone())
+                .error(error.clone()),
         ),
     }
     set_status(
@@ -181,10 +190,6 @@ fn set_status(
             process_id: None,
         })
         .map_err(|error| error.to_string())
-}
-
-fn log(logger: &Arc<dyn LogSink>, level: LogLevel, event: &str, message: &str) {
-    logger.log(LogEvent::new(level, "service", event).message(message));
 }
 
 fn log_fallback(message: &str) {

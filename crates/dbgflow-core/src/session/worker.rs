@@ -208,44 +208,75 @@ impl ProcessSessionWorker {
             request_id,
             request,
         };
+        let method = input.request.method_name().to_string();
+        let request_started = Instant::now();
+        self.inner.logger.log(
+            LogEvent::new(LogLevel::Info, "session_worker", "worker_request_started")
+                .session_id(self.inner.session_id)
+                .field("pid", self.inner.pid)
+                .field("request_id", request_id)
+                .field("method", method.clone()),
+        );
         {
             let mut stdin = self
                 .inner
                 .stdin
                 .lock()
                 .map_err(|_| DbgFlowError::Backend("worker stdin lock poisoned".to_string()))?;
-            serde_json::to_writer(&mut *stdin, &input).map_err(|error| {
-                DbgFlowError::Backend(format!("write worker request failed: {error}"))
-            })?;
-            writeln!(&mut *stdin).map_err(|error| {
-                DbgFlowError::Backend(format!("write worker request newline failed: {error}"))
-            })?;
-            stdin.flush().map_err(|error| {
-                DbgFlowError::Backend(format!("flush worker request failed: {error}"))
-            })?;
+            if let Err(error) = serde_json::to_writer(&mut *stdin, &input) {
+                let error = DbgFlowError::Backend(format!("write worker request failed: {error}"));
+                self.log_worker_request_failed(request_id, &method, request_started, &error);
+                return Err(error);
+            }
+            if let Err(error) = writeln!(&mut *stdin) {
+                let error =
+                    DbgFlowError::Backend(format!("write worker request newline failed: {error}"));
+                self.log_worker_request_failed(request_id, &method, request_started, &error);
+                return Err(error);
+            }
+            if let Err(error) = stdin.flush() {
+                let error = DbgFlowError::Backend(format!("flush worker request failed: {error}"));
+                self.log_worker_request_failed(request_id, &method, request_started, &error);
+                return Err(error);
+            }
         }
 
         loop {
             let mut line = String::new();
-            let read = self
+            let read = match self
                 .inner
                 .stdout
                 .lock()
                 .map_err(|_| DbgFlowError::Backend("worker stdout lock poisoned".to_string()))?
                 .read_line(&mut line)
-                .map_err(|error| {
-                    DbgFlowError::Backend(format!("read worker response failed: {error}"))
-                })?;
+            {
+                Ok(read) => read,
+                Err(error) => {
+                    let error =
+                        DbgFlowError::Backend(format!("read worker response failed: {error}"));
+                    self.log_worker_request_failed(request_id, &method, request_started, &error);
+                    return Err(error);
+                }
+            };
             if read == 0 {
-                return Err(DbgFlowError::Backend(format!(
+                let error = DbgFlowError::Backend(format!(
                     "session worker process exited before response: pid {}",
                     self.inner.pid
-                )));
+                ));
+                self.log_worker_request_failed(request_id, &method, request_started, &error);
+                return Err(error);
             }
 
-            match serde_json::from_str::<WorkerOutput>(&line).map_err(|error| {
-                DbgFlowError::Backend(format!("parse worker response failed: {error}"))
-            })? {
+            let output = match serde_json::from_str::<WorkerOutput>(&line) {
+                Ok(output) => output,
+                Err(error) => {
+                    let error =
+                        DbgFlowError::Backend(format!("parse worker response failed: {error}"));
+                    self.log_worker_request_failed(request_id, &method, request_started, &error);
+                    return Err(error);
+                }
+            };
+            match output {
                 WorkerOutput::Log { event } => self.inner.logger.log(event),
                 WorkerOutput::ExecutionStateChanged { event } => {
                     if let Some(event_sink) = &event_sink {
@@ -258,19 +289,73 @@ impl ProcessSessionWorker {
                     error,
                 } => {
                     if response_id != request_id {
-                        return Err(DbgFlowError::Backend(format!(
+                        let error = DbgFlowError::Backend(format!(
                             "unexpected worker response id: expected {request_id}, got {response_id}"
-                        )));
+                        ));
+                        self.log_worker_request_failed(
+                            request_id,
+                            &method,
+                            request_started,
+                            &error,
+                        );
+                        return Err(error);
                     }
                     if let Some(error) = error {
-                        return Err(DbgFlowError::Backend(error));
+                        let error = DbgFlowError::Backend(error);
+                        self.log_worker_request_failed(
+                            request_id,
+                            &method,
+                            request_started,
+                            &error,
+                        );
+                        return Err(error);
                     }
-                    return result.ok_or_else(|| {
+                    let result = result.ok_or_else(|| {
                         DbgFlowError::Backend("worker response missing result".to_string())
                     });
+                    match &result {
+                        Ok(result) => self.inner.logger.log(
+                            LogEvent::new(
+                                LogLevel::Info,
+                                "session_worker",
+                                "worker_request_finished",
+                            )
+                            .session_id(self.inner.session_id)
+                            .duration_ms(request_started.elapsed().as_millis())
+                            .field("pid", self.inner.pid)
+                            .field("request_id", request_id)
+                            .field("method", method.clone())
+                            .field("result", result.result_name()),
+                        ),
+                        Err(error) => self.log_worker_request_failed(
+                            request_id,
+                            &method,
+                            request_started,
+                            error,
+                        ),
+                    }
+                    return result;
                 }
             }
         }
+    }
+
+    fn log_worker_request_failed(
+        &self,
+        request_id: u64,
+        method: &str,
+        started: Instant,
+        error: &DbgFlowError,
+    ) {
+        self.inner.logger.log(
+            LogEvent::new(LogLevel::Error, "session_worker", "worker_request_failed")
+                .session_id(self.inner.session_id)
+                .duration_ms(started.elapsed().as_millis())
+                .field("pid", self.inner.pid)
+                .field("request_id", request_id)
+                .field("method", method)
+                .error(error.to_string()),
+        );
     }
 
     fn request_with_timeout(
@@ -278,6 +363,7 @@ impl ProcessSessionWorker {
         request: WorkerRequest,
         timeout: Duration,
     ) -> Result<WorkerResult> {
+        let method = request.method_name().to_string();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let worker = self.clone();
         thread::spawn(move || {
@@ -287,6 +373,13 @@ impl ProcessSessionWorker {
         match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.inner.logger.log(
+                    LogEvent::new(LogLevel::Error, "session_worker", "worker_request_timeout")
+                        .session_id(self.inner.session_id)
+                        .field("pid", self.inner.pid)
+                        .field("method", method)
+                        .field("timeout_ms", timeout.as_millis() as u64),
+                );
                 self.kill("worker_request_timeout")?;
                 Err(DbgFlowError::Backend(format!(
                     "session worker request timed out after {} ms",
@@ -477,6 +570,16 @@ enum WorkerRequest {
     CloseSession,
 }
 
+impl WorkerRequest {
+    fn method_name(&self) -> &'static str {
+        match self {
+            Self::CreateSession { .. } => "create_session",
+            Self::Execute { .. } => "execute",
+            Self::CloseSession => "close_session",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WorkerOutput {
@@ -507,6 +610,16 @@ enum WorkerResult {
         final_state: Option<crate::backend::BackendExecutionState>,
     },
     Closed,
+}
+
+impl WorkerResult {
+    fn result_name(&self) -> &'static str {
+        match self {
+            Self::SessionCreated { .. } => "session_created",
+            Self::Executed { .. } => "executed",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 pub fn run_session_worker_stdio<R, W>(input: R, output: W) -> std::io::Result<()>

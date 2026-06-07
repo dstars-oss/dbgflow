@@ -509,7 +509,6 @@ impl DbgEngSession {
         startup_cancel: Arc<StartupCancellation>,
     ) -> Result<Self> {
         let startup_started = Instant::now();
-        startup_cancel.check_canceled()?;
         logger.log(
             dbgeng_event(
                 LogLevel::Info,
@@ -520,6 +519,39 @@ impl DbgEngSession {
             .field("target", target),
         );
 
+        let result = Self::open_target_inner(
+            backend_session_id,
+            correlation_id.clone(),
+            target,
+            logger.clone(),
+            startup_cancel,
+            startup_started,
+        );
+        if let Err(error) = &result {
+            logger.log(
+                dbgeng_event(
+                    LogLevel::Error,
+                    "open_target_failed",
+                    &correlation_id,
+                    Some(backend_session_id),
+                )
+                .duration_ms(startup_started.elapsed().as_millis())
+                .field("target", target)
+                .error(error.to_string()),
+            );
+        }
+        result
+    }
+
+    fn open_target_inner(
+        backend_session_id: &str,
+        correlation_id: Option<String>,
+        target: &DebugTarget,
+        logger: Arc<dyn LogSink>,
+        startup_cancel: Arc<StartupCancellation>,
+        startup_started: Instant,
+    ) -> Result<Self> {
+        startup_cancel.check_canceled()?;
         let _dbgeng_guard = global_dbgeng_lock().lock().map_err(|_| {
             DbgFlowError::Backend("global dbgeng operation lock poisoned".to_string())
         })?;
@@ -765,77 +797,106 @@ impl DbgEngSession {
             )
             .operation(command_text.clone()),
         );
-        {
-            let mut output = self
-                .output
-                .lock()
-                .map_err(|_| DbgFlowError::Backend("dbgeng output buffer poisoned".to_string()))?;
-            output.clear();
-        }
-
-        if command.contains('\0') {
-            return Err(DbgFlowError::Backend(
-                "command contains NUL byte".to_string(),
-            ));
-        }
-        let command = to_wide_null_str(command);
-        unsafe {
-            self.control
-                .ExecuteWide(
-                    DEBUG_OUTCTL_ALL_CLIENTS,
-                    PCWSTR(command.as_ptr()),
-                    DEBUG_EXECUTE_DEFAULT,
-                )
-                .map_err(|error| {
-                    DbgFlowError::Backend(format!("IDebugControl4::ExecuteWide failed: {error}"))
+        let result = (|| -> Result<ExecuteBackendResult> {
+            {
+                let mut output = self.output.lock().map_err(|_| {
+                    DbgFlowError::Backend("dbgeng output buffer poisoned".to_string())
                 })?;
-        }
+                output.clear();
+            }
 
-        let mut warnings = Vec::new();
-        let mut final_state = self.query_execution_state()?;
-        if final_state == Some(BackendExecutionState::Running) {
-            event_sink.execution_state_changed(BackendExecutionEvent {
-                state: BackendExecutionState::Running,
-                reason: Some("dbgeng execution status running".to_string()),
-            });
-            warnings.extend(wait_for_execution_event(&self.control)?);
-            final_state = self.query_execution_state()?;
-            if let Some(state) = final_state {
+            if command.contains('\0') {
+                return Err(DbgFlowError::Backend(
+                    "command contains NUL byte".to_string(),
+                ));
+            }
+            let command = to_wide_null_str(command);
+            unsafe {
+                self.control
+                    .ExecuteWide(
+                        DEBUG_OUTCTL_ALL_CLIENTS,
+                        PCWSTR(command.as_ptr()),
+                        DEBUG_EXECUTE_DEFAULT,
+                    )
+                    .map_err(|error| {
+                        DbgFlowError::Backend(format!(
+                            "IDebugControl4::ExecuteWide failed: {error}"
+                        ))
+                    })?;
+            }
+
+            let mut warnings = Vec::new();
+            let mut final_state = self.query_execution_state()?;
+            if final_state == Some(BackendExecutionState::Running) {
                 event_sink.execution_state_changed(BackendExecutionEvent {
-                    state,
-                    reason: Some("dbgeng wait event returned".to_string()),
+                    state: BackendExecutionState::Running,
+                    reason: Some("dbgeng execution status running".to_string()),
+                });
+                warnings.extend(wait_for_execution_event(&self.control)?);
+                final_state = self.query_execution_state()?;
+                if let Some(state) = final_state {
+                    event_sink.execution_state_changed(BackendExecutionEvent {
+                        state,
+                        reason: Some("dbgeng wait event returned".to_string()),
+                    });
+                }
+            } else if final_state == Some(BackendExecutionState::Closed) {
+                event_sink.execution_state_changed(BackendExecutionEvent {
+                    state: BackendExecutionState::Closed,
+                    reason: Some("dbgeng execution status no debuggee".to_string()),
                 });
             }
-        } else if final_state == Some(BackendExecutionState::Closed) {
-            event_sink.execution_state_changed(BackendExecutionEvent {
-                state: BackendExecutionState::Closed,
-                reason: Some("dbgeng execution status no debuggee".to_string()),
-            });
+
+            let output = self
+                .output
+                .lock()
+                .map_err(|_| DbgFlowError::Backend("dbgeng output buffer poisoned".to_string()))?
+                .clone();
+
+            Ok(ExecuteBackendResult {
+                output,
+                warnings,
+                final_state,
+            })
+        })();
+
+        match result {
+            Ok(result) => {
+                self.logger.log(
+                    dbgeng_event(
+                        LogLevel::Info,
+                        "execute_finished",
+                        &self.correlation_id,
+                        Some(&self.backend_session_id),
+                    )
+                    .operation(command_text)
+                    .duration_ms(started.elapsed().as_millis())
+                    .field("output_bytes", result.output.len())
+                    .field("warnings_count", result.warnings.len())
+                    .field(
+                        "final_state",
+                        result.final_state.map(|state| format!("{state:?}")),
+                    ),
+                );
+                Ok(result)
+            }
+            Err(error) => {
+                let final_state = self.query_execution_state().ok().flatten();
+                self.logger.log(
+                    dbgeng_event(
+                        LogLevel::Error,
+                        "execute_failed",
+                        &self.correlation_id,
+                        Some(&self.backend_session_id),
+                    )
+                    .operation(command_text)
+                    .duration_ms(started.elapsed().as_millis())
+                    .field("final_state", final_state.map(|state| format!("{state:?}")))
+                    .error(error.to_string()),
+                );
+                Err(error)
+            }
         }
-
-        let output = self
-            .output
-            .lock()
-            .map_err(|_| DbgFlowError::Backend("dbgeng output buffer poisoned".to_string()))?
-            .clone();
-
-        self.logger.log(
-            dbgeng_event(
-                LogLevel::Info,
-                "execute_finished",
-                &self.correlation_id,
-                Some(&self.backend_session_id),
-            )
-            .operation(command_text)
-            .duration_ms(started.elapsed().as_millis())
-            .field("output_bytes", output.len()),
-        );
-
-        Ok(ExecuteBackendResult {
-            output,
-            warnings,
-            final_state,
-        })
     }
 
     fn query_execution_state(&self) -> Result<Option<BackendExecutionState>> {

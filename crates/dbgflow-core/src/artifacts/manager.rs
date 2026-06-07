@@ -92,6 +92,13 @@ impl ArtifactManager {
             .join("profile.json")
     }
 
+    pub fn profile_events_path(&self, profile_id: ProfileId) -> PathBuf {
+        self.root
+            .join("profiles")
+            .join(profile_id.to_string())
+            .join("events.jsonl")
+    }
+
     pub fn profile_stdout_path(&self, profile_id: ProfileId) -> PathBuf {
         self.root
             .join("profiles")

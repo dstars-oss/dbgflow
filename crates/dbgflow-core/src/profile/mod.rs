@@ -18,4 +18,7 @@ pub use model::{
     ProfileResult, ProfileStatus, ProfileTarget, RunProfile,
 };
 pub use procmon::ProcmonRuntime;
-pub use target::{validate_profile_target, ProcessTargetRunner, TargetExit, TargetRunner};
+pub use target::{
+    validate_profile_target, NoopTargetEventSink, ProcessTargetRunner, TargetEventSink, TargetExit,
+    TargetRunner,
+};

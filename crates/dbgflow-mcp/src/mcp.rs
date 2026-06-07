@@ -1,6 +1,6 @@
 use crate::logging::FileLogSink;
 use crate::tools::{ToolCallError, ToolService};
-use dbgflow_core::logging::LogSink;
+use dbgflow_core::logging::{noop_logger, LogEvent, LogLevel, LogSink};
 use dbgflow_core::profile::ProfileManager;
 use dbgflow_core::proxy::ProxyEnvironment;
 use dbgflow_core::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Instant;
 
 const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -19,21 +20,53 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
 #[derive(Clone)]
 pub struct McpServer {
     service: ToolService,
+    logger: Arc<dyn LogSink>,
 }
 
 impl McpServer {
     pub fn new(service: ToolService) -> Self {
-        Self { service }
+        Self::new_with_logger(service, noop_logger())
+    }
+
+    pub fn new_with_logger(service: ToolService, logger: Arc<dyn LogSink>) -> Self {
+        Self { service, logger }
     }
 
     pub fn handle_message(&self, message: Value) -> Option<Value> {
+        self.handle_message_with_context(message, None)
+    }
+
+    pub(crate) fn handle_message_with_http_request_id(
+        &self,
+        message: Value,
+        http_request_id: u64,
+    ) -> Option<Value> {
+        self.handle_message_with_context(message, Some(http_request_id))
+    }
+
+    fn handle_message_with_context(
+        &self,
+        message: Value,
+        http_request_id: Option<u64>,
+    ) -> Option<Value> {
         let Some(object) = message.as_object() else {
+            self.log_with_context(
+                LogEvent::new(LogLevel::Error, "mcp", "mcp_request_rejected")
+                    .error("invalid request"),
+                http_request_id,
+            );
             return Some(error_response(Value::Null, -32600, "invalid request"));
         };
 
         let id = object.get("id").cloned();
         let response_id = id.clone().unwrap_or(Value::Null);
         if object.get("jsonrpc").and_then(Value::as_str) != Some(JSONRPC_VERSION) {
+            self.log_with_context(
+                LogEvent::new(LogLevel::Error, "mcp", "mcp_request_rejected")
+                    .field("jsonrpc_id", jsonrpc_id_label(id.as_ref()))
+                    .error("invalid JSON-RPC version"),
+                http_request_id,
+            );
             return Some(error_response(
                 response_id,
                 -32600,
@@ -42,6 +75,12 @@ impl McpServer {
         }
 
         if id.as_ref().is_some_and(|id| !is_valid_request_id(id)) {
+            self.log_with_context(
+                LogEvent::new(LogLevel::Error, "mcp", "mcp_request_rejected")
+                    .field("jsonrpc_id", jsonrpc_id_label(id.as_ref()))
+                    .error("invalid JSON-RPC request id"),
+                http_request_id,
+            );
             return Some(error_response(
                 Value::Null,
                 -32600,
@@ -51,16 +90,47 @@ impl McpServer {
 
         let method = match message.get("method").and_then(Value::as_str) {
             Some(method) => method,
-            None => return Some(error_response(response_id, -32600, "invalid request")),
+            None => {
+                self.log_with_context(
+                    LogEvent::new(LogLevel::Error, "mcp", "mcp_request_rejected")
+                        .field("jsonrpc_id", jsonrpc_id_label(id.as_ref()))
+                        .error("invalid request"),
+                    http_request_id,
+                );
+                return Some(error_response(response_id, -32600, "invalid request"));
+            }
         };
         let is_notification = id.is_none();
+        let started = Instant::now();
+        self.log_with_context(
+            LogEvent::new(LogLevel::Info, "mcp", "mcp_request_started")
+                .field("method", method)
+                .field("jsonrpc_id", jsonrpc_id_label(id.as_ref()))
+                .field("is_notification", is_notification),
+            http_request_id,
+        );
 
         let result = match method {
             "initialize" => self.initialize(message.get("params").cloned().unwrap_or_default()),
-            "notifications/initialized" => return None,
+            "notifications/initialized" => {
+                self.log_with_context(
+                    LogEvent::new(LogLevel::Info, "mcp", "mcp_request_finished")
+                        .duration_ms(started.elapsed().as_millis())
+                        .field("method", method)
+                        .field("jsonrpc_id", jsonrpc_id_label(id.as_ref()))
+                        .field("is_notification", true)
+                        .field("response", "accepted"),
+                    http_request_id,
+                );
+                return None;
+            }
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": self.service.tool_descriptors() })),
-            "tools/call" => self.call_tool(message.get("params").cloned().unwrap_or_default()),
+            "tools/call" => self.call_tool(
+                message.get("params").cloned().unwrap_or_default(),
+                http_request_id,
+                id.as_ref(),
+            ),
             "resources/list" => self.resources_list(),
             "resources/read" => {
                 self.resources_read(message.get("params").cloned().unwrap_or_default())
@@ -72,6 +142,16 @@ impl McpServer {
         };
 
         if is_notification {
+            self.log_with_context(
+                LogEvent::new(LogLevel::Error, "mcp", "mcp_request_finished")
+                    .duration_ms(started.elapsed().as_millis())
+                    .field("method", method)
+                    .field("jsonrpc_id", jsonrpc_id_label(id.as_ref()))
+                    .field("is_notification", true)
+                    .field("error_code", -32600)
+                    .error("request method requires id"),
+                http_request_id,
+            );
             return Some(error_response(
                 Value::Null,
                 -32600,
@@ -81,8 +161,30 @@ impl McpServer {
 
         let id = id.expect("request id checked above");
         Some(match result {
-            Ok(result) => success_response(id, result),
-            Err(error) => error_response(id, error.code, &error.message),
+            Ok(result) => {
+                self.log_with_context(
+                    LogEvent::new(LogLevel::Info, "mcp", "mcp_request_finished")
+                        .duration_ms(started.elapsed().as_millis())
+                        .field("method", method)
+                        .field("jsonrpc_id", jsonrpc_id_label(Some(&id)))
+                        .field("is_notification", false),
+                    http_request_id,
+                );
+                success_response(id, result)
+            }
+            Err(error) => {
+                self.log_with_context(
+                    LogEvent::new(LogLevel::Error, "mcp", "mcp_request_finished")
+                        .duration_ms(started.elapsed().as_millis())
+                        .field("method", method)
+                        .field("jsonrpc_id", jsonrpc_id_label(Some(&id)))
+                        .field("is_notification", false)
+                        .field("error_code", error.code)
+                        .error(error.message.clone()),
+                    http_request_id,
+                );
+                error_response(id, error.code, &error.message)
+            }
         })
     }
 
@@ -117,7 +219,12 @@ impl McpServer {
         }))
     }
 
-    fn call_tool(&self, params: Value) -> std::result::Result<Value, ServerError> {
+    fn call_tool(
+        &self,
+        params: Value,
+        http_request_id: Option<u64>,
+        jsonrpc_id: Option<&Value>,
+    ) -> std::result::Result<Value, ServerError> {
         let params: CallToolParams = serde_json::from_value(params).map_err(|error| {
             ServerError::new(-32602, format!("invalid tools/call params: {error}"))
         })?;
@@ -125,14 +232,50 @@ impl McpServer {
         let arguments = params
             .arguments
             .unwrap_or(Value::Object(Default::default()));
+        let jsonrpc_id = jsonrpc_id_label(jsonrpc_id);
+        let started = Instant::now();
+        self.log_with_context(
+            LogEvent::new(LogLevel::Info, "mcp", "mcp_tool_call_started")
+                .field("tool_name", params.name.clone())
+                .field("jsonrpc_id", jsonrpc_id.clone()),
+            http_request_id,
+        );
         let result = match self.service.call_tool(&params.name, arguments) {
             Ok(value) => tool_success(value),
             Err(ToolCallError::InvalidRequest(message)) => {
+                self.log_with_context(
+                    LogEvent::new(LogLevel::Error, "mcp", "mcp_tool_call_finished")
+                        .duration_ms(started.elapsed().as_millis())
+                        .field("tool_name", params.name.clone())
+                        .field("jsonrpc_id", jsonrpc_id.clone())
+                        .field("error_kind", "invalid_request")
+                        .error(message.clone()),
+                    http_request_id,
+                );
                 return Err(ServerError::new(-32602, message));
             }
-            Err(ToolCallError::Execution(message)) => tool_error(message),
+            Err(ToolCallError::Execution(message)) => {
+                self.log_with_context(
+                    LogEvent::new(LogLevel::Warn, "mcp", "mcp_tool_call_finished")
+                        .duration_ms(started.elapsed().as_millis())
+                        .field("tool_name", params.name.clone())
+                        .field("jsonrpc_id", jsonrpc_id.clone())
+                        .field("is_tool_error", true)
+                        .error(message.clone()),
+                    http_request_id,
+                );
+                return Ok(tool_error(message));
+            }
         };
 
+        self.log_with_context(
+            LogEvent::new(LogLevel::Info, "mcp", "mcp_tool_call_finished")
+                .duration_ms(started.elapsed().as_millis())
+                .field("tool_name", params.name)
+                .field("jsonrpc_id", jsonrpc_id)
+                .field("is_tool_error", false),
+            http_request_id,
+        );
         Ok(result)
     }
 
@@ -179,6 +322,14 @@ impl McpServer {
 
     pub fn session_update_receiver(&self) -> mpsc::Receiver<SessionId> {
         self.service.subscribe_session_updates()
+    }
+
+    pub(crate) fn log(&self, event: LogEvent) {
+        self.logger.log(event);
+    }
+
+    fn log_with_context(&self, event: LogEvent, http_request_id: Option<u64>) {
+        self.log(with_http_request_id(event, http_request_id));
     }
 }
 
@@ -322,13 +473,14 @@ pub fn server_with_data_dir_proxy_sysinternals_and_logger(
         default_process_worker_launcher(),
         &artifact_root,
         proxy,
-        logger,
+        logger.clone(),
     );
-    let profiles = ProfileManager::with_runtime(
+    let profiles = ProfileManager::with_runtime_and_logger(
         &artifact_root,
         dbgflow_core::profile::ProcmonRuntime::from(sysinternals_dir),
+        logger.clone(),
     );
-    McpServer::new(ToolService::with_profiles(sessions, profiles))
+    McpServer::new_with_logger(ToolService::with_profiles(sessions, profiles), logger)
 }
 
 fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {
@@ -345,6 +497,21 @@ fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {
 
 fn is_valid_request_id(id: &Value) -> bool {
     id.is_string() || id.is_number() || id.is_null()
+}
+
+fn jsonrpc_id_label(id: Option<&Value>) -> String {
+    match id {
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => "<notification>".to_string(),
+    }
+}
+
+fn with_http_request_id(event: LogEvent, http_request_id: Option<u64>) -> LogEvent {
+    match http_request_id {
+        Some(http_request_id) => event.field("http_request_id", http_request_id),
+        None => event,
+    }
 }
 
 #[cfg(test)]
