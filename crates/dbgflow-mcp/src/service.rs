@@ -1,6 +1,6 @@
 use crate::http::{run_http, HttpConfig};
 use crate::logging::FileLogSink;
-use crate::mcp::server_with_data_dir_and_logger;
+use crate::mcp::server_with_data_dir_proxy_and_logger;
 use crate::runtime::{
     remove_install_files_target, service_process_options_from_command_line, ServiceInstallConfig,
     ServiceProcessConfig, ServiceUninstallConfig, SERVICE_DESCRIPTION,
@@ -92,7 +92,7 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
     )?;
 
     let result = run_http(
-        server_with_data_dir_and_logger(data_dir, logger.clone()),
+        server_with_data_dir_proxy_and_logger(data_dir, config.app.proxy.clone(), logger.clone()),
         HttpConfig {
             bind: config.app.bind,
         },

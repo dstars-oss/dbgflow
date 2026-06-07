@@ -1,6 +1,7 @@
 use crate::logging::FileLogSink;
 use crate::tools::{ToolCallError, ToolService};
 use dbgflow_core::logging::LogSink;
+use dbgflow_core::proxy::ProxyEnvironment;
 use dbgflow_core::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
 use dbgflow_core::session::SessionId;
 use serde::Deserialize;
@@ -265,23 +266,41 @@ fn parse_session_resource_uri(uri: &str) -> std::result::Result<SessionId, Serve
 pub fn server_with_data_dir(
     data_dir: impl Into<PathBuf>,
 ) -> std::result::Result<McpServer, String> {
+    server_with_data_dir_and_proxy(data_dir, ProxyEnvironment::none())
+}
+
+pub fn server_with_data_dir_and_proxy(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+) -> std::result::Result<McpServer, String> {
     let data_dir = data_dir.into();
     let logger = Arc::new(
         FileLogSink::new(data_dir.join("logs"), 7)
             .map_err(|error| format!("initialize log directory: {error}"))?,
     );
-    Ok(server_with_data_dir_and_logger(data_dir, logger))
+    Ok(server_with_data_dir_proxy_and_logger(
+        data_dir, proxy, logger,
+    ))
 }
 
 pub fn server_with_data_dir_and_logger(
     data_dir: impl Into<PathBuf>,
     logger: Arc<dyn LogSink>,
 ) -> McpServer {
+    server_with_data_dir_proxy_and_logger(data_dir, ProxyEnvironment::none(), logger)
+}
+
+pub fn server_with_data_dir_proxy_and_logger(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    logger: Arc<dyn LogSink>,
+) -> McpServer {
     let data_dir = data_dir.into();
     McpServer::new(ToolService::new(
-        dbgflow_core::session::SessionManager::with_worker_launcher_and_logger(
+        dbgflow_core::session::SessionManager::with_worker_launcher_proxy_and_logger(
             default_process_worker_launcher(),
             data_dir.join("artifacts"),
+            proxy,
             logger,
         ),
     ))
