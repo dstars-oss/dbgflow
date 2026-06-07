@@ -39,13 +39,17 @@ use super::{
 #[cfg(windows)]
 use crate::{DbgFlowError, Result};
 #[cfg(windows)]
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+#[cfg(windows)]
 use std::ffi::OsStr;
 #[cfg(windows)]
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::ptr::NonNull;
 #[cfg(windows)]
 use std::sync::Mutex;
 #[cfg(windows)]
@@ -53,7 +57,7 @@ use uuid::Uuid;
 #[cfg(windows)]
 use windows::core::PCWSTR;
 #[cfg(windows)]
-use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS, WIN32_ERROR};
 #[cfg(windows)]
 use windows::Win32::System::Diagnostics::Etw::{
     ControlTraceW, StartTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_STOP,
@@ -133,16 +137,15 @@ impl ProfileCollector for NativeEtwCollector {
             .state
             .lock()
             .map_err(|_| DbgFlowError::Backend("native ETW collector lock poisoned".to_string()))?;
-        let Some(session_name) = state.session_name.take() else {
+        let Some(session_name) = state.session_name.clone() else {
             return Ok(CollectorStop {
                 warnings: vec!["native ETW collector was not started".to_string()],
             });
         };
 
-        stop_trace_session(&session_name)?;
-        Ok(CollectorStop {
-            warnings: Vec::new(),
-        })
+        let warnings = stop_trace_session(&session_name, &self.trace_path)?;
+        state.session_name = None;
+        Ok(CollectorStop { warnings })
     }
 
     fn cleanup(&self) -> Result<()> {
@@ -153,7 +156,14 @@ impl ProfileCollector for NativeEtwCollector {
             .session_name
             .clone();
         if let Some(session_name) = session_name {
-            let _ = stop_trace_session(&session_name);
+            if stop_trace_session(&session_name, &self.trace_path).is_ok() {
+                let mut state = self.state.lock().map_err(|_| {
+                    DbgFlowError::Backend("native ETW collector lock poisoned".to_string())
+                })?;
+                if state.session_name.as_deref() == Some(session_name.as_str()) {
+                    state.session_name = None;
+                }
+            }
         }
         Ok(())
     }
@@ -166,8 +176,8 @@ fn start_trace_session(session_name: &str, trace_path: &Path) -> Result<()> {
     let properties_size = size_of::<EVENT_TRACE_PROPERTIES>()
         + session_name_w.len() * size_of::<u16>()
         + trace_path_w.len() * size_of::<u16>();
-    let mut buffer = vec![0u8; properties_size];
-    let properties = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+    let mut buffer = EtwPropertiesBuffer::new(properties_size)?;
+    let properties = buffer.properties();
 
     unsafe {
         (*properties).Wnode.BufferSize = properties_size as u32;
@@ -191,12 +201,12 @@ fn start_trace_session(session_name: &str, trace_path: &Path) -> Result<()> {
             (size_of::<EVENT_TRACE_PROPERTIES>() + session_name_w.len() * size_of::<u16>()) as u32;
 
         copy_wide_to_buffer(
-            &mut buffer,
+            buffer.as_bytes_mut(),
             (*properties).LoggerNameOffset as usize,
             &session_name_w,
         );
         copy_wide_to_buffer(
-            &mut buffer,
+            buffer.as_bytes_mut(),
             (*properties).LogFileNameOffset as usize,
             &trace_path_w,
         );
@@ -212,20 +222,29 @@ fn start_trace_session(session_name: &str, trace_path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn stop_trace_session(session_name: &str) -> Result<()> {
+fn stop_trace_session(session_name: &str, trace_path: &Path) -> Result<Vec<String>> {
     let session_name_w = wide_null(OsStr::new(session_name));
-    let properties_size =
-        size_of::<EVENT_TRACE_PROPERTIES>() + session_name_w.len() * size_of::<u16>();
-    let mut buffer = vec![0u8; properties_size];
-    let properties = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+    let trace_path_w = wide_null(trace_path.as_os_str());
+    let properties_size = size_of::<EVENT_TRACE_PROPERTIES>()
+        + session_name_w.len() * size_of::<u16>()
+        + trace_path_w.len() * size_of::<u16>();
+    let mut buffer = EtwPropertiesBuffer::new(properties_size)?;
+    let properties = buffer.properties();
 
     unsafe {
         (*properties).Wnode.BufferSize = properties_size as u32;
         (*properties).LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        (*properties).LogFileNameOffset =
+            (size_of::<EVENT_TRACE_PROPERTIES>() + session_name_w.len() * size_of::<u16>()) as u32;
         copy_wide_to_buffer(
-            &mut buffer,
+            buffer.as_bytes_mut(),
             (*properties).LoggerNameOffset as usize,
             &session_name_w,
+        );
+        copy_wide_to_buffer(
+            buffer.as_bytes_mut(),
+            (*properties).LogFileNameOffset as usize,
+            &trace_path_w,
         );
 
         let status = ControlTraceW(
@@ -234,12 +253,54 @@ fn stop_trace_session(session_name: &str) -> Result<()> {
             properties,
             EVENT_TRACE_CONTROL_STOP,
         );
+        if status == ERROR_MORE_DATA {
+            return Ok(vec![
+                "ControlTraceW stop returned ERROR_MORE_DATA after stopping the ETW session"
+                    .to_string(),
+            ]);
+        }
         if status != ERROR_SUCCESS {
             return Err(etw_error("ControlTraceW stop", status));
         }
     }
 
-    Ok(())
+    Ok(Vec::new())
+}
+
+#[cfg(windows)]
+struct EtwPropertiesBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+#[cfg(windows)]
+impl EtwPropertiesBuffer {
+    fn new(size: usize) -> Result<Self> {
+        let layout = Layout::from_size_align(size, align_of::<EVENT_TRACE_PROPERTIES>()).map_err(
+            |error| DbgFlowError::Backend(format!("invalid ETW buffer layout: {error}")),
+        )?;
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr)
+            .ok_or_else(|| DbgFlowError::Backend("allocate ETW properties buffer".to_string()))?;
+        Ok(Self { ptr, layout })
+    }
+
+    fn properties(&mut self) -> *mut EVENT_TRACE_PROPERTIES {
+        self.ptr.as_ptr() as *mut EVENT_TRACE_PROPERTIES
+    }
+
+    unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EtwPropertiesBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
 }
 
 #[cfg(windows)]

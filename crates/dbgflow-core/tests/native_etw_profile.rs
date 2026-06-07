@@ -30,6 +30,7 @@ fn native_etw_run_profile_writes_etl_for_cmd() {
         result.completion_reason,
         ProfileCompletionReason::TargetExited
     );
+    assert_eq!(result.error, None);
     assert!(result.artifacts.trace.path.is_file());
     assert!(
         result
@@ -42,4 +43,10 @@ fn native_etw_run_profile_writes_etl_for_cmd() {
             > 0,
         "expected non-empty ETL"
     );
+
+    let metadata: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&result.artifacts.profile.path).expect("read profile metadata"),
+    )
+    .expect("parse profile metadata");
+    assert_eq!(metadata["error"], serde_json::Value::Null);
 }
