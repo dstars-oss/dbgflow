@@ -89,7 +89,7 @@ function Convert-ToSymbolProxy {
     if ($Url -match "\s") {
         throw "ProxyUrl must not contain whitespace"
     }
-    if ($Url -notmatch "^(?<scheme>https?)://(?<authority>[^/?#]+)$") {
+    if ($Url -cnotmatch "^(?<scheme>https?)://(?<authority>[^/?#]+)$") {
         throw "ProxyUrl must use http:// or https://"
     }
 
