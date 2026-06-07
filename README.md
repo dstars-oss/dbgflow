@@ -89,12 +89,6 @@ sessions or the MCP server.
 Run the MCP server over local Streamable HTTP from the repository root:
 
 ```text
-cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir .\var
-```
-
-To configure runtime proxy settings for all session workers:
-
-```text
 cargo run -p dbgflow-mcp -- http --bind 127.0.0.1:7331 --data-dir .\var --proxy-url http://127.0.0.1:7897
 ```
 
