@@ -1,7 +1,8 @@
+use dbgflow_core::artifacts::ArtifactKind;
 use dbgflow_core::profile::{
-    validate_profile_target, CollectorStart, CollectorStop, ProfileCollector,
-    ProfileCollectorConfig, ProfileCollectorKind, ProfilePreset, ProfileTarget, TargetExit,
-    TargetRunner,
+    validate_profile_target, CollectorFactory, CollectorStart, CollectorStop, ProfileCollector,
+    ProfileCollectorConfig, ProfileCollectorKind, ProfileCompletionReason, ProfileManager,
+    ProfilePreset, ProfileStatus, ProfileTarget, RunProfile, TargetExit, TargetRunner,
 };
 use dbgflow_core::Result;
 use std::fs;
@@ -157,5 +158,159 @@ impl TargetRunner for TestTargetRunner {
         _stderr_path: &Path,
     ) -> Result<TargetExit> {
         Ok(self.exit.clone())
+    }
+}
+
+#[test]
+fn run_profile_starts_collector_launches_target_stops_collector_and_writes_artifacts() {
+    let root = test_profile_root("completed");
+    let collector_state = Arc::new(Mutex::new(Vec::new()));
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory {
+            state: collector_state.clone(),
+            fail_start: false,
+            fail_stop: false,
+        }),
+        Arc::new(TestTargetRunner {
+            exit: TargetExit::Exited {
+                pid: 1234,
+                exit_code: Some(7),
+            },
+        }),
+    );
+
+    let request = RunProfile {
+        target: ProfileTarget::Launch {
+            executable: std::env::current_exe().expect("current exe"),
+            args: Vec::new(),
+        },
+        timeout_ms: 1000,
+        collector: ProfileCollectorConfig::default(),
+    };
+
+    let result = manager.run_profile(request).expect("run profile");
+
+    assert_eq!(result.status, ProfileStatus::Completed);
+    assert_eq!(
+        result.completion_reason,
+        ProfileCompletionReason::TargetExited
+    );
+    assert_eq!(result.target_pid, Some(1234));
+    assert_eq!(result.target_exit_code, Some(7));
+    assert_eq!(result.artifacts.trace.kind, ArtifactKind::ProfileTrace);
+    assert!(result.artifacts.profile.path.is_file());
+    assert!(result.artifacts.events.path.is_file());
+    assert!(result.artifacts.stdout.path.is_file());
+    assert!(result.artifacts.stderr.path.is_file());
+    assert_eq!(
+        collector_state.lock().expect("state").as_slice(),
+        &["start".to_string(), "stop".to_string()]
+    );
+
+    let metadata =
+        fs::read_to_string(&result.artifacts.profile.path).expect("read profile metadata");
+    assert!(metadata.contains("target_exited"));
+    let events = fs::read_to_string(&result.artifacts.events.path).expect("read events");
+    assert!(events.contains("collector_started"));
+    assert!(events.contains("target_started"));
+    assert!(events.contains("collector_stopped"));
+    assert!(events.contains("profile_completed"));
+}
+
+#[test]
+fn run_profile_timeout_stops_collector_without_target_exit_code() {
+    let root = test_profile_root("timed-out");
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory::default()),
+        Arc::new(TestTargetRunner {
+            exit: TargetExit::TimedOut { pid: 88 },
+        }),
+    );
+
+    let result = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1,
+            collector: ProfileCollectorConfig::default(),
+        })
+        .expect("run profile");
+
+    assert_eq!(result.status, ProfileStatus::TimedOut);
+    assert_eq!(result.completion_reason, ProfileCompletionReason::Timeout);
+    assert_eq!(result.target_pid, Some(88));
+    assert_eq!(result.target_exit_code, None);
+}
+
+#[test]
+fn run_profile_collector_start_failure_does_not_launch_target() {
+    let root = test_profile_root("collector-start-failure");
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory {
+            state: Arc::new(Mutex::new(Vec::new())),
+            fail_start: true,
+            fail_stop: false,
+        }),
+        Arc::new(PanicTargetRunner),
+    );
+
+    let error = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1,
+            collector: ProfileCollectorConfig::default(),
+        })
+        .expect_err("collector start fails");
+
+    assert!(error.to_string().contains("collector start failed"));
+}
+
+fn test_profile_root(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("dbgflow-profile-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create root");
+    root
+}
+
+#[derive(Default)]
+struct TestCollectorFactory {
+    state: Arc<Mutex<Vec<String>>>,
+    fail_start: bool,
+    fail_stop: bool,
+}
+
+impl CollectorFactory for TestCollectorFactory {
+    fn create(
+        &self,
+        _config: &ProfileCollectorConfig,
+        _trace_path: &Path,
+    ) -> Result<Box<dyn ProfileCollector>> {
+        Ok(Box::new(TestCollector {
+            state: self.state.clone(),
+            fail_start: self.fail_start,
+            fail_stop: self.fail_stop,
+        }))
+    }
+}
+
+struct PanicTargetRunner;
+
+impl TargetRunner for PanicTargetRunner {
+    fn launch_and_wait(
+        &self,
+        _target: &ProfileTarget,
+        _timeout: Duration,
+        _stdout_path: &Path,
+        _stderr_path: &Path,
+    ) -> Result<TargetExit> {
+        panic!("target runner must not be called when collector start fails");
     }
 }
