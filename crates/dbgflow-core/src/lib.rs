@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod backend;
 pub mod error;
 pub mod logging;
+pub mod profile;
 pub mod proxy;
 pub mod session;
 
