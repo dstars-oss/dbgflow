@@ -7,5 +7,6 @@ artifacts/*
 *.dmp
 *.run
 *.trace
+.codex/
 issue/
 docs/superpowers/
