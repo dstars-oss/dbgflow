@@ -1,6 +1,7 @@
 use crate::logging::FileLogSink;
 use crate::tools::{ToolCallError, ToolService};
 use dbgflow_core::logging::LogSink;
+use dbgflow_core::profile::ProfileManager;
 use dbgflow_core::proxy::ProxyEnvironment;
 use dbgflow_core::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
 use dbgflow_core::session::SessionId;
@@ -296,14 +297,16 @@ pub fn server_with_data_dir_proxy_and_logger(
     logger: Arc<dyn LogSink>,
 ) -> McpServer {
     let data_dir = data_dir.into();
-    McpServer::new(ToolService::new(
+    let artifact_root = data_dir.join("artifacts");
+    let sessions =
         dbgflow_core::session::SessionManager::with_worker_launcher_proxy_and_logger(
             default_process_worker_launcher(),
-            data_dir.join("artifacts"),
+            &artifact_root,
             proxy,
             logger,
-        ),
-    ))
+        );
+    let profiles = ProfileManager::new(&artifact_root);
+    McpServer::new(ToolService::with_profiles(sessions, profiles))
 }
 
 fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {
