@@ -2,7 +2,7 @@ use dbgflow_core::proxy::ProxyEnvironment;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7331";
 pub const SERVICE_NAME: &str = "dbgflow-mcp";
@@ -46,7 +46,10 @@ pub struct ServiceInstallConfig {
     pub display_name: String,
     pub bind: SocketAddr,
     pub install_root: PathBuf,
+    pub proxy: ProxyEnvironment,
+    pub dbgeng_dir: Option<PathBuf>,
     pub sysinternals_dir: Option<PathBuf>,
+    pub interactive: bool,
 }
 
 impl ServiceInstallConfig {
@@ -79,6 +82,29 @@ impl ServiceInstallConfig {
             args.push(OsString::from("--sysinternals-dir"));
             args.push(sysinternals_dir.as_os_str().to_os_string());
         }
+        if let Some(dbgeng_dir) = &self.dbgeng_dir {
+            args.push(OsString::from("--dbgeng-dir"));
+            args.push(dbgeng_dir.as_os_str().to_os_string());
+        }
+        match self.proxy.source() {
+            dbgflow_core::proxy::ProxySource::Cli => {
+                if let Some(proxy_url) = self.proxy.value_for("HTTP_PROXY") {
+                    args.push(OsString::from("--proxy-url"));
+                    args.push(OsString::from(proxy_url));
+                }
+            }
+            dbgflow_core::proxy::ProxySource::Environment => {
+                for (key, value) in self.proxy.env_vars() {
+                    args.push(OsString::from("--proxy-env"));
+                    args.push(OsString::from(format!("{key}={value}")));
+                }
+            }
+            dbgflow_core::proxy::ProxySource::Disabled => {
+                args.push(OsString::from("--no-proxy"));
+            }
+            dbgflow_core::proxy::ProxySource::None => {}
+        }
+        args.push(OsString::from("--non-interactive"));
         args
     }
 
@@ -326,11 +352,27 @@ pub fn parse_service_install_options<I>(args: I) -> Result<ServiceInstallConfig,
 where
     I: IntoIterator<Item = OsString>,
 {
+    let env = std::env::vars().collect::<HashMap<_, _>>();
+    parse_service_install_options_with_env(args, &env)
+}
+
+fn parse_service_install_options_with_env<I>(
+    args: I,
+    env: &HashMap<String, String>,
+) -> Result<ServiceInstallConfig, String>
+where
+    I: IntoIterator<Item = OsString>,
+{
     let mut service_name = SERVICE_NAME.to_string();
     let mut display_name = SERVICE_DISPLAY_NAME.to_string();
     let mut bind = DEFAULT_BIND.parse().expect("valid default bind address");
     let mut install_root = None;
+    let mut proxy_url = None;
+    let mut no_proxy = false;
+    let mut proxy_env = HashMap::new();
+    let mut dbgeng_dir = None;
     let mut sysinternals_dir = None;
+    let mut interactive = true;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -354,6 +396,19 @@ where
             install_root = Some(PathBuf::from(value));
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--proxy-url=") {
+            proxy_url = Some(parse_non_empty(value, "--proxy-url")?);
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--proxy-env=") {
+            let (key, value) = parse_proxy_env_pair(value)?;
+            proxy_env.insert(key, value);
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--dbgeng-dir=") {
+            dbgeng_dir = Some(parse_dbgeng_dir(value, "--dbgeng-dir")?);
+            continue;
+        }
         if let Some(value) = arg.strip_prefix("--sysinternals-dir=") {
             sysinternals_dir = Some(parse_existing_dir(value, "--sysinternals-dir")?);
             continue;
@@ -375,10 +430,25 @@ where
                 let value = next_value(&mut args, "--install-root")?;
                 install_root = Some(PathBuf::from(value));
             }
+            "--proxy-url" => {
+                let value = next_value(&mut args, "--proxy-url")?;
+                proxy_url = Some(parse_non_empty(&value, "--proxy-url")?);
+            }
+            "--proxy-env" => {
+                let value = next_value(&mut args, "--proxy-env")?;
+                let (key, value) = parse_proxy_env_pair(&value)?;
+                proxy_env.insert(key, value);
+            }
+            "--dbgeng-dir" => {
+                let value = next_value(&mut args, "--dbgeng-dir")?;
+                dbgeng_dir = Some(parse_dbgeng_dir(&value, "--dbgeng-dir")?);
+            }
             "--sysinternals-dir" => {
                 let value = next_value(&mut args, "--sysinternals-dir")?;
                 sysinternals_dir = Some(parse_existing_dir(&value, "--sysinternals-dir")?);
             }
+            "--no-proxy" => no_proxy = true,
+            "--non-interactive" | "--yes" => interactive = false,
             "--help" | "-h" => return Err(service_install_help_text().to_string()),
             other => {
                 return Err(format!(
@@ -397,7 +467,10 @@ where
             Some(path) => path,
             None => default_install_root()?,
         },
+        proxy: resolve_service_install_proxy(proxy_url, no_proxy, proxy_env, env)?,
+        dbgeng_dir,
         sysinternals_dir,
+        interactive,
     })
 }
 
@@ -459,7 +532,7 @@ pub fn help_text() -> &'static str {
 }
 
 pub fn service_install_help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --sysinternals-dir <path>                           Optional Sysinternals directory for Procmon-based features"
+    "Usage:\n  dbgflow-mcp service install [options]\n\nOptions:\n  --service-name <name>                               Default: dbgflow-mcp\n  --display-name <name>                               Default: dbgflow MCP Server\n  --bind <addr:port>                                  Default: 127.0.0.1:7331\n  --install-root <path>                               Default: %LOCALAPPDATA%\\dbgflow\n  --proxy-url <url>                                   Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars for the service\n  --no-proxy                                         Clears known proxy vars for the service\n  --dbgeng-dir <path>                                 Directory containing dbgeng.dll\n  --sysinternals-dir <path>                           Optional Sysinternals directory for Procmon-based features\n  --non-interactive, --yes                            Use provided/default values without prompting"
 }
 
 pub fn service_uninstall_help_text() -> &'static str {
@@ -516,6 +589,55 @@ fn parse_existing_dir(value: &str, option: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn parse_dbgeng_dir(value: &str, option: &str) -> Result<PathBuf, String> {
+    let path = parse_existing_dir(value, option)?;
+    if !path.join("dbgeng.dll").is_file() {
+        return Err(format!(
+            "{option} must point to a directory containing dbgeng.dll: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn parse_proxy_env_pair(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| "--proxy-env must use KEY=VALUE".to_string())?;
+    if !is_known_proxy_key(key) {
+        return Err(format!("--proxy-env key is not supported: {key}"));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+pub fn dbgeng_dir_from_dependency_root(path: &Path) -> Option<PathBuf> {
+    if path.join("dbgeng.dll").is_file() {
+        return Some(path.to_path_buf());
+    }
+    let arch = debugger_arch();
+    let direct = path.join("Debuggers").join(arch);
+    if direct.join("dbgeng.dll").is_file() {
+        return Some(direct);
+    }
+    for prefix in [path.join("Windows Kits").join("10"), path.to_path_buf()] {
+        let candidate = prefix.join("Debuggers").join(arch);
+        if candidate.join("dbgeng.dll").is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn debugger_arch() -> &'static str {
+    if cfg!(target_arch = "x86") {
+        "x86"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    }
+}
+
 fn parse_service_name(value: &str) -> Result<String, String> {
     let service_name = parse_non_empty(value, "--service-name")?;
     if service_name
@@ -558,6 +680,22 @@ fn resolve_proxy(
     }
     let env = proxy_environment_map_without_empty_known_keys(env);
     ProxyEnvironment::from_environment_map(&env).map_err(|error| error.to_string())
+}
+
+fn resolve_service_install_proxy(
+    proxy_url: Option<String>,
+    no_proxy: bool,
+    proxy_env: HashMap<String, String>,
+    env: &HashMap<String, String>,
+) -> Result<ProxyEnvironment, String> {
+    if !proxy_env.is_empty() {
+        if no_proxy || proxy_url.is_some() {
+            return Err("--proxy-env cannot be used with --proxy-url or --no-proxy".to_string());
+        }
+        return ProxyEnvironment::from_environment_map(&proxy_env)
+            .map_err(|error| error.to_string());
+    }
+    resolve_proxy(proxy_url, no_proxy, env)
 }
 
 fn proxy_environment_map_without_empty_known_keys(
@@ -617,10 +755,10 @@ fn path_starts_with(path: &std::path::Path, base: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_options_with_env, parse_service_install_options,
-        parse_service_process_options_with_env, parse_service_uninstall_options,
-        remove_install_files_target, service_process_options_from_command_line_with_env,
-        DEFAULT_BIND, SERVICE_NAME,
+        dbgeng_dir_from_dependency_root, parse_options_with_env, parse_service_install_options,
+        parse_service_install_options_with_env, parse_service_process_options_with_env,
+        parse_service_uninstall_options, remove_install_files_target,
+        service_process_options_from_command_line_with_env, DEFAULT_BIND, SERVICE_NAME,
     };
     use std::collections::HashMap;
     use std::ffi::OsString;
@@ -944,6 +1082,7 @@ mod tests {
         assert_eq!(config.display_name, "dbgflow Dev");
         assert_eq!(config.bind.to_string(), "127.0.0.1:9002");
         assert_eq!(config.install_root, PathBuf::from("C:\\dbgflow"));
+        assert!(config.interactive);
         assert!(!config
             .normalized_command_args()
             .iter()
@@ -999,24 +1138,84 @@ mod tests {
 
     #[test]
     fn service_install_launch_arguments_do_not_include_proxy_url() {
-        let config = parse_service_install_options([
-            OsString::from("--service-name"),
-            OsString::from("dbgflow-dev"),
-            OsString::from("--install-root=C:\\dbgflow"),
-        ])
+        let config = parse_service_install_options_with_env(
+            [
+                OsString::from("--service-name"),
+                OsString::from("dbgflow-dev"),
+                OsString::from("--install-root=C:\\dbgflow"),
+            ],
+            &env(&[]),
+        )
         .expect("parse service install options");
 
-        for arg in config
-            .service_launch_arguments()
-            .iter()
-            .chain(config.normalized_command_args().iter())
-        {
+        for arg in config.service_launch_arguments() {
             let arg = arg.to_string_lossy();
             assert!(!arg.contains("7897"));
             assert_ne!(arg, "--proxy-url");
             assert!(!arg.starts_with("--proxy-url="));
             assert_ne!(arg, "--no-proxy");
         }
+    }
+
+    #[test]
+    fn service_install_normalized_arguments_include_proxy_and_non_interactive() {
+        let config = parse_service_install_options_with_env(
+            [
+                OsString::from("--install-root=C:\\dbgflow"),
+                OsString::from("--proxy-url=http://127.0.0.1:7897"),
+            ],
+            &env(&[]),
+        )
+        .expect("parse service install options");
+
+        let args = config.normalized_command_args();
+
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "--proxy-url" && pair[1] == "http://127.0.0.1:7897" }));
+        assert!(args.iter().any(|arg| arg == "--non-interactive"));
+    }
+
+    #[test]
+    fn service_install_normalized_arguments_preserve_environment_proxy() {
+        let config = parse_service_install_options_with_env(
+            [OsString::from("--install-root=C:\\dbgflow")],
+            &env(&[
+                ("_NT_SYMBOL_PROXY", "symproxy:80"),
+                ("HTTP_PROXY", "http://proxy:8080"),
+            ]),
+        )
+        .expect("parse service install options");
+
+        let args = config.normalized_command_args();
+        let reparsed = parse_service_install_options_with_env(args.into_iter().skip(2), &env(&[]))
+            .expect("parse normalized service install options");
+
+        assert_eq!(
+            reparsed.proxy.source(),
+            dbgflow_core::proxy::ProxySource::Environment
+        );
+        assert_eq!(
+            reparsed.proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
+            Some("symproxy:80")
+        );
+        assert_eq!(
+            reparsed.proxy.value_for("HTTP_PROXY").as_deref(),
+            Some("http://proxy:8080")
+        );
+        assert!(!reparsed.interactive);
+    }
+
+    #[test]
+    fn resolves_dbgeng_dir_from_windows_kits_root() {
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-install-dbgeng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dbgeng_dir = root.join("Debuggers").join(super::debugger_arch());
+        std::fs::create_dir_all(&dbgeng_dir).expect("create dbgeng dir");
+        std::fs::write(dbgeng_dir.join("dbgeng.dll"), b"dll").expect("write dbgeng");
+
+        assert_eq!(dbgeng_dir_from_dependency_root(&root), Some(dbgeng_dir));
     }
 
     #[test]

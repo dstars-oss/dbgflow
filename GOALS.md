@@ -338,6 +338,7 @@ Procmon 只从主服务 `--sysinternals-dir` 中派生 `Procmon64.exe` 或
 * [x] 支持本地 Streamable HTTP MCP endpoint。
 * [x] 支持 Windows service 安装 / 卸载子命令。
 * [x] 支持主服务级代理配置，并通过 `_NT_SYMBOL_PROXY` 支持 SymSrv 符号下载代理。
+* [x] 将 Windows service 交互式安装旅程、依赖探测、提权和 service 环境写入收敛到主程序。
 * [x] 补齐更多 live attach / launch HTTP E2E ignored 验证场景。
 * [x] 补齐 `transcript.log` 和 `events.jsonl` 审计链路。
 

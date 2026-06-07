@@ -195,25 +195,31 @@ Build and install or uninstall the Windows service from the repository scripts:
 .\scripts\uninstall-service.ps1
 ```
 
-The install script builds `dbgflow-mcp` in release mode and then invokes the
-built `target\release\dbgflow-mcp.exe service install` with the selected
-service parameters. The install subcommand copies its current executable to
+The install script only builds `dbgflow-mcp` in release mode and invokes the
+built `target\release\dbgflow-mcp.exe service install`. The install subcommand
+owns the rest of the flow: it prompts for service settings, detects local
+DbgEng in WinDbg Store packages first, Windows Kits / WDK Debuggers second, and
+the Windows directory last, detects Sysinternals from environment variables,
+`PATH`, and common Sysinternals directories, requests UAC elevation when needed,
+copies its current executable to
 `%LOCALAPPDATA%\dbgflow\bin`, installs it as LocalSystem with `service run
---data-dir %LOCALAPPDATA%\dbgflow\var`, starts it, and checks `/healthz`.
-Service artifacts and logs are written under `%LOCALAPPDATA%\dbgflow\var`.
-Uninstall does not delete artifacts or logs by default.
+--data-dir %LOCALAPPDATA%\dbgflow\var`, writes the selected service
+environment, starts the service, and checks `/healthz`. Service artifacts and
+logs are written under `%LOCALAPPDATA%\dbgflow\var`. Uninstall does not delete
+artifacts or logs by default.
 
-During installation, the script tries to detect a local Sysinternals directory
-and asks whether to write it as `--sysinternals-dir` for optional Procmon
-features. You can also pass `-SysinternalsDir <path>` explicitly. If no
-Sysinternals directory is configured, the service still installs and runs, but
-Procmon-based profiling is unavailable.
+During installation, accept the detected DbgEng directory or enter another
+directory containing `dbgeng.dll`. The selected path is written as
+`DBGFLOW_DBGENG_DIR` in the service environment and is preferred by the DbgEng
+resolver. Sysinternals is optional; if no Sysinternals directory is configured,
+the service still installs and runs, but Procmon-based profiling is
+unavailable.
 
-The install script configures the Windows service environment with
-`http://127.0.0.1:7897` by default, including `_NT_SYMBOL_PROXY=127.0.0.1:7897`.
-Use `-ProxyUrl <url>` to choose another proxy. Use `-NoProxy` to write empty
-known service proxy keys and override inherited machine or system proxy
-environment variables.
+The interactive installer uses `-ProxyUrl <url>` or existing proxy environment
+variables as the displayed proxy default. If neither is present, proxy is left
+unconfigured by default. Use `-NoProxy`, or type `none` at the prompt, to clear
+known service proxy keys. Use `-NonInteractive` to use provided/default CLI
+values without prompts.
 
 Live process DbgEng integration tests are ignored by default because attach and
 launch behavior depends on local debugger permissions and target process state.

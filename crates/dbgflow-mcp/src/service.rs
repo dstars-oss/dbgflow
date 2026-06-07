@@ -2,12 +2,15 @@ use crate::http::{run_http, HttpConfig};
 use crate::logging::FileLogSink;
 use crate::mcp::server_with_data_dir_proxy_sysinternals_and_logger;
 use crate::runtime::{
-    remove_install_files_target, service_process_options_from_command_line, ServiceInstallConfig,
-    ServiceProcessConfig, ServiceUninstallConfig, SERVICE_DESCRIPTION,
+    dbgeng_dir_from_dependency_root, remove_install_files_target,
+    service_process_options_from_command_line, ServiceInstallConfig, ServiceProcessConfig,
+    ServiceUninstallConfig, SERVICE_DESCRIPTION,
 };
+use dbgflow_core::backend::dbgeng::DBGFLOW_DBGENG_DIR_ENV;
 use dbgflow_core::logging::{LogEvent, LogLevel, LogSink};
+use dbgflow_core::proxy::{ProxyEnvironment, ProxySource};
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -30,6 +33,9 @@ use windows_sys::Win32::Foundation::{CloseHandle, FALSE, PSID, WAIT_FAILED, WAIT
 use windows_sys::Win32::Security::{
     AllocateAndInitializeSid, CheckTokenMembership, FreeSid, SECURITY_NT_AUTHORITY,
 };
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_MULTI_SZ,
+};
 use windows_sys::Win32::System::SystemServices::{
     DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID,
 };
@@ -43,6 +49,7 @@ const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE_DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
+const ERROR_SUCCESS: u32 = 0;
 
 pub fn run_dispatcher(service_name: &str) -> windows_service::Result<()> {
     service_dispatcher::start(service_name, ffi_service_main)
@@ -184,7 +191,11 @@ fn log_fallback(message: &str) {
     eprintln!("{message}");
 }
 
-pub fn install(config: ServiceInstallConfig) -> Result<(), String> {
+pub fn install(mut config: ServiceInstallConfig) -> Result<(), String> {
+    if config.interactive {
+        config = run_install_journey(config)?;
+    }
+
     if ensure_elevated(&config.normalized_command_args())? {
         return Ok(());
     }
@@ -218,6 +229,7 @@ pub fn install(config: ServiceInstallConfig) -> Result<(), String> {
     })?;
     grant_install_root_acl(&config.install_root)?;
     create_service(&config, &installed_exe)?;
+    set_service_environment(&config)?;
     start_service(&config.service_name)?;
     wait_healthz(config.bind)?;
 
@@ -225,6 +237,424 @@ pub fn install(config: ServiceInstallConfig) -> Result<(), String> {
         "Service '{}' is running at http://{}/mcp",
         config.service_name, config.bind
     );
+    Ok(())
+}
+
+fn run_install_journey(mut config: ServiceInstallConfig) -> Result<ServiceInstallConfig, String> {
+    println!("dbgflow Windows service install");
+    println!("Press Enter to accept a value, or type a replacement.");
+
+    config.service_name = prompt_string("Service name", &config.service_name, |value| {
+        validate_service_name(value)
+    })?;
+    config.display_name = prompt_string("Display name", &config.display_name, |value| {
+        if value.trim().is_empty() {
+            Err("display name must not be empty".to_string())
+        } else {
+            Ok(())
+        }
+    })?;
+    config.bind = prompt_string("Bind address", &config.bind.to_string(), |value| {
+        value
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid bind address {value}: {error}"))
+            .and_then(|bind| {
+                if bind.ip().is_loopback() {
+                    Ok(())
+                } else {
+                    Err("bind address must be loopback".to_string())
+                }
+            })
+    })?
+    .parse()
+    .map_err(|error| format!("invalid bind address: {error}"))?;
+
+    let install_root_default = config.install_root.display().to_string();
+    config.install_root = PathBuf::from(prompt_string(
+        "Install root",
+        &install_root_default,
+        |value| {
+            if value.trim().is_empty() {
+                Err("install root must not be empty".to_string())
+            } else {
+                Ok(())
+            }
+        },
+    )?);
+
+    config.dbgeng_dir = prompt_dbgeng_dir(config.dbgeng_dir)?;
+    config.sysinternals_dir = prompt_sysinternals_dir(config.sysinternals_dir)?;
+    config.proxy = prompt_proxy(config.proxy)?;
+
+    print_install_summary(&config);
+    if !prompt_yes_no("Install service with these settings?", true)? {
+        return Err("service install cancelled".to_string());
+    }
+    config.interactive = false;
+    Ok(config)
+}
+
+fn prompt_string(
+    label: &str,
+    default_value: &str,
+    validate: impl Fn(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    loop {
+        let input = read_prompt(&format!("{label} [{default_value}]: "))?;
+        let value = if input.trim().is_empty() {
+            default_value.to_string()
+        } else {
+            input.trim().to_string()
+        };
+        match validate(&value) {
+            Ok(()) => return Ok(value),
+            Err(error) => println!("{error}"),
+        }
+    }
+}
+
+fn prompt_dbgeng_dir(current: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    let detected = current.or_else(find_dbgeng_dir);
+    if let Some(path) = &detected {
+        println!("Detected DbgEng directory: {}", path.display());
+    } else {
+        println!("DbgEng directory was not detected; System32 fallback may still work.");
+    }
+    prompt_optional_path(
+        "DbgEng directory containing dbgeng.dll",
+        detected,
+        |path| dbgeng_dir_from_dependency_root(path),
+        "directory must contain dbgeng.dll or a Debuggers\\<arch>\\dbgeng.dll child",
+    )
+}
+
+fn prompt_sysinternals_dir(current: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    let detected = current.or_else(find_sysinternals_dir);
+    if let Some(path) = &detected {
+        println!("Detected Sysinternals directory: {}", path.display());
+    } else {
+        println!("Sysinternals directory was not detected; Procmon features will be unavailable.");
+    }
+    prompt_optional_path(
+        "Sysinternals directory containing Procmon64.exe or Procmon.exe",
+        detected,
+        |path| {
+            if is_sysinternals_dir(path) {
+                Some(path.to_path_buf())
+            } else {
+                None
+            }
+        },
+        "directory must contain Procmon64.exe or Procmon.exe",
+    )
+}
+
+fn prompt_optional_path(
+    label: &str,
+    default_value: Option<PathBuf>,
+    resolve: impl Fn(&Path) -> Option<PathBuf>,
+    error: &str,
+) -> Result<Option<PathBuf>, String> {
+    let default_text = default_value
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    loop {
+        let input = read_prompt(&format!("{label} [{default_text}]: "))?;
+        let trimmed = input.trim();
+        if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("skip") {
+            return Ok(None);
+        }
+        let Some(candidate) = (if trimmed.is_empty() {
+            default_value.clone()
+        } else {
+            Some(PathBuf::from(trimmed))
+        }) else {
+            return Ok(None);
+        };
+        if let Some(resolved) = resolve(&candidate) {
+            return Ok(Some(canonicalize_if_possible(resolved)));
+        }
+        println!("{error}: {}", candidate.display());
+    }
+}
+
+fn prompt_proxy(current: ProxyEnvironment) -> Result<ProxyEnvironment, String> {
+    let default_label = proxy_prompt_default_label(&current);
+    println!("Leave proxy blank to keep the displayed value. Type 'none' to clear known proxy variables for the service.");
+    loop {
+        let input = read_prompt(&format!("Proxy URL [{default_label}]: "))?;
+        let trimmed = input.trim();
+        if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("skip") {
+            return Ok(ProxyEnvironment::disabled());
+        }
+        if trimmed.is_empty() {
+            return Ok(current.clone());
+        }
+        match ProxyEnvironment::from_cli_proxy_url(trimmed) {
+            Ok(proxy) => return Ok(proxy),
+            Err(error) => println!("{error}"),
+        }
+    }
+}
+
+fn proxy_prompt_default_label(current: &ProxyEnvironment) -> String {
+    match current.source() {
+        ProxySource::None => "not configured".to_string(),
+        ProxySource::Disabled => "none".to_string(),
+        ProxySource::Cli | ProxySource::Environment => current
+            .value_for("HTTP_PROXY")
+            .or_else(|| {
+                current
+                    .value_for("_NT_SYMBOL_PROXY")
+                    .map(|value| format!("_NT_SYMBOL_PROXY={value}"))
+            })
+            .unwrap_or_else(|| "configured".to_string()),
+    }
+}
+
+fn print_install_summary(config: &ServiceInstallConfig) {
+    println!();
+    println!("Service name: {}", config.service_name);
+    println!("Display name: {}", config.display_name);
+    println!("Bind: {}", config.bind);
+    println!("Install root: {}", config.install_root.display());
+    println!("Data dir: {}", config.data_dir().display());
+    println!(
+        "DbgEng dir: {}",
+        config
+            .dbgeng_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not configured".to_string())
+    );
+    println!(
+        "Sysinternals dir: {}",
+        config
+            .sysinternals_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not configured".to_string())
+    );
+    println!("Proxy: {:?}", config.proxy);
+    println!(
+        "Service command: {} {}",
+        config.installed_exe().display(),
+        join_windows_command_line(&config.service_launch_arguments())
+    );
+    println!();
+}
+
+fn prompt_yes_no(label: &str, default_yes: bool) -> Result<bool, String> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    loop {
+        let input = read_prompt(&format!("{label} {suffix}: "))?;
+        let value = input.trim();
+        if value.is_empty() {
+            return Ok(default_yes);
+        }
+        if value.eq_ignore_ascii_case("y") || value.eq_ignore_ascii_case("yes") {
+            return Ok(true);
+        }
+        if value.eq_ignore_ascii_case("n") || value.eq_ignore_ascii_case("no") {
+            return Ok(false);
+        }
+        println!("Please answer y or n.");
+    }
+}
+
+fn read_prompt(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("write prompt: {error}"))?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| format!("read prompt: {error}"))?;
+    Ok(input.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn find_dbgeng_dir() -> Option<PathBuf> {
+    find_dbgeng_dir_from_roots(default_dbgeng_search_roots())
+}
+
+fn default_dbgeng_search_roots() -> DbgEngSearchRoots {
+    let program_files = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+
+    let mut sdk_roots = Vec::new();
+    push_env_path(&mut sdk_roots, "WindowsSdkDir");
+    push_env_path(&mut sdk_roots, "WDKContentRoot");
+    push_env_path(&mut sdk_roots, "WindowsSDK_ExecutablePath_x64");
+    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from) {
+        sdk_roots.push(program_files_x86.join("Windows Kits").join("10"));
+    }
+    sdk_roots.push(program_files.join("Windows Kits").join("10"));
+    sdk_roots.push(PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10"));
+    sdk_roots.push(PathBuf::from(r"C:\Program Files\Windows Kits\10"));
+
+    DbgEngSearchRoots {
+        app_store_root: program_files.join("WindowsApps"),
+        sdk_roots,
+        system_root,
+    }
+}
+
+fn find_dbgeng_dir_from_roots(roots: DbgEngSearchRoots) -> Option<PathBuf> {
+    find_app_store_dbgeng_dir(&roots.app_store_root)
+        .or_else(|| {
+            first_resolved_candidate(roots.sdk_roots, |path| {
+                dbgeng_dir_from_dependency_root(path)
+            })
+        })
+        .or_else(|| {
+            let system32 = roots.system_root.join("System32");
+            system32.join("dbgeng.dll").is_file().then_some(system32)
+        })
+        .map(canonicalize_if_possible)
+}
+
+struct DbgEngSearchRoots {
+    app_store_root: PathBuf,
+    sdk_roots: Vec<PathBuf>,
+    system_root: PathBuf,
+}
+
+fn find_app_store_dbgeng_dir(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut packages = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("Microsoft.WinDbg"))
+        })
+        .collect::<Vec<_>>();
+    packages.sort();
+    packages.reverse();
+
+    packages.into_iter().find_map(|package| {
+        find_file_limited(&package, "dbgeng.dll", 4)
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+    })
+}
+
+fn find_file_limited(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
+    if max_depth == 0 {
+        return None;
+    }
+
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(file_name))
+        {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_limited(&path, file_name, max_depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_sysinternals_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    push_env_path(&mut candidates, "DBGFLOW_SYSINTERNALS_DIR");
+    push_env_path(&mut candidates, "SysinternalsDir");
+    push_path_entries(&mut candidates);
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir.join("Sysinternals"));
+        if let Some(parent) = current_dir.parent() {
+            candidates.push(parent.join("Sysinternals"));
+        }
+    }
+    candidates.push(PathBuf::from(r"C:\Tools\Sysinternals"));
+    candidates.push(PathBuf::from(r"C:\Sysinternals"));
+    candidates.push(PathBuf::from(r"C:\Program Files\Sysinternals"));
+
+    first_resolved_candidate(candidates, |path| {
+        if is_sysinternals_dir(path) {
+            Some(path.to_path_buf())
+        } else {
+            None
+        }
+    })
+}
+
+fn first_resolved_candidate(
+    candidates: Vec<PathBuf>,
+    resolve: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let mut seen = Vec::<PathBuf>::new();
+    for candidate in candidates {
+        if seen
+            .iter()
+            .any(|seen| path_eq_case_insensitive(seen, &candidate))
+        {
+            continue;
+        }
+        seen.push(candidate.clone());
+        if let Some(resolved) = resolve(&candidate) {
+            return Some(canonicalize_if_possible(resolved));
+        }
+    }
+    None
+}
+
+fn push_env_path(candidates: &mut Vec<PathBuf>, key: &str) {
+    if let Some(value) = std::env::var_os(key) {
+        if !value.is_empty() {
+            candidates.push(PathBuf::from(value));
+        }
+    }
+}
+
+fn push_path_entries(candidates: &mut Vec<PathBuf>) {
+    let Some(path) = std::env::var_os("PATH") else {
+        return;
+    };
+    candidates.extend(std::env::split_paths(&path));
+}
+
+fn is_sysinternals_dir(path: &Path) -> bool {
+    path.join("Procmon64.exe").is_file() || path.join("Procmon.exe").is_file()
+}
+
+fn canonicalize_if_possible(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn path_eq_case_insensitive(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+fn validate_service_name(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("service name must not be empty".to_string());
+    }
+    if value
+        .chars()
+        .any(|ch| matches!(ch, '/' | '\\' | '*' | '?' | '[' | ']') || ch.is_control())
+    {
+        return Err(
+            "service name must not contain path separators, wildcards, or control characters"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -557,6 +987,121 @@ fn create_service(config: &ServiceInstallConfig, installed_exe: &Path) -> Result
     Ok(())
 }
 
+fn set_service_environment(config: &ServiceInstallConfig) -> Result<(), String> {
+    let entries = service_environment_entries(config);
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "Writing service environment for '{}'...",
+        config.service_name
+    );
+    let key_path = format!(r"SYSTEM\CurrentControlSet\Services\{}", config.service_name);
+    let key_path = wide_null(&key_path);
+    let mut key = 0;
+    let result = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            key_path.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if result != ERROR_SUCCESS {
+        return Err(format!(
+            "open service registry key for '{}': {}",
+            config.service_name,
+            std::io::Error::from_raw_os_error(result as i32)
+        ));
+    }
+
+    let name = wide_null("Environment");
+    let value = multi_sz(&entries);
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            value.as_ptr() as *const u8,
+            value.len() * std::mem::size_of::<u16>(),
+        )
+    };
+    let result = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_MULTI_SZ,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+    unsafe {
+        RegCloseKey(key);
+    }
+    if result != ERROR_SUCCESS {
+        return Err(format!(
+            "write service environment for '{}': {}",
+            config.service_name,
+            std::io::Error::from_raw_os_error(result as i32)
+        ));
+    }
+    Ok(())
+}
+
+fn service_environment_entries(config: &ServiceInstallConfig) -> Vec<String> {
+    let mut entries = Vec::new();
+    if let Some(dbgeng_dir) = &config.dbgeng_dir {
+        entries.push(format!(
+            "{}={}",
+            DBGFLOW_DBGENG_DIR_ENV,
+            dbgeng_dir.display()
+        ));
+    }
+
+    match config.proxy.source() {
+        ProxySource::None => {}
+        ProxySource::Cli | ProxySource::Environment => {
+            entries.extend(
+                config
+                    .proxy
+                    .env_vars()
+                    .map(|(key, value)| format!("{key}={value}")),
+            );
+            entries.extend(
+                config
+                    .proxy
+                    .removed_keys()
+                    .into_iter()
+                    .map(|key| format!("{key}=")),
+            );
+        }
+        ProxySource::Disabled => {
+            entries.extend(
+                config
+                    .proxy
+                    .removed_keys()
+                    .into_iter()
+                    .map(|key| format!("{key}=")),
+            );
+        }
+    }
+    entries
+}
+
+fn multi_sz(values: &[String]) -> Vec<u16> {
+    let mut output = Vec::new();
+    for value in values {
+        output.extend(value.encode_utf16());
+        output.push(0);
+    }
+    output.push(0);
+    output
+}
+
 fn start_service(service_name: &str) -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|error| format!("open service manager: {error}"))?;
@@ -656,4 +1201,101 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 fn wide_null_os(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        find_dbgeng_dir_from_roots, proxy_prompt_default_label, DbgEngSearchRoots, ProxyEnvironment,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn proxy_prompt_default_preserves_disabled_proxy() {
+        assert_eq!(
+            proxy_prompt_default_label(&ProxyEnvironment::disabled()),
+            "none"
+        );
+    }
+
+    #[test]
+    fn proxy_prompt_default_without_proxy_is_not_configured() {
+        assert_eq!(
+            proxy_prompt_default_label(&ProxyEnvironment::none()),
+            "not configured"
+        );
+    }
+
+    #[test]
+    fn proxy_prompt_default_uses_cli_proxy_when_configured() {
+        let proxy =
+            ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897").expect("parse proxy");
+
+        assert_eq!(proxy_prompt_default_label(&proxy), "http://127.0.0.1:7897");
+    }
+
+    #[test]
+    fn dbgeng_install_detection_prefers_app_store_over_sdk_and_system32() {
+        let root = unique_test_dir("dbgflow-install-dbgeng-store-order");
+        let app_dbgeng = root
+            .join("WindowsApps")
+            .join("Microsoft.WinDbg_1.0.0.0_x64__8wekyb3d8bbwe")
+            .join("amd64");
+        let sdk_dbgeng = root
+            .join("Windows Kits")
+            .join("10")
+            .join("Debuggers")
+            .join(crate::runtime::debugger_arch());
+        let system32 = root.join("Windows").join("System32");
+        touch(app_dbgeng.join("dbgeng.dll"));
+        touch(sdk_dbgeng.join("dbgeng.dll"));
+        touch(system32.join("dbgeng.dll"));
+
+        let detected = find_dbgeng_dir_from_roots(DbgEngSearchRoots {
+            app_store_root: root.join("WindowsApps"),
+            sdk_roots: vec![root.join("Windows Kits").join("10")],
+            system_root: root.join("Windows"),
+        })
+        .expect("detect dbgeng");
+
+        assert_eq!(detected, canonicalize(app_dbgeng));
+    }
+
+    #[test]
+    fn dbgeng_install_detection_prefers_sdk_over_system32() {
+        let root = unique_test_dir("dbgflow-install-dbgeng-sdk-order");
+        let sdk_dbgeng = root
+            .join("Windows Kits")
+            .join("10")
+            .join("Debuggers")
+            .join(crate::runtime::debugger_arch());
+        let system32 = root.join("Windows").join("System32");
+        touch(sdk_dbgeng.join("dbgeng.dll"));
+        touch(system32.join("dbgeng.dll"));
+
+        let detected = find_dbgeng_dir_from_roots(DbgEngSearchRoots {
+            app_store_root: root.join("WindowsApps"),
+            sdk_roots: vec![root.join("Windows Kits").join("10")],
+            system_root: root.join("Windows"),
+        })
+        .expect("detect dbgeng");
+
+        assert_eq!(detected, canonicalize(sdk_dbgeng));
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        root
+    }
+
+    fn touch(path: PathBuf) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, b"dll").expect("write file");
+    }
+
+    fn canonicalize(path: PathBuf) -> PathBuf {
+        std::fs::canonicalize(path).expect("canonicalize path")
+    }
 }

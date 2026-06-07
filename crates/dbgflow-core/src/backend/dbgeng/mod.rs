@@ -36,7 +36,7 @@ use windows::Win32::System::Threading::{
 
 mod resolver;
 
-pub use resolver::{resolve_dbgeng, DbgEngLocation, DbgEngSource};
+pub use resolver::{resolve_dbgeng, DbgEngLocation, DbgEngSource, DBGFLOW_DBGENG_DIR_ENV};
 
 const INFINITE_WAIT_MS: u32 = u32::MAX;
 const CLOSE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);

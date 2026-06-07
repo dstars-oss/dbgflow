@@ -10,8 +10,11 @@ pub struct DbgEngLocation {
     pub source: DbgEngSource,
 }
 
+pub const DBGFLOW_DBGENG_DIR_ENV: &str = "DBGFLOW_DBGENG_DIR";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DbgEngSource {
+    Environment,
     AppStore,
     WindowsSdk,
     System32,
@@ -22,6 +25,17 @@ pub fn resolve_dbgeng() -> Result<DbgEngLocation> {
 }
 
 fn resolve_dbgeng_from_roots(roots: &DbgEngRoots) -> Result<DbgEngLocation> {
+    if let Some(path) = roots
+        .environment_dbgeng_dir
+        .as_deref()
+        .and_then(find_dbgeng_in_debuggers_dir)
+    {
+        return Ok(DbgEngLocation {
+            path,
+            source: DbgEngSource::Environment,
+        });
+    }
+
     if let Some(path) = find_app_store_dbgeng(&roots.program_files_windows_apps) {
         return Ok(DbgEngLocation {
             path,
@@ -59,8 +73,10 @@ fn default_roots() -> DbgEngRoots {
     let system_root = env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let environment_dbgeng_dir = env::var_os(DBGFLOW_DBGENG_DIR_ENV).map(PathBuf::from);
 
     DbgEngRoots {
+        environment_dbgeng_dir,
         program_files_windows_apps: program_files.join("WindowsApps"),
         windows_kits_roots: vec![
             program_files_x86.join("Windows Kits").join("10"),
@@ -92,9 +108,14 @@ fn find_app_store_dbgeng(root: &Path) -> Option<PathBuf> {
 fn find_sdk_dbgeng(roots: &[PathBuf]) -> Option<PathBuf> {
     let arch = debugger_arch();
     roots.iter().find_map(|root| {
-        let path = root.join("Debuggers").join(arch).join("dbgeng.dll");
-        path.is_file().then_some(path)
+        find_dbgeng_in_debuggers_dir(&root.join("Debuggers").join(arch))
+            .or_else(|| find_dbgeng_in_debuggers_dir(root))
     })
+}
+
+fn find_dbgeng_in_debuggers_dir(dir: &Path) -> Option<PathBuf> {
+    let path = dir.join("dbgeng.dll");
+    path.is_file().then_some(path)
 }
 
 fn find_file_limited(root: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
@@ -135,6 +156,7 @@ fn debugger_arch() -> &'static str {
 #[cfg(test)]
 #[derive(Debug)]
 struct DbgEngRoots {
+    environment_dbgeng_dir: Option<PathBuf>,
     program_files_windows_apps: PathBuf,
     windows_kits_roots: Vec<PathBuf>,
     system_root: PathBuf,
@@ -143,6 +165,7 @@ struct DbgEngRoots {
 #[cfg(not(test))]
 #[derive(Debug)]
 struct DbgEngRoots {
+    environment_dbgeng_dir: Option<PathBuf>,
     program_files_windows_apps: PathBuf,
     windows_kits_roots: Vec<PathBuf>,
     system_root: PathBuf,
@@ -172,6 +195,7 @@ mod tests {
         touch(system_root.join("System32").join("dbgeng.dll"));
 
         let location = resolve_dbgeng_from_roots(&DbgEngRoots {
+            environment_dbgeng_dir: None,
             program_files_windows_apps: apps,
             windows_kits_roots: vec![sdk],
             system_root,
@@ -195,6 +219,7 @@ mod tests {
         touch(system_root.join("System32").join("dbgeng.dll"));
 
         let location = resolve_dbgeng_from_roots(&DbgEngRoots {
+            environment_dbgeng_dir: None,
             program_files_windows_apps: root.join("WindowsApps"),
             windows_kits_roots: vec![sdk],
             system_root,
@@ -202,6 +227,31 @@ mod tests {
         .expect("resolve dbgeng");
 
         assert_eq!(location.source, DbgEngSource::WindowsSdk);
+    }
+
+    #[test]
+    fn prefers_environment_dbgeng_dir_over_other_sources() {
+        let root = unique_test_dir("dbgeng-resolver-env");
+        let env_dir = root.join("Debuggers").join(debugger_arch());
+        let sdk = root.join("Windows Kits").join("10");
+
+        touch(env_dir.join("dbgeng.dll"));
+        touch(
+            sdk.join("Debuggers")
+                .join(debugger_arch())
+                .join("dbgeng.dll"),
+        );
+
+        let location = resolve_dbgeng_from_roots(&DbgEngRoots {
+            environment_dbgeng_dir: Some(env_dir.clone()),
+            program_files_windows_apps: root.join("WindowsApps"),
+            windows_kits_roots: vec![sdk],
+            system_root: root.join("Windows"),
+        })
+        .expect("resolve dbgeng");
+
+        assert_eq!(location.source, DbgEngSource::Environment);
+        assert_eq!(location.path, env_dir.join("dbgeng.dll"));
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
