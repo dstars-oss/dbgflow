@@ -76,8 +76,8 @@ function Assert-ServiceName {
     if ([string]::IsNullOrWhiteSpace($ServiceName)) {
         throw "ServiceName must not be empty"
     }
-    if ($ServiceName -match "[\\/]") {
-        throw "ServiceName must not contain registry path separators"
+    if ($ServiceName -match "[\\/\\*\\?\\[\\]\x00-\x1F\x7F]") {
+        throw "ServiceName must not contain path separators, wildcards, or control characters"
     }
 }
 
@@ -85,6 +85,9 @@ function Convert-ToSymbolProxy {
     param([Parameter(Mandatory = $true)][string]$Url)
     if ([string]::IsNullOrWhiteSpace($Url)) {
         throw "ProxyUrl must not be empty. Use -NoProxy to skip service proxy configuration."
+    }
+    if ($Url -match "[\x00-\x1F\x7F]") {
+        throw "ProxyUrl must not contain control characters"
     }
     if ($Url -match "\s") {
         throw "ProxyUrl must not contain whitespace"
@@ -127,6 +130,16 @@ function Convert-ToSymbolProxy {
     return "${symbolHost}:$port"
 }
 
+function Get-ExactService {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    Assert-ServiceName -ServiceName $ServiceName
+    $services = @(Get-Service -Name $ServiceName -ErrorAction Stop)
+    if (($services.Count -ne 1) -or ($services[0].Name -ne $ServiceName)) {
+        throw "Service lookup for '$ServiceName' did not return an exact service match"
+    }
+    return $services[0]
+}
+
 function Wait-ServiceHealth {
     param(
         [Parameter(Mandatory = $true)][string]$Bind,
@@ -152,22 +165,26 @@ function Wait-ServiceHealth {
 function Set-ServiceProxyEnvironment {
     param(
         [Parameter(Mandatory = $true)][string]$ServiceName,
-        [Parameter(Mandatory = $true)][string]$ProxyUrl
+        [Parameter(Mandatory = $true)][string]$ProxyUrl,
+        [Parameter(Mandatory = $true)][string]$SymbolProxy
     )
     Assert-ServiceName -ServiceName $ServiceName
-    $symbolProxy = Convert-ToSymbolProxy -Url $ProxyUrl
     $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
     $environment = @(
         "HTTP_PROXY=$ProxyUrl"
         "HTTPS_PROXY=$ProxyUrl"
         "http_proxy=$ProxyUrl"
         "https_proxy=$ProxyUrl"
-        "_NT_SYMBOL_PROXY=$symbolProxy"
+        "_NT_SYMBOL_PROXY=$SymbolProxy"
     )
     New-ItemProperty -LiteralPath $key -Name Environment -PropertyType MultiString -Value $environment -Force | Out-Null
 }
 
 Assert-ServiceName -ServiceName $ServiceName
+$symbolProxy = $null
+if (-not $NoProxy) {
+    $symbolProxy = Convert-ToSymbolProxy -Url $ProxyUrl
+}
 
 Push-Location $RepoRoot
 try {
@@ -185,8 +202,9 @@ try {
         exit $installExitCode
     }
     if (-not $NoProxy) {
-        Set-ServiceProxyEnvironment -ServiceName $ServiceName -ProxyUrl $ProxyUrl
-        Restart-Service -Name $ServiceName -Force
+        Set-ServiceProxyEnvironment -ServiceName $ServiceName -ProxyUrl $ProxyUrl -SymbolProxy $symbolProxy
+        $service = Get-ExactService -ServiceName $ServiceName
+        Restart-Service -InputObject $service -Force
         Wait-ServiceHealth -Bind $Bind
     }
     exit 0
