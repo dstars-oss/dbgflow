@@ -7,6 +7,8 @@ param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA "dbgflow"),
     [string]$ProxyUrl = "http://127.0.0.1:7897",
     [string]$SysinternalsDir,
+    [Parameter(DontShow = $true)]
+    [string]$SysinternalsSearchPathFile,
     [switch]$NoProxy
 )
 
@@ -29,46 +31,79 @@ function Test-IsAdministrator {
 }
 
 if (-not (Test-IsAdministrator)) {
-    $command = @(
-        "&"
-        (Convert-ToPowerShellLiteral -Value $PSCommandPath)
-        "-ServiceName"
-        (Convert-ToPowerShellLiteral -Value $ServiceName)
-        "-DisplayName"
-        (Convert-ToPowerShellLiteral -Value $DisplayName)
-        "-Bind"
-        (Convert-ToPowerShellLiteral -Value $Bind)
-        "-InstallRoot"
-        (Convert-ToPowerShellLiteral -Value $InstallRoot)
-    )
-    if ($proxyUrlWasBound) {
-        $command += @(
-            "-ProxyUrl"
-            (Convert-ToPowerShellLiteral -Value $ProxyUrl)
+    $sysinternalsSearchPathFile = $null
+    try {
+        $command = @(
+            "&"
+            (Convert-ToPowerShellLiteral -Value $PSCommandPath)
+            "-ServiceName"
+            (Convert-ToPowerShellLiteral -Value $ServiceName)
+            "-DisplayName"
+            (Convert-ToPowerShellLiteral -Value $DisplayName)
+            "-Bind"
+            (Convert-ToPowerShellLiteral -Value $Bind)
+            "-InstallRoot"
+            (Convert-ToPowerShellLiteral -Value $InstallRoot)
         )
-    }
-    if ($sysinternalsDirWasBound) {
-        $command += @(
-            "-SysinternalsDir"
-            (Convert-ToPowerShellLiteral -Value $SysinternalsDir)
+        if ($proxyUrlWasBound) {
+            $command += @(
+                "-ProxyUrl"
+                (Convert-ToPowerShellLiteral -Value $ProxyUrl)
+            )
+        }
+        if ($sysinternalsDirWasBound) {
+            $command += @(
+                "-SysinternalsDir"
+                (Convert-ToPowerShellLiteral -Value $SysinternalsDir)
+            )
+        }
+        else {
+            $sysinternalsSearchPathFile = Join-Path ([IO.Path]::GetTempPath()) ("dbgflow-sysinternals-path-" + [guid]::NewGuid().ToString("N") + ".txt")
+            $sysinternalsSearchPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
+            if ($null -eq $sysinternalsSearchPath) {
+                $sysinternalsSearchPath = ""
+            }
+            [IO.File]::WriteAllText(
+                $sysinternalsSearchPathFile,
+                $sysinternalsSearchPath,
+                [Text.Encoding]::UTF8
+            )
+            $command += @(
+                "-SysinternalsSearchPathFile"
+                (Convert-ToPowerShellLiteral -Value $sysinternalsSearchPathFile)
+            )
+        }
+        if ($NoProxy) {
+            $command += "-NoProxy"
+        }
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($command -join " ")))
+        $process = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+            "-NoProfile"
+            "-ExecutionPolicy"
+            "Bypass"
+            "-EncodedCommand"
+            $encodedCommand
         )
+        exit $process.ExitCode
     }
-    if ($NoProxy) {
-        $command += "-NoProxy"
+    finally {
+        if ($sysinternalsSearchPathFile -and (Test-Path -LiteralPath $sysinternalsSearchPathFile -PathType Leaf)) {
+            Remove-Item -LiteralPath $sysinternalsSearchPathFile -Force
+        }
     }
-    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($command -join " ")))
-    $process = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
-        "-NoProfile"
-        "-ExecutionPolicy"
-        "Bypass"
-        "-EncodedCommand"
-        $encodedCommand
-    )
-    exit $process.ExitCode
 }
 
 if ($NoProxy -and $proxyUrlWasBound) {
     throw "-NoProxy and -ProxyUrl cannot be used together."
+}
+if ($PSBoundParameters.ContainsKey("SysinternalsSearchPathFile")) {
+    if (-not (Test-Path -LiteralPath $SysinternalsSearchPathFile -PathType Leaf)) {
+        throw "SysinternalsSearchPathFile does not exist: $SysinternalsSearchPathFile"
+    }
+    $SysinternalsSearchPath = [IO.File]::ReadAllText($SysinternalsSearchPathFile, [Text.Encoding]::UTF8)
+}
+else {
+    $SysinternalsSearchPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
 }
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
@@ -102,15 +137,63 @@ function Test-SysinternalsDir {
     )
 }
 
+function Get-PathEnvironmentDirectories {
+    param([AllowNull()][string]$PathValue = [Environment]::GetEnvironmentVariable("PATH", "Process"))
+    if ([string]::IsNullOrWhiteSpace($PathValue)) {
+        return @()
+    }
+
+    $directories = @()
+    $seen = @{}
+    foreach ($entry in ($PathValue -split [IO.Path]::PathSeparator)) {
+        if ([string]::IsNullOrWhiteSpace($entry)) {
+            continue
+        }
+
+        $candidate = $entry.Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+            continue
+        }
+
+        $resolved = (Resolve-Path -LiteralPath $candidate).Path
+        $key = $resolved.ToLowerInvariant()
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $directories += $resolved
+        }
+    }
+
+    return $directories
+}
+
 function Find-SysinternalsDir {
-    param([Parameter(Mandatory = $true)][string]$RepoRoot)
-    $candidates = @(
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [AllowNull()][string]$SearchPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
+    )
+    $candidates = @()
+    $candidates += Get-PathEnvironmentDirectories -PathValue $SearchPath
+    $candidates += @(
         (Join-Path (Split-Path -Parent $RepoRoot) "Sysinternals"),
         "C:\Tools\Sysinternals",
         "C:\Sysinternals",
         "C:\Program Files\Sysinternals"
     )
+    $seen = @{}
     foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+
+        $key = $candidate.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+        $seen[$key] = $true
+
         if (Test-SysinternalsDir -Path $candidate) {
             return (Resolve-Path -LiteralPath $candidate).Path
         }
@@ -284,7 +367,7 @@ if ($sysinternalsDirWasBound) {
     $resolvedSysinternalsDir = (Resolve-Path -LiteralPath $SysinternalsDir).Path
 }
 else {
-    $candidateSysinternalsDir = Find-SysinternalsDir -RepoRoot $RepoRoot
+    $candidateSysinternalsDir = Find-SysinternalsDir -RepoRoot $RepoRoot -SearchPath $SysinternalsSearchPath
     if ($candidateSysinternalsDir -and (Confirm-SysinternalsDir -Path $candidateSysinternalsDir)) {
         $resolvedSysinternalsDir = $candidateSysinternalsDir
     }
