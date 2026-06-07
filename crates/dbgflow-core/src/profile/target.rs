@@ -12,11 +12,9 @@ pub fn validate_profile_target(target: ProfileTarget) -> Result<ProfileTarget> {
 }
 
 fn validate_launch_target(executable: &Path, args: Vec<String>) -> Result<ProfileTarget> {
-    let executable = executable
-        .canonicalize()
-        .map_err(|error| {
-            DbgFlowError::Backend(format!("invalid profile launch executable: {error}"))
-        })?;
+    let executable = executable.canonicalize().map_err(|error| {
+        DbgFlowError::Backend(format!("invalid profile launch executable: {error}"))
+    })?;
     if !executable.is_file() {
         return Err(DbgFlowError::Backend(format!(
             "profile launch executable is not a file: {}",
@@ -70,14 +68,15 @@ impl TargetRunner for ProcessTargetRunner {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
-            .map_err(|error| DbgFlowError::Backend(format!("launch profile target failed: {error}")))?;
+            .map_err(|error| {
+                DbgFlowError::Backend(format!("launch profile target failed: {error}"))
+            })?;
         let pid = child.id();
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|error| DbgFlowError::Backend(format!("poll profile target failed: {error}")))?
-            {
+            if let Some(status) = child.try_wait().map_err(|error| {
+                DbgFlowError::Backend(format!("poll profile target failed: {error}"))
+            })? {
                 return Ok(TargetExit::Exited {
                     pid,
                     exit_code: exit_code(status),

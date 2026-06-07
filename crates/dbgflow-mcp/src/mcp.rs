@@ -298,13 +298,12 @@ pub fn server_with_data_dir_proxy_and_logger(
 ) -> McpServer {
     let data_dir = data_dir.into();
     let artifact_root = data_dir.join("artifacts");
-    let sessions =
-        dbgflow_core::session::SessionManager::with_worker_launcher_proxy_and_logger(
-            default_process_worker_launcher(),
-            &artifact_root,
-            proxy,
-            logger,
-        );
+    let sessions = dbgflow_core::session::SessionManager::with_worker_launcher_proxy_and_logger(
+        default_process_worker_launcher(),
+        &artifact_root,
+        proxy,
+        logger,
+    );
     let profiles = ProfileManager::new(&artifact_root);
     McpServer::new(ToolService::with_profiles(sessions, profiles))
 }

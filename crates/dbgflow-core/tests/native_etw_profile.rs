@@ -8,10 +8,8 @@ use dbgflow_core::profile::{
 #[test]
 #[ignore = "requires local ETW permissions and writes a real ETL trace"]
 fn native_etw_run_profile_writes_etl_for_cmd() {
-    let root = std::env::temp_dir().join(format!(
-        "dbgflow-native-etw-profile-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("dbgflow-native-etw-profile-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create root");
 
@@ -28,7 +26,10 @@ fn native_etw_run_profile_writes_etl_for_cmd() {
         .expect("run profile");
 
     assert_eq!(result.status, ProfileStatus::Completed);
-    assert_eq!(result.completion_reason, ProfileCompletionReason::TargetExited);
+    assert_eq!(
+        result.completion_reason,
+        ProfileCompletionReason::TargetExited
+    );
     assert!(result.artifacts.trace.path.is_file());
     assert!(
         result

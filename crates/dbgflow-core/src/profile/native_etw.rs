@@ -1,7 +1,6 @@
 #[cfg(not(windows))]
 use super::{
-    CollectorFactory, ProfileCollector, ProfileCollectorConfig, ProfileCollectorKind,
-    ProfilePreset,
+    CollectorFactory, ProfileCollector, ProfileCollectorConfig, ProfileCollectorKind, ProfilePreset,
 };
 #[cfg(not(windows))]
 use crate::{DbgFlowError, Result};
@@ -111,9 +110,10 @@ impl NativeEtwCollector {
 #[cfg(windows)]
 impl ProfileCollector for NativeEtwCollector {
     fn start(&self, _output_dir: &Path) -> Result<CollectorStart> {
-        let mut state = self.state.lock().map_err(|_| {
-            DbgFlowError::Backend("native ETW collector lock poisoned".to_string())
-        })?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("native ETW collector lock poisoned".to_string()))?;
         if state.session_name.is_some() {
             return Err(DbgFlowError::Backend(
                 "native ETW collector already started".to_string(),
@@ -129,9 +129,10 @@ impl ProfileCollector for NativeEtwCollector {
     }
 
     fn stop(&self) -> Result<CollectorStop> {
-        let mut state = self.state.lock().map_err(|_| {
-            DbgFlowError::Backend("native ETW collector lock poisoned".to_string())
-        })?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbgFlowError::Backend("native ETW collector lock poisoned".to_string()))?;
         let Some(session_name) = state.session_name.take() else {
             return Ok(CollectorStop {
                 warnings: vec!["native ETW collector was not started".to_string()],
@@ -172,8 +173,8 @@ fn start_trace_session(session_name: &str, trace_path: &Path) -> Result<()> {
         (*properties).Wnode.BufferSize = properties_size as u32;
         (*properties).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         (*properties).Wnode.ClientContext = 1;
-        (*properties).LogFileMode = EVENT_TRACE_FILE_MODE_SEQUENTIAL
-            | EVENT_TRACE_SYSTEM_LOGGER_MODE;
+        (*properties).LogFileMode =
+            EVENT_TRACE_FILE_MODE_SEQUENTIAL | EVENT_TRACE_SYSTEM_LOGGER_MODE;
         (*properties).EnableFlags = EVENT_TRACE_FLAG_PROCESS
             | EVENT_TRACE_FLAG_THREAD
             | EVENT_TRACE_FLAG_IMAGE_LOAD
@@ -189,8 +190,16 @@ fn start_trace_session(session_name: &str, trace_path: &Path) -> Result<()> {
         (*properties).LogFileNameOffset =
             (size_of::<EVENT_TRACE_PROPERTIES>() + session_name_w.len() * size_of::<u16>()) as u32;
 
-        copy_wide_to_buffer(&mut buffer, (*properties).LoggerNameOffset as usize, &session_name_w);
-        copy_wide_to_buffer(&mut buffer, (*properties).LogFileNameOffset as usize, &trace_path_w);
+        copy_wide_to_buffer(
+            &mut buffer,
+            (*properties).LoggerNameOffset as usize,
+            &session_name_w,
+        );
+        copy_wide_to_buffer(
+            &mut buffer,
+            (*properties).LogFileNameOffset as usize,
+            &trace_path_w,
+        );
 
         let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
         let status = StartTraceW(&mut handle, PCWSTR(session_name_w.as_ptr()), properties);
@@ -213,7 +222,11 @@ fn stop_trace_session(session_name: &str) -> Result<()> {
     unsafe {
         (*properties).Wnode.BufferSize = properties_size as u32;
         (*properties).LoggerNameOffset = size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-        copy_wide_to_buffer(&mut buffer, (*properties).LoggerNameOffset as usize, &session_name_w);
+        copy_wide_to_buffer(
+            &mut buffer,
+            (*properties).LoggerNameOffset as usize,
+            &session_name_w,
+        );
 
         let status = ControlTraceW(
             CONTROLTRACE_HANDLE { Value: 0 },
@@ -242,8 +255,5 @@ unsafe fn copy_wide_to_buffer(buffer: &mut [u8], byte_offset: usize, value: &[u1
 
 #[cfg(windows)]
 fn etw_error(operation: &str, status: WIN32_ERROR) -> DbgFlowError {
-    DbgFlowError::Backend(format!(
-        "{operation} failed with Win32 error {}",
-        status.0
-    ))
+    DbgFlowError::Backend(format!("{operation} failed with Win32 error {}", status.0))
 }

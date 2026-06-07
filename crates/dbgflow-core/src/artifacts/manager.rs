@@ -319,10 +319,8 @@ mod tests {
 
     #[test]
     fn profile_artifacts_are_initialized_under_profiles_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "dbgflow-profile-artifacts-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-profile-artifacts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let artifacts = ArtifactManager::new(&root);
         let profile_id = ProfileId::new();
@@ -346,10 +344,8 @@ mod tests {
 
     #[test]
     fn profile_event_and_metadata_are_written() {
-        let root = std::env::temp_dir().join(format!(
-            "dbgflow-profile-event-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-profile-event-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let artifacts = ArtifactManager::new(&root);
         let profile_id = ProfileId::new();

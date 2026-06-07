@@ -496,10 +496,7 @@ fn wait_until_blocking_runner_started(blocker: &Arc<(Mutex<BlockingTargetState>,
     let (lock, cvar) = &**blocker;
     let mut state = lock.lock().expect("blocker lock");
     while !state.started {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "runner did not start"
-        );
+        assert!(std::time::Instant::now() < deadline, "runner did not start");
         let (next, _) = cvar
             .wait_timeout(state, Duration::from_millis(10))
             .expect("wait");

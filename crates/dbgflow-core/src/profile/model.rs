@@ -13,7 +13,10 @@ pub struct RunProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProfileTarget {
-    Launch { executable: PathBuf, args: Vec<String> },
+    Launch {
+        executable: PathBuf,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
