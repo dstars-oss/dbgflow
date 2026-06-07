@@ -895,14 +895,17 @@ mod tests {
         ])
         .expect("parse service install options");
 
-        assert!(!config
+        for arg in config
             .service_launch_arguments()
             .iter()
-            .any(|arg| arg.to_string_lossy().contains("7897")));
-        assert!(!config
-            .normalized_command_args()
-            .iter()
-            .any(|arg| arg.to_string_lossy().contains("7897")));
+            .chain(config.normalized_command_args().iter())
+        {
+            let arg = arg.to_string_lossy();
+            assert!(!arg.contains("7897"));
+            assert_ne!(arg, "--proxy-url");
+            assert!(!arg.starts_with("--proxy-url="));
+            assert_ne!(arg, "--no-proxy");
+        }
     }
 
     #[test]

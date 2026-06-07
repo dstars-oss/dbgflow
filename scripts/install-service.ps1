@@ -11,6 +11,49 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Convert-ToPowerShellLiteral {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) {
+        return "''"
+    }
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not (Test-IsAdministrator)) {
+    $command = @(
+        "&"
+        (Convert-ToPowerShellLiteral -Value $PSCommandPath)
+        "-ServiceName"
+        (Convert-ToPowerShellLiteral -Value $ServiceName)
+        "-DisplayName"
+        (Convert-ToPowerShellLiteral -Value $DisplayName)
+        "-Bind"
+        (Convert-ToPowerShellLiteral -Value $Bind)
+        "-InstallRoot"
+        (Convert-ToPowerShellLiteral -Value $InstallRoot)
+        "-ProxyUrl"
+        (Convert-ToPowerShellLiteral -Value $ProxyUrl)
+    )
+    if ($NoProxy) {
+        $command += "-NoProxy"
+    }
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($command -join " ")))
+    $process = Start-Process -FilePath "powershell.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
+        "-NoProfile"
+        "-ExecutionPolicy"
+        "Bypass"
+        "-EncodedCommand"
+        $encodedCommand
+    )
+    exit $process.ExitCode
+}
+
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = Split-Path -Parent $ScriptDir
 $Exe = Join-Path $RepoRoot "target\release\dbgflow-mcp.exe"
@@ -28,19 +71,82 @@ $arguments = @(
     $InstallRoot
 )
 
+function Assert-ServiceName {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+    if ([string]::IsNullOrWhiteSpace($ServiceName)) {
+        throw "ServiceName must not be empty"
+    }
+    if ($ServiceName -match "[\\/]") {
+        throw "ServiceName must not contain registry path separators"
+    }
+}
+
 function Convert-ToSymbolProxy {
     param([Parameter(Mandatory = $true)][string]$Url)
-    $uri = [Uri]$Url
-    if (($uri.Scheme -ne "http") -and ($uri.Scheme -ne "https")) {
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        throw "ProxyUrl must not be empty. Use -NoProxy to skip service proxy configuration."
+    }
+    if ($Url -match "\s") {
+        throw "ProxyUrl must not contain whitespace"
+    }
+    if ($Url -notmatch "^(?<scheme>https?)://(?<authority>[^/?#]+)$") {
         throw "ProxyUrl must use http:// or https://"
     }
-    if (-not $uri.Host -or $uri.Port -le 0) {
-        throw "ProxyUrl must include host and port"
-    }
-    if ($uri.UserInfo) {
+
+    $authority = $Matches["authority"]
+    if ($authority -match "@") {
         throw "ProxyUrl credentials are not supported for _NT_SYMBOL_PROXY"
     }
-    return "$($uri.Host):$($uri.Port)"
+
+    $host = $null
+    $portText = $null
+    $symbolHost = $null
+    if ($authority -match "^\[(?<host>[^\]]+)\]:(?<port>[0-9]+)$") {
+        $host = $Matches["host"]
+        $portText = $Matches["port"]
+        $symbolHost = "[$host]"
+    }
+    elseif ($authority -match "^(?<host>[^:]+):(?<port>[0-9]+)$") {
+        $host = $Matches["host"]
+        $portText = $Matches["port"]
+        $symbolHost = $host
+    }
+    else {
+        throw "ProxyUrl must include host and numeric port"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($host)) {
+        throw "ProxyUrl must include host and port"
+    }
+
+    $port = 0
+    if (-not [int]::TryParse($portText, [ref]$port) -or $port -le 0 -or $port -gt 65535) {
+        throw "ProxyUrl port must be between 1 and 65535"
+    }
+
+    return "${symbolHost}:$port"
+}
+
+function Wait-ServiceHealth {
+    param(
+        [Parameter(Mandatory = $true)][string]$Bind,
+        [int]$TimeoutSeconds = 60
+    )
+    $uri = "http://$Bind/healthz"
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $response = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 5
+            if ($response.Content -match '"status"\s*:\s*"ok"') {
+                return
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Service health check did not report status ok at $uri within $TimeoutSeconds seconds"
 }
 
 function Set-ServiceProxyEnvironment {
@@ -48,6 +154,7 @@ function Set-ServiceProxyEnvironment {
         [Parameter(Mandatory = $true)][string]$ServiceName,
         [Parameter(Mandatory = $true)][string]$ProxyUrl
     )
+    Assert-ServiceName -ServiceName $ServiceName
     $symbolProxy = Convert-ToSymbolProxy -Url $ProxyUrl
     $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
     $environment = @(
@@ -57,8 +164,10 @@ function Set-ServiceProxyEnvironment {
         "https_proxy=$ProxyUrl"
         "_NT_SYMBOL_PROXY=$symbolProxy"
     )
-    New-ItemProperty -Path $key -Name Environment -PropertyType MultiString -Value $environment -Force | Out-Null
+    New-ItemProperty -LiteralPath $key -Name Environment -PropertyType MultiString -Value $environment -Force | Out-Null
 }
+
+Assert-ServiceName -ServiceName $ServiceName
 
 Push-Location $RepoRoot
 try {
@@ -76,11 +185,9 @@ try {
         exit $installExitCode
     }
     if (-not $NoProxy) {
-        if ([string]::IsNullOrWhiteSpace($ProxyUrl)) {
-            throw "ProxyUrl must not be empty. Use -NoProxy to skip service proxy configuration."
-        }
         Set-ServiceProxyEnvironment -ServiceName $ServiceName -ProxyUrl $ProxyUrl
         Restart-Service -Name $ServiceName -Force
+        Wait-ServiceHealth -Bind $Bind
     }
     exit 0
 }
