@@ -344,6 +344,21 @@ fallback。
 * 保留原生 WinDbg symbol path 字符串，兼容 `srv*`、`cache*`、UNC 和分号语义。
 * 不默认写入 Microsoft public symbol server，避免默认网络下载和隐藏磁盘占用。
 
+### D-012: SymSrv proxy 可由网络代理配置派生
+
+决定：
+
+`_NT_SYMBOL_PROXY` 仍是 SymSrv 符号下载代理的最终环境变量入口。若 proxy 配置来自
+环境变量且未显式提供 `_NT_SYMBOL_PROXY`，runtime 可从 `HTTPS_PROXY`、
+`HTTP_PROXY` 或 `ALL_PROXY` 派生 SymSrv 所需的 `host:port` 值；无法派生时保留
+原网络代理变量但不设置 `_NT_SYMBOL_PROXY`。
+
+原因：
+
+* 安装脚本可继续持久化现有网络代理环境，不需要新增配置项。
+* 符号下载代理行为对用户更符合预期，同时保留显式 `_NT_SYMBOL_PROXY` 的优先级。
+* 避免把 socks、带认证信息或带路径的通用代理值错误传给 SymSrv。
+
 ## 8. 当前待办
 
 ### P0

@@ -204,7 +204,10 @@ Use `mode = "url"` with `url = "http://host:port"` to set
 `_NT_SYMBOL_PROXY`, `HTTP_PROXY` / `HTTPS_PROXY`, and lowercase equivalents for
 session workers and launched debuggees. Use `mode = "disabled"` to clear known
 proxy variables, `mode = "env"` with `[proxy.env]` to persist specific proxy
-environment variables, or `mode = "none"` to leave proxy unconfigured.
+environment variables, or `mode = "none"` to leave proxy unconfigured. In
+`mode = "env"`, `_NT_SYMBOL_PROXY` is derived from `HTTPS_PROXY`, `HTTP_PROXY`,
+or `ALL_PROXY` when it is not explicitly configured and the proxy value can be
+converted to the SymSrv `host:port` format.
 
 The server supports `initialize`, `notifications/initialized`, `ping`,
 `tools/list`, `tools/call`, `resources/list`, and `resources/read`. Tool

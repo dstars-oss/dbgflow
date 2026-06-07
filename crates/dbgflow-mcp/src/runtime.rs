@@ -1102,6 +1102,45 @@ data_dir = "{}"
     }
 
     #[test]
+    fn proxy_env_derives_symbol_proxy_from_network_proxy() {
+        let root = unique_test_dir("runtime-proxy-derived-symbol");
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[proxy]
+mode = "env"
+
+[proxy.env]
+http_proxy = "http://127.0.0.1:7897"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+            ),
+        );
+
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+
+        assert_eq!(config.app.proxy.source(), ProxySource::Environment);
+        assert_eq!(
+            config.app.proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
+            Some("127.0.0.1:7897")
+        );
+    }
+
+    #[test]
     fn proxy_env_rejects_unknown_key() {
         let root = unique_test_dir("runtime-proxy-unknown");
         let config_path = root.join("config.toml");

@@ -80,6 +80,7 @@ impl ProxyEnvironment {
         insert_env_pair(env, &mut vars, HTTPS_PROXY_KEY, Some(LOWER_HTTPS_PROXY_KEY))?;
         insert_env_pair(env, &mut vars, ALL_PROXY_KEY, Some(LOWER_ALL_PROXY_KEY))?;
         insert_env_pair(env, &mut vars, NO_PROXY_KEY, Some(LOWER_NO_PROXY_KEY))?;
+        derive_symbol_proxy_from_network_proxy(&mut vars);
         if vars.is_empty() {
             Ok(Self::none())
         } else {
@@ -164,6 +165,22 @@ fn insert_env_pair(
         vars.insert(lower.to_string(), value.clone());
     }
     Ok(())
+}
+
+fn derive_symbol_proxy_from_network_proxy(vars: &mut BTreeMap<String, String>) {
+    if vars.contains_key(SYMBOL_PROXY_KEY) {
+        return;
+    }
+    for key in [HTTPS_PROXY_KEY, HTTP_PROXY_KEY, ALL_PROXY_KEY] {
+        let Some(value) = vars.get(key) else {
+            continue;
+        };
+        let Ok(symbol_proxy) = symbol_proxy_from_url(value) else {
+            continue;
+        };
+        vars.insert(SYMBOL_PROXY_KEY.to_string(), symbol_proxy);
+        return;
+    }
 }
 
 fn validate_proxy_value(value: &str, label: &str) -> Result<()> {
@@ -355,6 +372,66 @@ mod tests {
         assert_eq!(
             proxy.value_for("NO_PROXY").as_deref(),
             Some("localhost,127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn environment_derives_symbol_proxy_from_lowercase_http_proxy() {
+        let proxy = ProxyEnvironment::from_environment_map(&env(&[(
+            "http_proxy",
+            "http://127.0.0.1:7897",
+        )]))
+        .expect("read environment proxy");
+
+        assert_eq!(
+            proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
+            Some("127.0.0.1:7897")
+        );
+        assert_eq!(proxy.proxy_keys(), vec!["_NT_SYMBOL_PROXY", "HTTP_PROXY"]);
+    }
+
+    #[test]
+    fn environment_derives_symbol_proxy_from_https_before_http_or_all() {
+        let proxy = ProxyEnvironment::from_environment_map(&env(&[
+            ("HTTP_PROXY", "http://http-proxy:8080"),
+            ("HTTPS_PROXY", "https://secure-proxy:8443"),
+            ("ALL_PROXY", "http://all-proxy:8081"),
+        ]))
+        .expect("read environment proxy");
+
+        assert_eq!(
+            proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
+            Some("secure-proxy:8443")
+        );
+    }
+
+    #[test]
+    fn environment_does_not_derive_symbol_proxy_from_no_proxy_only() {
+        let proxy =
+            ProxyEnvironment::from_environment_map(&env(&[("NO_PROXY", "localhost,127.0.0.1")]))
+                .expect("read environment proxy");
+
+        assert!(proxy.value_for("_NT_SYMBOL_PROXY").is_none());
+        assert_eq!(proxy.proxy_keys(), vec!["NO_PROXY"]);
+    }
+
+    #[test]
+    fn environment_keeps_invalid_network_proxy_without_deriving_symbol_proxy() {
+        let proxy = ProxyEnvironment::from_environment_map(&env(&[
+            ("HTTP_PROXY", "socks5://127.0.0.1:7897"),
+            ("HTTPS_PROXY", "http://user:pass@secure-proxy:8080"),
+            ("ALL_PROXY", "http://all-proxy:8081/path"),
+        ]))
+        .expect("read environment proxy");
+
+        assert!(proxy.value_for("_NT_SYMBOL_PROXY").is_none());
+        assert_eq!(
+            proxy.value_for("HTTP_PROXY").as_deref(),
+            Some("socks5://127.0.0.1:7897")
+        );
+        assert_eq!(
+            proxy.proxy_keys(),
+            vec!["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
         );
     }
 

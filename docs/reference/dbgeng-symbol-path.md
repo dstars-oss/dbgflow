@@ -89,7 +89,9 @@ Recommended behavior:
 - Treat symbol cache contents and symbol-server downloads as local debugging
   artifacts that may reveal target module identity.
 - Keep proxy handling separate. `_NT_SYMBOL_PROXY` controls SymSrv proxy
-  behavior; it does not replace the symbol path.
+  behavior; it does not replace the symbol path. dbgflow may derive
+  `_NT_SYMBOL_PROXY` from a configured HTTP/HTTPS proxy when the explicit symbol
+  proxy is absent.
 
 ## Sources
 
