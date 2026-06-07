@@ -702,9 +702,12 @@ impl<W: Write + Send + 'static> BackendEventSink for WorkerProtocolEventSink<W> 
 
 #[cfg(test)]
 mod tests {
-    use super::run_session_worker_stdio;
+    use super::{apply_proxy_environment, run_session_worker_stdio};
+    use crate::proxy::ProxyEnvironment;
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::io::{Cursor, Write};
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -723,6 +726,72 @@ mod tests {
         assert_eq!(response["request_id"], 1);
         assert_eq!(response["result"]["result"], "closed");
         assert_eq!(response["error"], Value::Null);
+    }
+
+    #[test]
+    fn apply_proxy_environment_sets_cli_proxy_vars_and_removes_unused_proxy_keys() {
+        let mut command = Command::new("dbgflow-test");
+        let proxy =
+            ProxyEnvironment::from_cli_proxy_url("http://127.0.0.1:7897").expect("parse proxy");
+
+        apply_proxy_environment(&mut command, &proxy);
+
+        let envs = command_envs(&command);
+        assert_eq!(env_value(&envs, "_NT_SYMBOL_PROXY"), Some("127.0.0.1:7897"));
+        assert_eq!(
+            env_value(&envs, "HTTP_PROXY"),
+            Some("http://127.0.0.1:7897")
+        );
+        assert_eq!(
+            env_value(&envs, "HTTPS_PROXY"),
+            Some("http://127.0.0.1:7897")
+        );
+        assert!(env_removed(&envs, "ALL_PROXY"));
+        assert!(env_removed(&envs, "NO_PROXY"));
+    }
+
+    #[test]
+    fn apply_proxy_environment_removes_known_proxy_keys_when_disabled() {
+        let mut command = Command::new("dbgflow-test");
+
+        apply_proxy_environment(&mut command, &ProxyEnvironment::disabled());
+
+        let envs = command_envs(&command);
+        for key in [
+            "_NT_SYMBOL_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ] {
+            assert!(env_removed(&envs, key), "expected {key} to be removed");
+        }
+        for key in ["http_proxy", "https_proxy", "all_proxy", "no_proxy"] {
+            assert!(
+                env_removed(&envs, key) || (cfg!(windows) && env_value(&envs, key).is_none()),
+                "expected {key} to be removed"
+            );
+        }
+    }
+
+    fn command_envs(command: &Command) -> HashMap<String, Option<String>> {
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    fn env_value<'a>(envs: &'a HashMap<String, Option<String>>, key: &str) -> Option<&'a str> {
+        envs.get(key).and_then(|value| value.as_deref())
+    }
+
+    fn env_removed(envs: &HashMap<String, Option<String>>, key: &str) -> bool {
+        matches!(envs.get(key), Some(None))
     }
 
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);

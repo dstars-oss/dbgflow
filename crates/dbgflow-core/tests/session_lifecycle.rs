@@ -10,9 +10,10 @@ use dbgflow_core::session::{
 };
 use dbgflow_core::{DbgFlowError, Result};
 use serde_json::Value;
+use std::ffi::OsString;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 #[test]
@@ -530,7 +531,7 @@ fn dropping_manager_kills_active_workers() {
         let _ = wait_for_break(&manager, session.id);
     }
 
-    assert_eq!(kill_count.load(Ordering::SeqCst), 1);
+    wait_for_counter_value(&kill_count, 1, "active worker to be killed");
 }
 
 #[test]
@@ -566,6 +567,38 @@ fn session_manager_passes_proxy_environment_to_worker_launcher() {
         observed.value_for("_NT_SYMBOL_PROXY").as_deref(),
         Some("127.0.0.1:7897")
     );
+}
+
+#[test]
+fn legacy_worker_launcher_constructor_passes_empty_proxy_environment() {
+    let _env_guard = ProxyEnvGuard::with_proxy_environment();
+    let observed_proxy = Arc::new(Mutex::new(None));
+    let launcher = RecordingProxyWorkerLauncher {
+        observed_proxy: observed_proxy.clone(),
+    };
+    let manager = SessionManager::with_worker_launcher_and_logger(
+        Arc::new(launcher),
+        test_artifact_root("legacy-empty-proxy-worker-env"),
+        Arc::new(RecordingLogSink::default()),
+    );
+
+    let session = manager
+        .create_session(CreateSession {
+            target: test_dump_target("legacy-empty-proxy-worker-env-target"),
+            startup_timeout_ms: None,
+        })
+        .expect("create session");
+    let session = wait_for_break(&manager, session.id);
+    assert_eq!(session.state, SessionState::Break);
+
+    let observed = observed_proxy
+        .lock()
+        .expect("observed proxy lock")
+        .clone()
+        .expect("proxy observed");
+    assert_eq!(observed.source(), ProxySource::None);
+    assert!(observed.proxy_keys().is_empty());
+    assert!(observed.value_for("HTTP_PROXY").is_none());
 }
 
 #[test]
@@ -797,6 +830,76 @@ fn wait_until_executing(state: &Arc<(Mutex<BlockingState>, Condvar)>) {
             .wait_timeout(state, Duration::from_millis(10))
             .expect("blocking state wait");
         state = next_state;
+    }
+}
+
+fn wait_for_counter_value(counter: &AtomicUsize, expected: usize, label: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = counter.load(Ordering::SeqCst);
+        if actual == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {label}: expected {expected}, got {actual}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct ProxyEnvGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl ProxyEnvGuard {
+    fn with_proxy_environment() -> Self {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("proxy env test lock");
+        let keys = [
+            "_NT_SYMBOL_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ];
+        let saved = keys
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        std::env::set_var("_NT_SYMBOL_PROXY", "env-symbol-proxy:80");
+        std::env::set_var("HTTP_PROXY", "http://env-proxy:8080");
+        std::env::set_var("HTTPS_PROXY", "http://env-secure-proxy:8080");
+        std::env::remove_var("ALL_PROXY");
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("http_proxy");
+        std::env::remove_var("https_proxy");
+        std::env::remove_var("all_proxy");
+        std::env::remove_var("no_proxy");
+        Self {
+            _guard: guard,
+            saved,
+        }
+    }
+}
+
+impl Drop for ProxyEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
     }
 }
 

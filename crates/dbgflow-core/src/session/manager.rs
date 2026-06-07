@@ -151,8 +151,7 @@ impl SessionManager {
         Self::with_worker_launcher_proxy_and_logger(
             worker_launcher,
             artifact_root,
-            ProxyEnvironment::from_current_environment()
-                .unwrap_or_else(|_| ProxyEnvironment::none()),
+            ProxyEnvironment::none(),
             logger,
         )
     }
