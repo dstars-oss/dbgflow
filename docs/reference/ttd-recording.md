@@ -26,8 +26,9 @@ This note records the external behavior dbgflow relies on for TTD recording.
 
 ## Implementation consequences
 
-- `record_ttd` is a dedicated tool, not a `run_profile` collector. TTD launch
-  recording owns target process creation, while `run_profile` assumes dbgflow
+- `trace.record_ttd` is a dedicated tool, not a `trace.record_profile`
+  collector. TTD launch recording owns target process creation, while
+  `trace.record_profile` assumes dbgflow
   owns target launch after collectors start.
 - dbgflow config accepts `[tools].ttd_dir` as an explicit directory containing
   `TTD.exe`; when omitted, the runtime derives `<dbgeng_dir>\ttd` from

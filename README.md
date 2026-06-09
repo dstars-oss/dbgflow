@@ -25,20 +25,20 @@ endpoint, and Windows service install / uninstall subcommands:
 - launch-only profiling with native ETW and optional Sysinternals Procmon collectors
 - Time Travel Debugging recording with `TTD.exe` for launch, attach, and bounded monitor scenarios
 
-Initial tool names:
+Current tool names:
 
-- `create_session`
-- `get_session`
-- `list_sessions`
-- `close_session`
-- `eval`
-- `set_symbols`
-- `run_profile`
-- `record_ttd`
+- `dbg.create_session`
+- `dbg.get_session`
+- `dbg.list_sessions`
+- `dbg.close_session`
+- `dbg.eval`
+- `dbg.add_symbols`
+- `trace.record_profile`
+- `trace.record_ttd`
 
-`create_session` uses get-or-create semantics and returns quickly with a
+`dbg.create_session` uses get-or-create semantics and returns quickly with a
 `Starting` session while the backend opens the target in the background. Use
-`get_session`, `list_sessions`, or the HTTP resource update stream to observe
+`dbg.get_session`, `dbg.list_sessions`, or the HTTP resource update stream to observe
 the transition to `Ready`, `Break`, `Closed`, or `Error`.
 `target` is required; dbgflow no longer exposes a mock target in the MCP tool
 schema.
@@ -71,17 +71,17 @@ existing path; shell invocation, custom current directories, and custom
 environments are not part of this MVP.
 Command output, transcripts, command records, event records, and logs are still
 written under controlled runtime directories.
-`eval` passes native debugger commands through to DbgEng except for empty
+`dbg.eval` passes native debugger commands through to DbgEng except for empty
 commands. Use it only in a trusted local environment. Run-control commands
 are not detected from command text; session state is updated from backend
 execution-status events and final backend status.
-`set_symbols` accepts native WinDbg symbol path strings, including symbol server
-paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
+`dbg.add_symbols` appends native WinDbg symbol path strings, including symbol
+server paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
 The runtime config can also provide an initial DbgEng symbol path. dbgflow
 applies this through the DbgEng symbols API before opening the target; it is not
 implemented by relying on worker environment variables.
 
-`run_profile` launches a local executable and records one or more profiling
+`trace.record_profile` launches a local executable and records one or more profiling
 collectors around the same target lifetime. The default collector is
 `native_etw/system_overview`, which writes a standard `.etl` trace. The tool
 also accepts `collectors[]` for parallel collection; the legacy single
@@ -139,7 +139,7 @@ The `procmon` collector is optional and depends on Sysinternals Process Monitor.
 Configure `[tools].sysinternals_dir` in `config.toml`; dbgflow derives
 `Procmon64.exe` or `Procmon.exe` from that directory. If it is not configured,
 Sysinternals-dependent features return a clear error and the target is not
-launched. `run_profile` requests do not accept a Sysinternals path; this is
+launched. `trace.record_profile` requests do not accept a Sysinternals path; this is
 server runtime configuration. dbgflow does not download Procmon, does not scan
 the whole machine, and does not accept a standalone Procmon executable path.
 Procmon writes `capture.pml` as the authoritative artifact and exports
@@ -147,7 +147,7 @@ Procmon writes `capture.pml` as the authoritative artifact and exports
 `events.jsonl`; when stack capture is requested, dbgflow also requests an XML
 export with stack data.
 
-`record_ttd` records Microsoft Time Travel Debugging traces by running
+`trace.record_ttd` records Microsoft Time Travel Debugging traces by running
 `TTD.exe` with typed launch, attach, or monitor targets. Configure
 `[tools].ttd_dir` to override the recorder location; otherwise dbgflow derives
 `TTD.exe` from `[debugger].dbgeng_dir\ttd` when available, then falls back to
@@ -176,15 +176,15 @@ Example TTD recording request:
 }
 ```
 
-`eval` is synchronous and does not expose per-command timeout knobs. While a
+`dbg.eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a
 `last_operation` summary with status, timing, artifact, error, and output-size
 fields. If DbgEng reports the target running, the session state becomes
 `Running` until the next debug event returns it to `Break` or the backend
 reports no debuggee and the session becomes `Closed`. Clients can observe
-progress with `get_session`, `resources/read`, or the HTTP resource update
+progress with `dbg.get_session`, `resources/read`, or the HTTP resource update
 stream. Legacy timeout fields are accepted for compatibility, ignored, and
-logged as warnings. `close_session` requests backend cancellation before closing
+logged as warnings. `dbg.close_session` requests backend cancellation before closing
 a session that is currently executing a command; if the worker is stuck, the
 main process can terminate that session's worker without taking down other
 sessions or the MCP server.

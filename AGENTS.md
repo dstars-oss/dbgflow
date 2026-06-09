@@ -45,18 +45,19 @@ MCP Tool Layer
 当前基础 session tools：
 
 ```text
-create_session
-list_sessions
-close_session
+dbg.create_session
+dbg.get_session
+dbg.list_sessions
+dbg.close_session
 ```
 
-`create_session` 采用 get-or-create 语义：同一 target 已存在 active session 时返回现有详情，否则创建新 session 并返回相同详情结构。
+`dbg.create_session` 采用 get-or-create 语义：同一 target 已存在 active session 时返回现有详情，否则创建新 session 并返回相同详情结构。
 
 后续 tool 应优先表达调试目标、会话控制或受控配置动作，例如：
 
 ```text
 open_dump
-set_symbols
+dbg.add_symbols
 continue_until_event
 break_execution
 ```
@@ -64,12 +65,12 @@ break_execution
 文本命令接口用于可信本机调试，例如：
 
 ```text
-eval
+dbg.eval
 ```
 
-`eval` 透传原生 debugger command，除空命令外不做 denylist 过滤；调用方必须把它视为可信本机能力。
+`dbg.eval` 透传原生 debugger command，除空命令外不做 denylist 过滤；调用方必须把它视为可信本机能力。
 
-工具返回应包含 session 状态、结果、warnings 和 artifact 引用。`eval` 可以返回调试器原始输出，但必须同时写入 artifact 并记录审计信息。
+工具返回应包含 session 状态、结果、warnings 和 artifact 引用。`dbg.eval` 可以返回调试器原始输出，但必须同时写入 artifact 并记录审计信息。
 
 ## 4. Session 规则
 

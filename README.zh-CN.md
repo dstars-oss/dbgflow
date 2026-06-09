@@ -23,18 +23,18 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - launch-only profiling，支持 native ETW 和可选 Sysinternals Procmon collector
 - 通过 `TTD.exe` 录制 Time Travel Debugging trace，支持 launch、attach 和有界 monitor 场景
 
-初始公开 tool 名称：
+当前公开 tool 名称：
 
-- `create_session`
-- `get_session`
-- `list_sessions`
-- `close_session`
-- `eval`
-- `set_symbols`
-- `run_profile`
-- `record_ttd`
+- `dbg.create_session`
+- `dbg.get_session`
+- `dbg.list_sessions`
+- `dbg.close_session`
+- `dbg.eval`
+- `dbg.add_symbols`
+- `trace.record_profile`
+- `trace.record_ttd`
 
-`create_session` 采用 get-or-create 语义，并会快速返回 `Starting` session；后端打开 target 在后台完成。调用方可以通过 `get_session`、`list_sessions` 或 HTTP resource update stream 观察状态转为 `Ready`、`Break`、`Closed` 或 `Error`。
+`dbg.create_session` 采用 get-or-create 语义，并会快速返回 `Starting` session；后端打开 target 在后台完成。调用方可以通过 `dbg.get_session`、`dbg.list_sessions` 或 HTTP resource update stream 观察状态转为 `Ready`、`Break`、`Closed` 或 `Error`。
 `target` 现在是必填参数；MCP tool schema 不再暴露 mock target。
 
 当前 backend 选择属于内部实现细节，不作为公开 tool 暴露。调用方只需要描述要调试的 target，后续由内部机制选择合适的 backend。
@@ -58,11 +58,11 @@ Target 示例：
 { "kind": "launch", "executable": "C:\\app\\app.exe", "args": ["--flag"] }
 ```
 
-Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。session 状态不再从命令文本识别运行控制，而是由 backend execution status 事件和最终状态更新。`set_symbols` 接受原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
+Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`dbg.eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。session 状态不再从命令文本识别运行控制，而是由 backend execution status 事件和最终状态更新。`dbg.add_symbols` 追加原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
 运行配置也可以提供初始 DbgEng symbol path。dbgflow 会在打开 target 前通过
 DbgEng symbols API 应用该路径，而不是依赖 worker 环境变量生效。
 
-`run_profile` 启动本地可执行文件，并围绕同一个 target 生命周期运行一个
+`trace.record_profile` 启动本地可执行文件，并围绕同一个 target 生命周期运行一个
 或多个 profiling collector。默认 collector 是 `native_etw/system_overview`，
 会写入标准 `.etl` trace。工具也接受 `collectors[]` 做并行采集；旧的单数
 `collector` 字段继续兼容。采集会在目标进程退出或 `timeout_ms` 到达时停止。
@@ -117,14 +117,14 @@ Profile 请求示例：
 `procmon` collector 是可选能力，依赖 Sysinternals Process Monitor。通过
 `config.toml` 中的 `[tools].sysinternals_dir` 配置；dbgflow 只会从该目录中
 派生 `Procmon64.exe` 或 `Procmon.exe`。如果未配置该路径，依赖 Sysinternals
-的能力会返回明确错误，且不会启动目标进程。`run_profile` 请求不接受
+的能力会返回明确错误，且不会启动目标进程。`trace.record_profile` 请求不接受
 Sysinternals 路径；这是 server runtime 配置。dbgflow 不下载 Procmon、不扫描
 全盘，也不接受单独的 Procmon exe 路径。Procmon 会写入
 权威 artifact `capture.pml`，并导出 `events.csv` 以及按 target PID /
 operation / path best-effort 过滤后的 `events.jsonl`；请求 stack capture 时，
 dbgflow 也会请求带 stack 数据的 XML 导出。
 
-`record_ttd` 通过 Microsoft `TTD.exe` 录制 Time Travel Debugging trace，支持
+`trace.record_ttd` 通过 Microsoft `TTD.exe` 录制 Time Travel Debugging trace，支持
 typed launch、attach 和 monitor target。可用 `[tools].ttd_dir` 显式覆盖
 recorder 位置；若未配置，dbgflow 会先从 `[debugger].dbgeng_dir\ttd` 推导
 `TTD.exe`，再回退到 `PATH`。dbgflow 不下载或安装 TTD，不接受任意 recorder
@@ -150,7 +150,7 @@ TTD recording 请求示例：
 }
 ```
 
-`eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。如果 DbgEng 报告目标正在运行，session state 会变为 `Running`；下一次 debug event 返回后恢复为 `Break`，如果 backend 报告 no debuggee 则变为 `Closed`。调用方可以通过 `get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `close_session`，服务会先请求 backend cancellation，再关闭 session。
+`dbg.eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。如果 DbgEng 报告目标正在运行，session state 会变为 `Running`；下一次 debug event 返回后恢复为 `Break`，如果 backend 报告 no debuggee 则变为 `Closed`。调用方可以通过 `dbg.get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `dbg.close_session`，服务会先请求 backend cancellation，再关闭 session。
 如果 worker 卡住，主进程可以终止该 session 对应的 worker 子进程，不会拖垮其他 session 或 MCP server。
 
 从仓库根目录通过本地 Streamable HTTP 启动 MCP server：

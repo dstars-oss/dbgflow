@@ -25,7 +25,7 @@ fn http_worker_can_attach_to_process_and_eval_queries() {
 
     let created = tool_call(
         &server.addr,
-        "create_session",
+        "dbg.create_session",
         json!({
             "target": { "kind": "attach", "pid": target.id() }
         }),
@@ -36,7 +36,7 @@ fn http_worker_can_attach_to_process_and_eval_queries() {
 
     let modules = tool_call(
         &server.addr,
-        "eval",
+        "dbg.eval",
         json!({
             "session_id": session_id,
             "command": "lm"
@@ -46,7 +46,7 @@ fn http_worker_can_attach_to_process_and_eval_queries() {
 
     let stacks = tool_call(
         &server.addr,
-        "eval",
+        "dbg.eval",
         json!({
             "session_id": session_id,
             "command": "~* k"
@@ -75,7 +75,7 @@ fn http_worker_can_launch_process_and_continue_to_exit() {
 
     let created = tool_call(
         &server.addr,
-        "create_session",
+        "dbg.create_session",
         json!({
             "target": {
                 "kind": "launch",
@@ -90,7 +90,7 @@ fn http_worker_can_launch_process_and_continue_to_exit() {
 
     let continued = tool_call(
         &server.addr,
-        "eval",
+        "dbg.eval",
         json!({
             "session_id": session_id,
             "command": "g"
@@ -285,7 +285,7 @@ fn wait_for_session_state(addr: &SocketAddr, session_id: &str, state: &str) -> V
     loop {
         let session = tool_call(
             addr,
-            "get_session",
+            "dbg.get_session",
             json!({
                 "session_id": session_id
             }),

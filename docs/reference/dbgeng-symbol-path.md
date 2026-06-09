@@ -78,14 +78,14 @@ not a general shell or environment mutator.
 
 Recommended behavior:
 
-- Keep the public tool name in debugging language, for example `set_symbols`.
+- Keep the public tool name in debugging language, currently `dbg.add_symbols`.
 - Accept native WinDbg symbol path strings so `srv*` and `cache*` syntax works.
 - Store install-time defaults as `[debugger].symbol_path` and apply them with
   `IDebugSymbols3::SetSymbolPathWide` before opening a target.
 - Reject empty path entries and control characters that can break command or log
   boundaries, especially while any command fallback exists.
-- Record the requested path, append/replace mode, backend result, warnings, and
-  any reload operation in artifacts and audit logs.
+- Record the requested appended path, backend result, warnings, and any reload
+  operation in artifacts and audit logs.
 - Treat symbol cache contents and symbol-server downloads as local debugging
   artifacts that may reveal target module identity.
 - Keep proxy handling separate. `_NT_SYMBOL_PROXY` controls SymSrv proxy

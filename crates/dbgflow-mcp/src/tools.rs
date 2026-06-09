@@ -11,14 +11,14 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-pub const CREATE_SESSION: &str = "create_session";
-pub const GET_SESSION: &str = "get_session";
-pub const LIST_SESSIONS: &str = "list_sessions";
-pub const CLOSE_SESSION: &str = "close_session";
-pub const EVAL: &str = "eval";
-pub const SET_SYMBOLS: &str = "set_symbols";
-pub const RUN_PROFILE: &str = "run_profile";
-pub const RECORD_TTD: &str = "record_ttd";
+pub const CREATE_SESSION: &str = "dbg.create_session";
+pub const GET_SESSION: &str = "dbg.get_session";
+pub const LIST_SESSIONS: &str = "dbg.list_sessions";
+pub const CLOSE_SESSION: &str = "dbg.close_session";
+pub const EVAL: &str = "dbg.eval";
+pub const ADD_SYMBOLS: &str = "dbg.add_symbols";
+pub const RECORD_PROFILE: &str = "trace.record_profile";
+pub const RECORD_TTD: &str = "trace.record_ttd";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -147,7 +147,7 @@ impl ToolService {
                     "properties": {
                         "session_id": {
                             "type": "string",
-                            "description": "Session id returned by create_session."
+                            "description": "Session id returned by dbg.create_session."
                         }
                     },
                     "required": ["session_id"],
@@ -171,7 +171,7 @@ impl ToolService {
                     "properties": {
                         "session_id": {
                             "type": "string",
-                            "description": "Session id returned by create_session."
+                            "description": "Session id returned by dbg.create_session."
                         }
                     },
                     "required": ["session_id"],
@@ -186,7 +186,7 @@ impl ToolService {
                     "properties": {
                         "session_id": {
                             "type": "string",
-                            "description": "Session id returned by create_session."
+                            "description": "Session id returned by dbg.create_session."
                         },
                         "command": {
                             "type": "string",
@@ -198,24 +198,20 @@ impl ToolService {
                 }),
             },
             ToolDescriptor {
-                name: SET_SYMBOLS,
-                description: "Set or append a native debugger symbol path.",
+                name: ADD_SYMBOLS,
+                description: "Append native debugger symbol path entries to a session.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "session_id": {
                             "type": "string",
-                            "description": "Session id returned by create_session."
+                            "description": "Session id returned by dbg.create_session."
                         },
                         "paths": {
                             "type": "array",
                             "items": { "type": "string" },
                             "minItems": 1,
                             "description": "Debugger symbol path entries. Raw WinDbg symbol path strings are accepted."
-                        },
-                        "append": {
-                            "type": "boolean",
-                            "description": "Append to the current symbol path instead of replacing it."
                         }
                     },
                     "required": ["session_id", "paths"],
@@ -223,7 +219,7 @@ impl ToolService {
                 }),
             },
             ToolDescriptor {
-                name: RUN_PROFILE,
+                name: RECORD_PROFILE,
                 description:
                     "Launch a process and record a native ETW profile trace as a standard ETL artifact. Procmon collectors use the server runtime's configured Sysinternals directory.",
                 input_schema: json!({
@@ -466,16 +462,15 @@ impl ToolService {
         })
     }
 
-    pub fn set_symbols(&self, request: SetSymbolsRequest) -> Result<EvalSessionResult> {
+    pub fn add_symbols(&self, request: AddSymbolsRequest) -> Result<EvalSessionResult> {
         if request.paths.is_empty() {
             return Err(DbgFlowError::Backend(
                 "at least one symbol path is required".to_string(),
             ));
         }
 
-        let append = request.append.unwrap_or(false);
         let mut result = None;
-        for (index, path) in request.paths.iter().enumerate() {
+        for path in &request.paths {
             let path = path.as_os_str().to_string_lossy();
             if path.trim().is_empty() {
                 return Err(DbgFlowError::Backend(
@@ -490,15 +485,11 @@ impl ToolService {
                     "symbol path contains unsupported control characters".to_string(),
                 ));
             }
-            let command = if append || index > 0 {
-                format!(".sympath+ {path}")
-            } else {
-                format!(".sympath {path}")
-            };
+            let command = format!(".sympath+ {path}");
             result = Some(self.eval(EvalRequest {
                 session_id: request.session_id,
                 command,
-                timeout_ms: request.timeout_ms,
+                timeout_ms: None,
             })?);
         }
 
@@ -547,11 +538,11 @@ impl ToolService {
                 .eval(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
-            SET_SYMBOLS => self
-                .set_symbols(decode_arguments(arguments)?)
+            ADD_SYMBOLS => self
+                .add_symbols(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
-            RUN_PROFILE => self
+            RECORD_PROFILE => self
                 .run_profile(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
@@ -616,11 +607,10 @@ pub struct GetSessionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetSymbolsRequest {
+#[serde(deny_unknown_fields)]
+pub struct AddSymbolsRequest {
     pub session_id: SessionId,
     pub paths: Vec<PathBuf>,
-    pub append: Option<bool>,
-    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,17 +750,17 @@ mod tests {
     };
 
     #[test]
-    fn tool_descriptors_include_run_profile() {
+    fn tool_descriptors_include_record_profile() {
         let service = ToolService::new_for_tests();
 
         let descriptors = service.tool_descriptors();
-        let run_profile = descriptors
+        let record_profile = descriptors
             .iter()
-            .find(|descriptor| descriptor.name == RUN_PROFILE)
-            .expect("run_profile descriptor");
+            .find(|descriptor| descriptor.name == RECORD_PROFILE)
+            .expect("trace.record_profile descriptor");
 
-        assert!(run_profile.description.contains("profile"));
-        assert_eq!(run_profile.input_schema["type"], "object");
+        assert!(record_profile.description.contains("profile"));
+        assert_eq!(record_profile.input_schema["type"], "object");
     }
 
     #[test]
@@ -781,7 +771,7 @@ mod tests {
         let record_ttd = descriptors
             .iter()
             .find(|descriptor| descriptor.name == RECORD_TTD)
-            .expect("record_ttd descriptor");
+            .expect("trace.record_ttd descriptor");
 
         assert!(record_ttd.description.contains("TTD"));
         assert_eq!(record_ttd.input_schema["type"], "object");

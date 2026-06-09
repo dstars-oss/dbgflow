@@ -669,12 +669,12 @@ mod tests {
 
         let tools = response["result"]["tools"].as_array().expect("tools array");
         assert!(tools.iter().any(|tool| {
-            tool["name"] == "create_session" && tool["inputSchema"]["type"] == "object"
+            tool["name"] == "dbg.create_session" && tool["inputSchema"]["type"] == "object"
         }));
         let create_session = tools
             .iter()
-            .find(|tool| tool["name"] == "create_session")
-            .expect("create_session tool");
+            .find(|tool| tool["name"] == "dbg.create_session")
+            .expect("dbg.create_session tool");
         assert!(create_session["inputSchema"]["properties"]
             .get("startup_timeout_ms")
             .is_none());
@@ -696,17 +696,22 @@ mod tests {
             .iter()
             .any(|target| target["properties"]["kind"]["const"] == "launch"));
         assert!(tools.iter().any(|tool| {
-            tool["name"] == "eval" && tool["inputSchema"]["required"][0] == "session_id"
+            tool["name"] == "dbg.eval" && tool["inputSchema"]["required"][0] == "session_id"
         }));
         let eval = tools
             .iter()
-            .find(|tool| tool["name"] == "eval")
-            .expect("eval tool");
+            .find(|tool| tool["name"] == "dbg.eval")
+            .expect("dbg.eval tool");
         assert!(eval["inputSchema"]["properties"]
             .get("timeout_ms")
             .is_none());
-        assert!(tools.iter().any(|tool| tool["name"] == "get_session"));
-        assert!(tools.iter().any(|tool| tool["name"] == "set_symbols"));
+        assert!(tools.iter().any(|tool| tool["name"] == "dbg.get_session"));
+        assert!(tools.iter().any(|tool| tool["name"] == "dbg.add_symbols"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "trace.record_profile"));
+        assert!(tools.iter().any(|tool| tool["name"] == "trace.record_ttd"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "set_symbols"));
     }
 
     #[test]
@@ -719,7 +724,7 @@ mod tests {
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "create_session",
+                    "name": "dbg.create_session",
                     "arguments": {
                         "target": { "kind": "dump", "path": dump_path }
                     }
@@ -737,7 +742,7 @@ mod tests {
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "eval",
+                    "name": "dbg.eval",
                     "arguments": {
                         "session_id": session_id,
                         "command": "k"
@@ -754,16 +759,16 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_set_symbols_accepts_raw_symbol_path() {
+    fn tools_call_add_symbols_accepts_raw_symbol_path() {
         let server = test_server();
-        let dump_path = test_dump_path("mcp-set-symbols-raw");
+        let dump_path = test_dump_path("mcp-add-symbols-raw");
         let create_response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "create_session",
+                    "name": "dbg.create_session",
                     "arguments": {
                         "target": { "kind": "dump", "path": dump_path }
                     }
@@ -782,7 +787,7 @@ mod tests {
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "set_symbols",
+                    "name": "dbg.add_symbols",
                     "arguments": {
                         "session_id": session_id,
                         "paths": [symbol_path]
@@ -795,20 +800,20 @@ mod tests {
         assert!(result["output"]
             .as_str()
             .expect("output")
-            .contains(&format!(".sympath {symbol_path}")));
+            .contains(&format!(".sympath+ {symbol_path}")));
     }
 
     #[test]
-    fn tools_call_set_symbols_rejects_line_separators() {
+    fn tools_call_add_symbols_rejects_line_separators() {
         let server = test_server();
-        let dump_path = test_dump_path("mcp-set-symbols-line-separator");
+        let dump_path = test_dump_path("mcp-add-symbols-line-separator");
         let create_response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "create_session",
+                    "name": "dbg.create_session",
                     "arguments": {
                         "target": { "kind": "dump", "path": dump_path }
                     }
@@ -826,7 +831,7 @@ mod tests {
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "set_symbols",
+                    "name": "dbg.add_symbols",
                     "arguments": {
                         "session_id": session_id,
                         "paths": ["srv*C:\\symbols\r\n.shell dir"]
@@ -840,6 +845,80 @@ mod tests {
             .as_str()
             .expect("tool error text")
             .contains("symbol path contains unsupported control characters"));
+    }
+
+    #[test]
+    fn tools_call_add_symbols_rejects_append_field() {
+        let server = test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "dbg.add_symbols",
+                    "arguments": {
+                        "session_id": "00000000-0000-0000-0000-000000000000",
+                        "paths": ["srv*C:\\symbols"],
+                        "append": true
+                    }
+                }
+            }))
+            .expect("response");
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("unknown field"));
+    }
+
+    #[test]
+    fn tools_call_add_symbols_rejects_timeout_field() {
+        let server = test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "dbg.add_symbols",
+                    "arguments": {
+                        "session_id": "00000000-0000-0000-0000-000000000000",
+                        "paths": ["srv*C:\\symbols"],
+                        "timeout_ms": 1000
+                    }
+                }
+            }))
+            .expect("response");
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("unknown field"));
+    }
+
+    #[test]
+    fn tools_call_rejects_legacy_flat_names() {
+        let server = test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_symbols",
+                    "arguments": {}
+                }
+            }))
+            .expect("response");
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("unknown tool"));
     }
 
     #[test]
@@ -873,7 +952,7 @@ mod tests {
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "eval",
+                    "name": "dbg.eval",
                     "arguments": {
                         "session_id": 123,
                         "command": "k"
@@ -898,7 +977,7 @@ mod tests {
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "create_session",
+                    "name": "dbg.create_session",
                     "arguments": {}
                 }
             }))
@@ -920,7 +999,7 @@ mod tests {
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "create_session",
+                    "name": "dbg.create_session",
                     "arguments": {
                         "target": { "kind": "mock" }
                     }
@@ -945,7 +1024,7 @@ mod tests {
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "create_session",
+                    "name": "dbg.create_session",
                     "arguments": { "target": { "kind": "dump", "path": dump_path } }
                 }
             }))
@@ -959,7 +1038,7 @@ mod tests {
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "eval",
+                    "name": "dbg.eval",
                     "arguments": {
                         "session_id": session_id,
                         "command": " "
@@ -1048,7 +1127,7 @@ mod tests {
                     "id": "get-session",
                     "method": "tools/call",
                     "params": {
-                        "name": "get_session",
+                        "name": "dbg.get_session",
                         "arguments": {
                             "session_id": session_id
                         }
