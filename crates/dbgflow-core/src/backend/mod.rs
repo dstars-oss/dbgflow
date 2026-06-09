@@ -67,6 +67,30 @@ pub struct ExecuteBackendResult {
     pub final_state: Option<BackendExecutionState>,
 }
 
+#[derive(Debug)]
+pub struct ExecuteBackendFailure {
+    pub error: DbgFlowError,
+    pub partial_output: Option<String>,
+}
+
+impl ExecuteBackendFailure {
+    pub fn with_partial_output(error: DbgFlowError, partial_output: String) -> Self {
+        Self {
+            error,
+            partial_output: Some(partial_output),
+        }
+    }
+}
+
+impl From<DbgFlowError> for ExecuteBackendFailure {
+    fn from(error: DbgFlowError) -> Self {
+        Self {
+            error,
+            partial_output: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackendExecutionState {
     Break,
@@ -99,6 +123,13 @@ pub trait DebugBackend: Send + Sync {
         request: ExecuteBackendRequest,
         event_sink: std::sync::Arc<dyn BackendEventSink>,
     ) -> Result<ExecuteBackendResult>;
+    fn execute_with_output_on_error(
+        &self,
+        request: ExecuteBackendRequest,
+        event_sink: std::sync::Arc<dyn BackendEventSink>,
+    ) -> std::result::Result<ExecuteBackendResult, ExecuteBackendFailure> {
+        self.execute(request, event_sink).map_err(Into::into)
+    }
     fn cancel_startup(&self, _correlation_id: &str) -> Result<()> {
         Err(DbgFlowError::Backend(
             "backend does not support startup cancellation".to_string(),

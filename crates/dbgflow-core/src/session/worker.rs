@@ -2,7 +2,7 @@
 use crate::backend::{dbgeng::DbgEngBackend, DebugBackend};
 use crate::backend::{
     BackendEventSink, BackendExecutionEvent, CreateBackendSession, DebugTarget,
-    ExecuteBackendRequest, ExecuteBackendResult,
+    ExecuteBackendFailure, ExecuteBackendRequest, ExecuteBackendResult,
 };
 use crate::logging::{LogEvent, LogLevel, LogSink};
 use crate::proxy::ProxyEnvironment;
@@ -46,6 +46,13 @@ pub trait SessionWorker: Send + Sync {
         command: String,
         event_sink: Arc<dyn BackendEventSink>,
     ) -> Result<ExecuteBackendResult>;
+    fn execute_with_output_on_error(
+        &self,
+        command: String,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> std::result::Result<ExecuteBackendResult, ExecuteBackendFailure> {
+        self.execute(command, event_sink).map_err(Into::into)
+    }
     fn has_exited(&self) -> Result<bool>;
     fn close(&self) -> Result<()>;
     fn kill(&self, reason: &str) -> Result<()>;
@@ -184,13 +191,14 @@ impl ProcessSessionWorker {
 
     fn request(&self, request: WorkerRequest) -> Result<WorkerResult> {
         self.request_with_event_sink(request, None)
+            .map_err(|failure| failure.error)
     }
 
     fn request_with_event_sink(
         &self,
         request: WorkerRequest,
         event_sink: Option<Arc<dyn BackendEventSink>>,
-    ) -> Result<WorkerResult> {
+    ) -> std::result::Result<WorkerResult, ExecuteBackendFailure> {
         let _request_guard = self
             .inner
             .request_lock
@@ -200,7 +208,8 @@ impl ProcessSessionWorker {
             return Err(DbgFlowError::Backend(format!(
                 "session worker process already exited: pid {}",
                 self.inner.pid
-            )));
+            ))
+            .into());
         }
 
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -226,18 +235,18 @@ impl ProcessSessionWorker {
             if let Err(error) = serde_json::to_writer(&mut *stdin, &input) {
                 let error = DbgFlowError::Backend(format!("write worker request failed: {error}"));
                 self.log_worker_request_failed(request_id, &method, request_started, &error);
-                return Err(error);
+                return Err(error.into());
             }
             if let Err(error) = writeln!(&mut *stdin) {
                 let error =
                     DbgFlowError::Backend(format!("write worker request newline failed: {error}"));
                 self.log_worker_request_failed(request_id, &method, request_started, &error);
-                return Err(error);
+                return Err(error.into());
             }
             if let Err(error) = stdin.flush() {
                 let error = DbgFlowError::Backend(format!("flush worker request failed: {error}"));
                 self.log_worker_request_failed(request_id, &method, request_started, &error);
-                return Err(error);
+                return Err(error.into());
             }
         }
 
@@ -255,7 +264,7 @@ impl ProcessSessionWorker {
                     let error =
                         DbgFlowError::Backend(format!("read worker response failed: {error}"));
                     self.log_worker_request_failed(request_id, &method, request_started, &error);
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             if read == 0 {
@@ -264,7 +273,7 @@ impl ProcessSessionWorker {
                     self.inner.pid
                 ));
                 self.log_worker_request_failed(request_id, &method, request_started, &error);
-                return Err(error);
+                return Err(error.into());
             }
 
             let output = match serde_json::from_str::<WorkerOutput>(&line) {
@@ -273,7 +282,7 @@ impl ProcessSessionWorker {
                     let error =
                         DbgFlowError::Backend(format!("parse worker response failed: {error}"));
                     self.log_worker_request_failed(request_id, &method, request_started, &error);
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             match output {
@@ -298,20 +307,22 @@ impl ProcessSessionWorker {
                             request_started,
                             &error,
                         );
-                        return Err(error);
+                        return Err(error.into());
                     }
                     if let Some(error) = error {
-                        let error = DbgFlowError::Backend(error);
+                        let error = error.into_execute_failure();
                         self.log_worker_request_failed(
                             request_id,
                             &method,
                             request_started,
-                            &error,
+                            &error.error,
                         );
                         return Err(error);
                     }
                     let result = result.ok_or_else(|| {
-                        DbgFlowError::Backend("worker response missing result".to_string())
+                        ExecuteBackendFailure::from(DbgFlowError::Backend(
+                            "worker response missing result".to_string(),
+                        ))
                     });
                     match &result {
                         Ok(result) => self.inner.logger.log(
@@ -331,7 +342,7 @@ impl ProcessSessionWorker {
                             request_id,
                             &method,
                             request_started,
-                            error,
+                            &error.error,
                         ),
                     }
                     return result;
@@ -461,6 +472,15 @@ impl SessionWorker for ProcessSessionWorker {
         command: String,
         event_sink: Arc<dyn BackendEventSink>,
     ) -> Result<ExecuteBackendResult> {
+        self.execute_with_output_on_error(command, event_sink)
+            .map_err(|failure| failure.error)
+    }
+
+    fn execute_with_output_on_error(
+        &self,
+        command: String,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> std::result::Result<ExecuteBackendResult, ExecuteBackendFailure> {
         match self.request_with_event_sink(WorkerRequest::Execute { command }, Some(event_sink))? {
             WorkerResult::Executed {
                 output,
@@ -473,7 +493,8 @@ impl SessionWorker for ProcessSessionWorker {
             }),
             other => Err(DbgFlowError::Backend(format!(
                 "unexpected worker execute response: {other:?}"
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -588,7 +609,7 @@ enum WorkerOutput {
     Response {
         request_id: u64,
         result: Option<WorkerResult>,
-        error: Option<String>,
+        error: Option<WorkerError>,
     },
     Log {
         event: LogEvent,
@@ -612,6 +633,43 @@ enum WorkerResult {
         final_state: Option<crate::backend::BackendExecutionState>,
     },
     Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum WorkerError {
+    Structured {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial_output: Option<String>,
+    },
+    Legacy(String),
+}
+
+impl WorkerError {
+    fn from_failure(failure: &ExecuteBackendFailure) -> Self {
+        Self::Structured {
+            message: failure.error.to_string(),
+            partial_output: failure.partial_output.clone(),
+        }
+    }
+
+    fn into_execute_failure(self) -> ExecuteBackendFailure {
+        match self {
+            Self::Structured {
+                message,
+                partial_output: Some(partial_output),
+            } => ExecuteBackendFailure::with_partial_output(
+                DbgFlowError::Backend(message),
+                partial_output,
+            ),
+            Self::Structured {
+                message,
+                partial_output: None,
+            } => DbgFlowError::Backend(message).into(),
+            Self::Legacy(message) => DbgFlowError::Backend(message).into(),
+        }
+    }
 }
 
 impl WorkerResult {
@@ -651,9 +709,9 @@ where
                 write_response(
                     &output,
                     0,
-                    Err(DbgFlowError::Backend(format!(
+                    Err(ExecuteBackendFailure::from(DbgFlowError::Backend(format!(
                         "invalid session worker request: {error}"
-                    ))),
+                    )))),
                 )?;
                 continue;
             }
@@ -673,7 +731,7 @@ where
 fn write_response<W: Write>(
     output: &Arc<Mutex<W>>,
     request_id: u64,
-    result: Result<WorkerResult>,
+    result: std::result::Result<WorkerResult, ExecuteBackendFailure>,
 ) -> std::io::Result<()> {
     let frame = match result {
         Ok(result) => WorkerOutput::Response {
@@ -681,10 +739,10 @@ fn write_response<W: Write>(
             result: Some(result),
             error: None,
         },
-        Err(error) => WorkerOutput::Response {
+        Err(failure) => WorkerOutput::Response {
             request_id,
             result: None,
-            error: Some(error.to_string()),
+            error: Some(WorkerError::from_failure(&failure)),
         },
     };
     write_worker_output(output, &frame)
@@ -732,7 +790,10 @@ impl WorkerRuntime {
         request: WorkerRequest,
         _request_id: u64,
         output: Arc<Mutex<W>>,
-    ) -> (Result<WorkerResult>, bool) {
+    ) -> (
+        std::result::Result<WorkerResult, ExecuteBackendFailure>,
+        bool,
+    ) {
         match request {
             WorkerRequest::CreateSession {
                 target,
@@ -743,7 +804,8 @@ impl WorkerRuntime {
                     return (
                         Err(DbgFlowError::Backend(
                             "worker backend session already exists".to_string(),
-                        )),
+                        )
+                        .into()),
                         true,
                     );
                 }
@@ -763,7 +825,7 @@ impl WorkerRuntime {
                             false,
                         )
                     }
-                    Err(error) => (Err(error), true),
+                    Err(error) => (Err(error.into()), true),
                 }
             }
             WorkerRequest::Execute { command } => {
@@ -771,13 +833,14 @@ impl WorkerRuntime {
                     return (
                         Err(DbgFlowError::Backend(
                             "worker backend session is not initialized".to_string(),
-                        )),
+                        )
+                        .into()),
                         true,
                     );
                 };
                 (
                     self.backend
-                        .execute(
+                        .execute_with_output_on_error(
                             ExecuteBackendRequest {
                                 backend_session_id,
                                 command,
@@ -799,7 +862,8 @@ impl WorkerRuntime {
                 (
                     self.backend
                         .close_session(&backend_session_id)
-                        .map(|_| WorkerResult::Closed),
+                        .map(|_| WorkerResult::Closed)
+                        .map_err(Into::into),
                     true,
                 )
             }
@@ -819,12 +883,19 @@ impl<W: Write + Send + 'static> BackendEventSink for WorkerProtocolEventSink<W> 
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_proxy_environment, run_session_worker_stdio};
+    use super::{
+        apply_proxy_environment, run_session_worker_stdio, ProcessSessionWorker,
+        ProcessSessionWorkerInner, SessionWorker, WorkerError, WorkerOutput,
+    };
+    use crate::backend::{ExecuteBackendFailure, NoopBackendEventSink};
     use crate::proxy::ProxyEnvironment;
+    use crate::session::SessionId;
+    use crate::DbgFlowError;
     use serde_json::Value;
     use std::collections::HashMap;
     use std::io::{Cursor, Write};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -843,6 +914,92 @@ mod tests {
         assert_eq!(response["request_id"], 1);
         assert_eq!(response["result"]["result"], "closed");
         assert_eq!(response["error"], Value::Null);
+    }
+
+    #[test]
+    fn worker_error_response_preserves_partial_output() {
+        let original = ExecuteBackendFailure::with_partial_output(
+            DbgFlowError::Backend("execute failed".to_string()),
+            "partial debugger output".to_string(),
+        );
+        let frame = WorkerOutput::Response {
+            request_id: 7,
+            result: None,
+            error: Some(WorkerError::from_failure(&original)),
+        };
+        let encoded = serde_json::to_string(&frame).expect("encode worker error");
+        let decoded: WorkerOutput = serde_json::from_str(&encoded).expect("decode worker error");
+
+        let WorkerOutput::Response {
+            request_id,
+            error: Some(error),
+            ..
+        } = decoded
+        else {
+            panic!("unexpected worker response: {decoded:?}");
+        };
+        assert_eq!(request_id, 7);
+        let restored = error.into_execute_failure();
+        assert_eq!(
+            restored.partial_output.as_deref(),
+            Some("partial debugger output")
+        );
+        assert!(restored.error.to_string().contains("execute failed"));
+    }
+
+    #[test]
+    fn worker_error_response_accepts_legacy_string_error() {
+        let encoded = r#"{"kind":"response","request_id":9,"result":null,"error":"legacy error"}"#;
+        let decoded: WorkerOutput =
+            serde_json::from_str(encoded).expect("decode legacy worker error");
+
+        let WorkerOutput::Response {
+            request_id,
+            error: Some(error),
+            ..
+        } = decoded
+        else {
+            panic!("unexpected worker response: {decoded:?}");
+        };
+        assert_eq!(request_id, 9);
+        let restored = error.into_execute_failure();
+        assert_eq!(restored.partial_output, None);
+        assert!(restored.error.to_string().contains("legacy error"));
+    }
+
+    #[test]
+    fn process_session_worker_execute_preserves_structured_error_partial_output() {
+        let response = r#"{"kind":"response","request_id":0,"result":null,"error":{"message":"backend error: execute failed","partial_output":"partial from worker\n"}}"#;
+        let mut child = spawn_worker_response_child(response);
+        let pid = child.id();
+        let stdin = child.stdin.take().expect("fake worker stdin");
+        let stdout = child.stdout.take().expect("fake worker stdout");
+        let worker = ProcessSessionWorker {
+            inner: Arc::new(ProcessSessionWorkerInner {
+                session_id: SessionId::new(),
+                pid,
+                child: Mutex::new(child),
+                stdin: Mutex::new(stdin),
+                stdout: Mutex::new(std::io::BufReader::new(stdout)),
+                request_lock: Mutex::new(()),
+                next_request_id: AtomicU64::new(0),
+                logger: crate::logging::noop_logger(),
+            }),
+        };
+
+        let failure = worker
+            .execute_with_output_on_error("k".to_string(), Arc::new(NoopBackendEventSink))
+            .expect_err("fake worker returns structured error");
+
+        assert!(
+            failure.error.to_string().contains("execute failed"),
+            "unexpected error: {}",
+            failure.error
+        );
+        assert_eq!(
+            failure.partial_output.as_deref(),
+            Some("partial from worker\n")
+        );
     }
 
     #[test]
@@ -945,6 +1102,36 @@ mod tests {
             Ok(())
         }
     }
+
+    fn spawn_worker_response_child(response: &str) -> std::process::Child {
+        let mut command = worker_response_command(response);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fake worker response process")
+    }
+
+    #[cfg(windows)]
+    fn worker_response_command(response: &str) -> Command {
+        let escaped = response.replace('\'', "''");
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            &format!("$null=[Console]::In.ReadLine(); [Console]::Out.WriteLine('{escaped}')"),
+        ]);
+        command
+    }
+
+    #[cfg(not(windows))]
+    fn worker_response_command(response: &str) -> Command {
+        let escaped = response.replace('\'', "'\\''");
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("read line; printf '%s\\n' '{escaped}'")]);
+        command
+    }
 }
 
 #[cfg(not(windows))]
@@ -961,18 +1148,23 @@ impl WorkerRuntime {
         request: WorkerRequest,
         _request_id: u64,
         _output: Arc<Mutex<W>>,
-    ) -> (Result<WorkerResult>, bool) {
+    ) -> (
+        std::result::Result<WorkerResult, ExecuteBackendFailure>,
+        bool,
+    ) {
         match request {
             WorkerRequest::CreateSession { .. } => (
                 Err(DbgFlowError::Backend(
                     "real debug sessions are only supported on Windows".to_string(),
-                )),
+                )
+                .into()),
                 true,
             ),
             WorkerRequest::Execute { .. } => (
-                Err(DbgFlowError::Backend(
-                    "worker backend session is not initialized".to_string(),
-                )),
+                Err(
+                    DbgFlowError::Backend("worker backend session is not initialized".to_string())
+                        .into(),
+                ),
                 true,
             ),
             WorkerRequest::CloseSession => (Ok(WorkerResult::Closed), true),

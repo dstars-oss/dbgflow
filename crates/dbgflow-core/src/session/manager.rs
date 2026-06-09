@@ -597,7 +597,7 @@ impl SessionManager {
                 .field("backend", session.backend.clone())
                 .field("state", format!("{:?}", session.state)),
         );
-        let backend_result = worker.execute(
+        let backend_result = worker.execute_with_output_on_error(
             command.clone(),
             Arc::new(SessionBackendEventSink {
                 manager: self.clone(),
@@ -608,29 +608,46 @@ impl SessionManager {
 
         let backend_result = match backend_result {
             Ok(result) => result,
-            Err(error) => {
+            Err(failure) => {
+                let error = failure.error;
                 let error_text = error.to_string();
-                self.log(
-                    LogEvent::new(LogLevel::Error, "session", "eval_failed")
-                        .session_id(request.session_id)
-                        .backend_session_id(
-                            session
-                                .backend_session_id
-                                .clone()
-                                .unwrap_or_else(|| "worker".to_string()),
-                        )
-                        .operation(command.clone())
-                        .duration_ms(duration_ms)
-                        .field("command_id", command_id.clone())
-                        .error(error_text.clone()),
-                );
+                let partial_output = failure.partial_output;
+                let partial_artifact = partial_output.as_ref().and_then(|output| {
+                    self.write_failed_eval_output_best_effort(
+                        request.session_id,
+                        session.backend_session_id.as_deref(),
+                        &command,
+                        &command_id,
+                        duration_ms,
+                        output,
+                    )
+                });
+                let partial_output_bytes = partial_output.as_ref().map(|output| output.len());
+                let mut event = LogEvent::new(LogLevel::Error, "session", "eval_failed")
+                    .session_id(request.session_id)
+                    .backend_session_id(
+                        session
+                            .backend_session_id
+                            .clone()
+                            .unwrap_or_else(|| "worker".to_string()),
+                    )
+                    .operation(command.clone())
+                    .duration_ms(duration_ms)
+                    .field("command_id", command_id.clone());
+                if let Some(output_bytes) = partial_output_bytes {
+                    event = event.field("output_bytes", output_bytes);
+                }
+                if let Some(artifact) = &partial_artifact {
+                    event = event.field("artifact_path", artifact.path.display().to_string());
+                }
+                self.log(event.error(error_text.clone()));
                 let operation_finished = self.finish_operation(
                     request.session_id,
                     SessionState::Error,
                     OperationStatus::Failed,
-                    None,
+                    partial_artifact.clone(),
                     Some(error_text.clone()),
-                    None,
+                    partial_output_bytes,
                     duration_ms,
                 )?;
                 if operation_finished {
@@ -640,15 +657,26 @@ impl SessionManager {
                             command_id: command_id.clone(),
                             command: command.clone(),
                             status: "Failed".to_string(),
-                            output_path: None,
+                            output_path: partial_artifact
+                                .as_ref()
+                                .map(|artifact| artifact.path.clone()),
                             started_at_unix_ms,
                             duration_ms: Some(duration_ms),
-                            output_bytes: None,
+                            output_bytes: partial_output_bytes,
                             warnings: Vec::new(),
                             error: Some(error_text),
                             backend_session_id: session.backend_session_id.clone(),
                         },
                     );
+                    if let Some(output) = partial_output {
+                        self.append_transcript_best_effort(
+                            request.session_id,
+                            &format!(
+                                "\n--- command {} partial output: {} ---\n{}\n--- end command {} partial output ---\n",
+                                command_id, command, output, command_id
+                            ),
+                        );
+                    }
                 }
                 return Err(error);
             }
@@ -1110,6 +1138,38 @@ impl SessionManager {
                     .field("command_id", record.command_id.clone())
                     .error(error.to_string()),
             );
+        }
+    }
+
+    fn write_failed_eval_output_best_effort(
+        &self,
+        session_id: SessionId,
+        backend_session_id: Option<&str>,
+        command: &str,
+        command_id: &str,
+        duration_ms: u128,
+        output: &str,
+    ) -> Option<ArtifactRef> {
+        match self
+            .artifacts
+            .write_eval_output(session_id, command_id, output)
+        {
+            Ok(artifact) => Some(artifact),
+            Err(error) => {
+                let mut event =
+                    LogEvent::new(LogLevel::Error, "session", "eval_partial_artifact_failed")
+                        .session_id(session_id)
+                        .operation(command.to_string())
+                        .duration_ms(duration_ms)
+                        .field("command_id", command_id.to_string())
+                        .field("output_bytes", output.len())
+                        .error(error.to_string());
+                if let Some(backend_session_id) = backend_session_id {
+                    event = event.backend_session_id(backend_session_id.to_string());
+                }
+                self.log(event);
+                None
+            }
         }
     }
 

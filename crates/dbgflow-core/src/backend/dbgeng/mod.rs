@@ -1,7 +1,7 @@
 use super::{
     BackendCapability, BackendEventSink, BackendExecutionEvent, BackendExecutionState, BackendInfo,
     BackendKind, BackendSession, CreateBackendSession, DebugBackend, DebugTarget,
-    ExecuteBackendRequest, ExecuteBackendResult,
+    ExecuteBackendFailure, ExecuteBackendRequest, ExecuteBackendResult,
 };
 use crate::logging::{noop_logger, LogEvent, LogLevel, LogSink};
 use crate::{DbgFlowError, Result};
@@ -147,6 +147,15 @@ impl DebugBackend for DbgEngBackend {
         request: ExecuteBackendRequest,
         event_sink: Arc<dyn BackendEventSink>,
     ) -> Result<ExecuteBackendResult> {
+        self.execute_with_output_on_error(request, event_sink)
+            .map_err(|failure| failure.error)
+    }
+
+    fn execute_with_output_on_error(
+        &self,
+        request: ExecuteBackendRequest,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> std::result::Result<ExecuteBackendResult, ExecuteBackendFailure> {
         let tx = self
             .sessions
             .lock()
@@ -438,7 +447,7 @@ enum WorkerCommand {
     Execute {
         command: String,
         event_sink: Arc<dyn BackendEventSink>,
-        reply: mpsc::SyncSender<Result<ExecuteBackendResult>>,
+        reply: mpsc::SyncSender<std::result::Result<ExecuteBackendResult, ExecuteBackendFailure>>,
     },
     Close {
         reply: mpsc::SyncSender<Result<()>>,
@@ -483,7 +492,7 @@ fn worker_main(
                 event_sink,
                 reply,
             } => {
-                let _ = reply.send(session.execute(&command, event_sink));
+                let _ = reply.send(session.execute_with_output_on_error(&command, event_sink));
             }
             WorkerCommand::Close { reply } => {
                 let result = session.close();
@@ -799,11 +808,11 @@ impl DbgEngSession {
         }
     }
 
-    fn execute(
+    fn execute_with_output_on_error(
         &mut self,
         command: &str,
         event_sink: Arc<dyn BackendEventSink>,
-    ) -> Result<ExecuteBackendResult> {
+    ) -> std::result::Result<ExecuteBackendResult, ExecuteBackendFailure> {
         let command_text = command.to_string();
         let _dbgeng_guard = global_dbgeng_lock().lock().map_err(|_| {
             DbgFlowError::Backend("global dbgeng operation lock poisoned".to_string())
@@ -903,19 +912,24 @@ impl DbgEngSession {
             }
             Err(error) => {
                 let final_state = self.query_execution_state().ok().flatten();
-                self.logger.log(
-                    dbgeng_event(
-                        LogLevel::Error,
-                        "execute_failed",
-                        &self.correlation_id,
-                        Some(&self.backend_session_id),
-                    )
-                    .operation(command_text)
-                    .duration_ms(started.elapsed().as_millis())
-                    .field("final_state", final_state.map(|state| format!("{state:?}")))
-                    .error(error.to_string()),
-                );
-                Err(error)
+                let partial_output = self.output.lock().ok().map(|output| output.clone());
+                let mut event = dbgeng_event(
+                    LogLevel::Error,
+                    "execute_failed",
+                    &self.correlation_id,
+                    Some(&self.backend_session_id),
+                )
+                .operation(command_text)
+                .duration_ms(started.elapsed().as_millis())
+                .field("final_state", final_state.map(|state| format!("{state:?}")));
+                if let Some(output) = &partial_output {
+                    event = event.field("output_bytes", output.len());
+                }
+                self.logger.log(event.error(error.to_string()));
+                match partial_output {
+                    Some(output) => Err(ExecuteBackendFailure::with_partial_output(error, output)),
+                    None => Err(error.into()),
+                }
             }
         }
     }

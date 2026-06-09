@@ -1,6 +1,6 @@
 use dbgflow_core::backend::{
     BackendEventSink, BackendExecutionEvent, BackendExecutionState, CreateBackendSession,
-    DebugTarget, ExecuteBackendResult,
+    DebugTarget, ExecuteBackendFailure, ExecuteBackendResult,
 };
 use dbgflow_core::logging::{LogEvent, LogSink};
 use dbgflow_core::proxy::{ProxyEnvironment, ProxySource};
@@ -224,6 +224,75 @@ fn session_eval_writes_output_artifact() {
         Some(result.output.len() as u64)
     );
     assert!(commands[0]["backend_session_id"].as_str().is_some());
+}
+
+#[test]
+fn failed_eval_writes_partial_output_artifact() {
+    let root = test_artifact_root("failed-execute-partial-artifact");
+    let partial_output = "first line before ExecuteWide failed\nsecond line\n";
+    let manager = SessionManager::with_worker_launcher(
+        Arc::new(TestWorkerLauncher::new(
+            WorkerBehavior::PartialOutputError {
+                output: partial_output.to_string(),
+            },
+        )),
+        &root,
+    );
+
+    let session = manager
+        .create_session(CreateSession {
+            target: test_dump_target("failed-execute-partial-artifact-target"),
+            startup_timeout_ms: None,
+        })
+        .expect("create session");
+    let session = wait_for_break(&manager, session.id);
+    let error = manager
+        .eval(EvalSession {
+            session_id: session.id,
+            command: "!tt 1; r".to_string(),
+            timeout_ms: None,
+        })
+        .expect_err("eval fails");
+
+    assert!(error.to_string().contains("simulated execute failure"));
+    let failed = manager
+        .query_session(session.id)
+        .expect("query failed session");
+    assert_eq!(failed.state, SessionState::Error);
+    let last = failed.last_operation.as_ref().expect("last operation");
+    assert_eq!(last.status, OperationStatus::Failed);
+    assert_eq!(last.output_bytes, Some(partial_output.len()));
+    let artifact = last.artifact.as_ref().expect("partial output artifact");
+    let output = fs::read_to_string(&artifact.path).expect("read partial output artifact");
+    assert_eq!(output, partial_output);
+
+    let session_dir = root.join("sessions").join(session.id.to_string());
+    let commands = read_jsonl(&session_dir.join("commands.jsonl"));
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0]["command"], "!tt 1; r");
+    assert_eq!(commands[0]["status"], "Failed");
+    assert_eq!(
+        commands[0]["output_bytes"].as_u64(),
+        Some(partial_output.len() as u64)
+    );
+    let output_path = commands[0]["output_path"]
+        .as_str()
+        .expect("command output path");
+    assert_eq!(
+        fs::read_to_string(output_path).expect("read command output"),
+        partial_output
+    );
+
+    let events = read_jsonl(&session_dir.join("events.jsonl"));
+    assert!(events.iter().any(|event| {
+        event["event"] == "eval_failed"
+            && event["artifact_path"].as_str().is_some()
+            && event["fields"]["output_bytes"].as_u64() == Some(partial_output.len() as u64)
+    }));
+    let transcript =
+        fs::read_to_string(session_dir.join("transcript.log")).expect("read transcript");
+    assert!(transcript.contains("partial output"));
+    assert!(transcript.contains(partial_output));
 }
 
 #[test]
@@ -999,6 +1068,9 @@ enum WorkerBehavior {
         running_delay: Duration,
         final_state: BackendExecutionState,
     },
+    PartialOutputError {
+        output: String,
+    },
     ExitAfterCreate {
         exited: Arc<AtomicBool>,
     },
@@ -1178,6 +1250,20 @@ impl SessionWorker for TestWorker {
             warnings: Vec::new(),
             final_state,
         })
+    }
+
+    fn execute_with_output_on_error(
+        &self,
+        command: String,
+        event_sink: Arc<dyn BackendEventSink>,
+    ) -> std::result::Result<ExecuteBackendResult, ExecuteBackendFailure> {
+        if let WorkerBehavior::PartialOutputError { output } = &self.behavior {
+            return Err(ExecuteBackendFailure::with_partial_output(
+                DbgFlowError::Backend("simulated execute failure".to_string()),
+                output.clone(),
+            ));
+        }
+        self.execute(command, event_sink).map_err(Into::into)
     }
 
     fn close(&self) -> Result<()> {
