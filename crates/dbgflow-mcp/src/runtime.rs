@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub proxy: ProxyEnvironment,
     pub sysinternals_dir: Option<PathBuf>,
+    pub ttd_dir: Option<PathBuf>,
     pub dbgeng_dir: Option<PathBuf>,
     pub symbol_path: Option<String>,
 }
@@ -98,11 +99,18 @@ impl RuntimeConfig {
             .and_then(|debugger| debugger.symbol_path)
             .map(|symbol_path| parse_symbol_path(&symbol_path, "debugger.symbol_path"))
             .transpose()?;
-        let sysinternals_dir = raw
-            .tools
-            .and_then(|tools| tools.sysinternals_dir)
-            .map(|path| parse_sysinternals_dir_path(&path, "tools.sysinternals_dir"))
+        let tools = raw.tools;
+        let sysinternals_dir = tools
+            .as_ref()
+            .and_then(|tools| tools.sysinternals_dir.as_ref())
+            .map(|path| parse_sysinternals_dir_path(path, "tools.sysinternals_dir"))
             .transpose()?;
+        let ttd_dir = tools
+            .as_ref()
+            .and_then(|tools| tools.ttd_dir.as_ref())
+            .map(|path| parse_ttd_dir_path(path, "tools.ttd_dir"))
+            .transpose()?
+            .or_else(|| infer_ttd_dir_from_dbgeng_dir(dbgeng_dir.as_deref()));
         let proxy = proxy_from_config(raw.proxy)?;
 
         Ok(Self {
@@ -117,6 +125,7 @@ impl RuntimeConfig {
                 data_dir,
                 proxy,
                 sysinternals_dir,
+                ttd_dir,
                 dbgeng_dir,
                 symbol_path,
             },
@@ -440,6 +449,7 @@ struct RawDebuggerConfig {
 #[derive(Debug, Deserialize)]
 struct RawToolsConfig {
     sysinternals_dir: Option<PathBuf>,
+    ttd_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -552,6 +562,23 @@ fn parse_sysinternals_dir_path(path: &Path, label: &str) -> Result<PathBuf, Stri
         ));
     }
     Ok(path)
+}
+
+fn parse_ttd_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = parse_existing_dir_path(path, label)?;
+    if !path.join("TTD.exe").is_file() {
+        return Err(format!(
+            "{label} must point to a directory containing TTD.exe: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn infer_ttd_dir_from_dbgeng_dir(dbgeng_dir: Option<&Path>) -> Option<PathBuf> {
+    let dbgeng_dir = dbgeng_dir?;
+    let ttd_dir = dbgeng_dir.join("ttd");
+    ttd_dir.join("TTD.exe").is_file().then_some(ttd_dir)
 }
 
 fn parse_symbol_path(value: &str, label: &str) -> Result<String, String> {
@@ -810,10 +837,13 @@ mod tests {
         let root = unique_test_dir("runtime-config");
         let dbgeng = root.join("dbgeng");
         let sysinternals = root.join("sysinternals");
+        let ttd = root.join("ttd");
         std::fs::create_dir_all(&dbgeng).expect("create dbgeng dir");
         std::fs::create_dir_all(&sysinternals).expect("create sysinternals dir");
+        std::fs::create_dir_all(&ttd).expect("create ttd dir");
         touch(dbgeng.join("dbgeng.dll"));
         touch(sysinternals.join("Procmon64.exe"));
+        touch(ttd.join("TTD.exe"));
         let config_path = root.join("config.toml");
         write_config(
             &config_path,
@@ -836,6 +866,7 @@ symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 
 [tools]
 sysinternals_dir = "{}"
+ttd_dir = "{}"
 
 [proxy]
 mode = "url"
@@ -845,6 +876,7 @@ url = "http://127.0.0.1:7897"
                 toml_path(&root.join("var")),
                 toml_path(&dbgeng),
                 toml_path(&sysinternals),
+                toml_path(&ttd),
             ),
         );
 
@@ -861,6 +893,130 @@ url = "http://127.0.0.1:7897"
             config.app.symbol_path.as_deref(),
             Some("srv*C:\\symbols*https://msdl.microsoft.com/download/symbols")
         );
+        assert_eq!(config.app.ttd_dir.as_deref(), Some(ttd.as_path()));
+    }
+
+    #[test]
+    fn derives_ttd_dir_from_dbgeng_dir_when_tools_ttd_dir_is_omitted() {
+        let root = unique_test_dir("runtime-derived-ttd");
+        let dbgeng = root.join("windbg").join("amd64");
+        let derived_ttd = dbgeng.join("ttd");
+        touch(dbgeng.join("dbgeng.dll"));
+        touch(derived_ttd.join("TTD.exe"));
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[debugger]
+dbgeng_dir = "{}"
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+                toml_path(&dbgeng),
+            ),
+        );
+
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+
+        assert_eq!(config.app.ttd_dir.as_deref(), Some(derived_ttd.as_path()));
+    }
+
+    #[test]
+    fn explicit_ttd_dir_overrides_dbgeng_derived_ttd_dir() {
+        let root = unique_test_dir("runtime-explicit-ttd");
+        let dbgeng = root.join("windbg").join("amd64");
+        let explicit_ttd = root.join("explicit-ttd");
+        touch(dbgeng.join("dbgeng.dll"));
+        touch(dbgeng.join("ttd").join("TTD.exe"));
+        touch(explicit_ttd.join("TTD.exe"));
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[debugger]
+dbgeng_dir = "{}"
+
+[tools]
+ttd_dir = "{}"
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+                toml_path(&dbgeng),
+                toml_path(&explicit_ttd),
+            ),
+        );
+
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+
+        assert_eq!(config.app.ttd_dir.as_deref(), Some(explicit_ttd.as_path()));
+    }
+
+    #[test]
+    fn does_not_derive_ttd_dir_when_dbgeng_ttd_directory_is_missing() {
+        let root = unique_test_dir("runtime-no-derived-ttd");
+        let dbgeng = root.join("windbg").join("amd64");
+        touch(dbgeng.join("dbgeng.dll"));
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[debugger]
+dbgeng_dir = "{}"
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+                toml_path(&dbgeng),
+            ),
+        );
+
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+
+        assert!(config.app.ttd_dir.is_none());
     }
 
     #[test]

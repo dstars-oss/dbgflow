@@ -3,6 +3,7 @@ use dbgflow_core::profile::{ProfileCollectorConfig, ProfileManager, ProfileResul
 use dbgflow_core::session::{
     CreateSession, EvalSession, EvalSessionResult, Session, SessionId, SessionManager,
 };
+use dbgflow_core::ttd::{RecordTtd, TtdRecordingManager, TtdRecordingResult};
 use dbgflow_core::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,6 +18,7 @@ pub const CLOSE_SESSION: &str = "close_session";
 pub const EVAL: &str = "eval";
 pub const SET_SYMBOLS: &str = "set_symbols";
 pub const RUN_PROFILE: &str = "run_profile";
+pub const RECORD_TTD: &str = "record_ttd";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -30,6 +32,7 @@ pub struct ToolDescriptor {
 pub struct ToolService {
     sessions: SessionManager,
     profiles: ProfileManager,
+    ttd_recordings: TtdRecordingManager,
 }
 
 impl ToolService {
@@ -37,11 +40,28 @@ impl ToolService {
         Self {
             sessions,
             profiles: ProfileManager::new("artifacts"),
+            ttd_recordings: TtdRecordingManager::new("artifacts"),
         }
     }
 
     pub fn with_profiles(sessions: SessionManager, profiles: ProfileManager) -> Self {
-        Self { sessions, profiles }
+        Self {
+            sessions,
+            profiles,
+            ttd_recordings: TtdRecordingManager::new("artifacts"),
+        }
+    }
+
+    pub fn with_profiles_and_ttd(
+        sessions: SessionManager,
+        profiles: ProfileManager,
+        ttd_recordings: TtdRecordingManager,
+    ) -> Self {
+        Self {
+            sessions,
+            profiles,
+            ttd_recordings,
+        }
     }
 
     #[cfg(test)]
@@ -52,6 +72,7 @@ impl ToolService {
         Self {
             sessions: SessionManager::with_artifact_root(&root),
             profiles: ProfileManager::new(&root),
+            ttd_recordings: TtdRecordingManager::new(&root),
         }
     }
 
@@ -314,6 +335,107 @@ impl ToolService {
                     "additionalProperties": false
                 }),
             },
+            ToolDescriptor {
+                name: RECORD_TTD,
+                description:
+                    "Record a Time Travel Debugging trace with TTD.exe. Supports launch, attach, and bounded monitor recording into controlled artifacts.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "object",
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "launch" },
+                                        "executable": {
+                                            "type": "string",
+                                            "description": "Path to a local executable."
+                                        },
+                                        "args": {
+                                            "type": "array",
+                                            "items": { "type": "string" },
+                                            "description": "Command-line arguments. Omit for no arguments."
+                                        }
+                                    },
+                                    "required": ["kind", "executable"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "attach" },
+                                        "pid": {
+                                            "type": "integer",
+                                            "minimum": 1,
+                                            "description": "Process id to attach and record."
+                                        }
+                                    },
+                                    "required": ["kind", "pid"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "monitor" },
+                                        "program": {
+                                            "type": "string",
+                                            "description": "Executable file name or absolute executable path to monitor."
+                                        },
+                                        "cmd_line_filter": {
+                                            "type": "string",
+                                            "description": "Optional command-line substring filter for monitor mode."
+                                        }
+                                    },
+                                    "required": ["kind", "program"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Stop recording when the recorder exits or this timeout expires."
+                        },
+                        "options": {
+                            "type": "object",
+                            "properties": {
+                                "children": { "type": "boolean" },
+                                "no_ui": { "type": "boolean" },
+                                "accept_eula": { "type": "boolean" },
+                                "ring": { "type": "boolean" },
+                                "max_file_mb": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "Maximum TTD trace size in MiB."
+                                },
+                                "modules": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                },
+                                "record_mode": {
+                                    "type": "string",
+                                    "enum": ["automatic", "manual"]
+                                },
+                                "replay_cpu_support": {
+                                    "type": "string",
+                                    "enum": [
+                                        "default",
+                                        "most_conservative",
+                                        "most_aggressive",
+                                        "intel_avx_required",
+                                        "intel_avx2_required"
+                                    ]
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["target", "timeout_ms"],
+                    "additionalProperties": false
+                }),
+            },
         ]
     }
 
@@ -387,6 +509,10 @@ impl ToolService {
         self.profiles.run_profile(request.into())
     }
 
+    pub fn record_ttd(&self, request: RecordTtd) -> Result<TtdRecordingResult> {
+        self.ttd_recordings.record_ttd(request)
+    }
+
     pub fn subscribe_session_updates(&self) -> mpsc::Receiver<SessionId> {
         self.sessions.subscribe_session_updates()
     }
@@ -427,6 +553,10 @@ impl ToolService {
                 .and_then(to_value),
             RUN_PROFILE => self
                 .run_profile(decode_arguments(arguments)?)
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            RECORD_TTD => self
+                .record_ttd(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             _ => Err(ToolCallError::invalid_request(format!(
@@ -625,6 +755,9 @@ impl<'de> Deserialize<'de> for RunProfileRequest {
 mod tests {
     use super::*;
     use dbgflow_core::profile::{ProfileCollectorKind, ProfilePreset};
+    use dbgflow_core::ttd::{
+        RecordTtd, TtdRecordMode, TtdRecordingOptions, TtdReplayCpuSupport, TtdTarget,
+    };
 
     #[test]
     fn tool_descriptors_include_run_profile() {
@@ -638,6 +771,25 @@ mod tests {
 
         assert!(run_profile.description.contains("profile"));
         assert_eq!(run_profile.input_schema["type"], "object");
+    }
+
+    #[test]
+    fn tool_descriptors_include_record_ttd() {
+        let service = ToolService::new_for_tests();
+
+        let descriptors = service.tool_descriptors();
+        let record_ttd = descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == RECORD_TTD)
+            .expect("record_ttd descriptor");
+
+        assert!(record_ttd.description.contains("TTD"));
+        assert_eq!(record_ttd.input_schema["type"], "object");
+        assert!(record_ttd.input_schema["properties"]["target"]["oneOf"]
+            .as_array()
+            .expect("target variants")
+            .iter()
+            .any(|target| target["properties"]["kind"]["const"] == "monitor"));
     }
 
     #[test]
@@ -806,5 +958,98 @@ mod tests {
 
         assert!(error.to_string().contains("unknown field"));
         assert!(error.to_string().contains("sysinternals_dir"));
+    }
+
+    #[test]
+    fn record_ttd_arguments_decode_launch_with_options() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe",
+                "args": ["/C", "echo dbgflow"]
+            },
+            "timeout_ms": 1000,
+            "options": {
+                "accept_eula": true,
+                "ring": true,
+                "max_file_mb": 256,
+                "modules": ["cmd.exe"],
+                "record_mode": "manual",
+                "replay_cpu_support": "intel_avx2_required"
+            }
+        });
+
+        let request: RecordTtd = decode_arguments(value).expect("decode record_ttd");
+
+        assert_eq!(request.timeout_ms, 1000);
+        assert!(matches!(request.target, TtdTarget::Launch { .. }));
+        assert_eq!(
+            request.options,
+            TtdRecordingOptions {
+                accept_eula: true,
+                ring: true,
+                max_file_mb: 256,
+                modules: vec!["cmd.exe".to_string()],
+                record_mode: TtdRecordMode::Manual,
+                replay_cpu_support: TtdReplayCpuSupport::IntelAvx2Required,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn record_ttd_arguments_decode_attach_with_default_options() {
+        let value = json!({
+            "target": {
+                "kind": "attach",
+                "pid": 1234
+            },
+            "timeout_ms": 1000
+        });
+
+        let request: RecordTtd = decode_arguments(value).expect("decode record_ttd");
+
+        assert!(matches!(request.target, TtdTarget::Attach { pid: 1234 }));
+        assert_eq!(request.options, TtdRecordingOptions::default());
+    }
+
+    #[test]
+    fn record_ttd_arguments_decode_monitor() {
+        let value = json!({
+            "target": {
+                "kind": "monitor",
+                "program": "notepad.exe",
+                "cmd_line_filter": "specialfile.txt"
+            },
+            "timeout_ms": 1000
+        });
+
+        let request: RecordTtd = decode_arguments(value).expect("decode record_ttd");
+
+        assert!(matches!(
+            request.target,
+            TtdTarget::Monitor {
+                ref program,
+                ref cmd_line_filter
+            } if program == std::path::Path::new("notepad.exe")
+                && cmd_line_filter.as_deref() == Some("specialfile.txt")
+        ));
+    }
+
+    #[test]
+    fn record_ttd_arguments_reject_unknown_fields() {
+        let value = json!({
+            "target": {
+                "kind": "attach",
+                "pid": 1234
+            },
+            "timeout_ms": 1000,
+            "ttd_dir": "C:\\TTD"
+        });
+
+        let error = decode_arguments::<RecordTtd>(value).expect_err("reject unknown field");
+
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("ttd_dir"));
     }
 }

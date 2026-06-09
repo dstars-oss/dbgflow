@@ -5,6 +5,7 @@ use dbgflow_core::profile::ProfileManager;
 use dbgflow_core::proxy::ProxyEnvironment;
 use dbgflow_core::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
 use dbgflow_core::session::SessionId;
+use dbgflow_core::ttd::{TtdRecorderRuntime, TtdRecordingManager};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -442,16 +443,33 @@ pub fn server_with_data_dir_proxy_sysinternals_and_symbol_path(
     sysinternals_dir: Option<PathBuf>,
     symbol_path: Option<String>,
 ) -> std::result::Result<McpServer, String> {
+    server_with_data_dir_proxy_sysinternals_ttd_and_symbol_path(
+        data_dir,
+        proxy,
+        sysinternals_dir,
+        None,
+        symbol_path,
+    )
+}
+
+pub fn server_with_data_dir_proxy_sysinternals_ttd_and_symbol_path(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    sysinternals_dir: Option<PathBuf>,
+    ttd_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
+) -> std::result::Result<McpServer, String> {
     let data_dir = data_dir.into();
     let logger = Arc::new(
         FileLogSink::new(data_dir.join("logs"), 7)
             .map_err(|error| format!("initialize log directory: {error}"))?,
     );
     Ok(
-        server_with_data_dir_proxy_sysinternals_symbol_path_and_logger(
+        server_with_data_dir_proxy_sysinternals_ttd_symbol_path_and_logger(
             data_dir,
             proxy,
             sysinternals_dir,
+            ttd_dir,
             symbol_path,
             logger,
         ),
@@ -495,6 +513,24 @@ pub fn server_with_data_dir_proxy_sysinternals_symbol_path_and_logger(
     symbol_path: Option<String>,
     logger: Arc<dyn LogSink>,
 ) -> McpServer {
+    server_with_data_dir_proxy_sysinternals_ttd_symbol_path_and_logger(
+        data_dir,
+        proxy,
+        sysinternals_dir,
+        None,
+        symbol_path,
+        logger,
+    )
+}
+
+pub fn server_with_data_dir_proxy_sysinternals_ttd_symbol_path_and_logger(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    sysinternals_dir: Option<PathBuf>,
+    ttd_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
+    logger: Arc<dyn LogSink>,
+) -> McpServer {
     let data_dir = data_dir.into();
     let artifact_root = data_dir.join("artifacts");
     let sessions =
@@ -510,7 +546,17 @@ pub fn server_with_data_dir_proxy_sysinternals_symbol_path_and_logger(
         dbgflow_core::profile::ProcmonRuntime::from(sysinternals_dir),
         logger.clone(),
     );
-    McpServer::new_with_logger(ToolService::with_profiles(sessions, profiles), logger)
+    let ttd_recordings = TtdRecordingManager::with_runtime_and_logger(
+        &artifact_root,
+        ttd_dir
+            .map(TtdRecorderRuntime::with_ttd_dir)
+            .unwrap_or_else(TtdRecorderRuntime::unavailable),
+        logger.clone(),
+    );
+    McpServer::new_with_logger(
+        ToolService::with_profiles_and_ttd(sessions, profiles, ttd_recordings),
+        logger,
+    )
 }
 
 fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {

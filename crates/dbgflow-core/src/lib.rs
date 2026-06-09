@@ -5,5 +5,6 @@ pub mod logging;
 pub mod profile;
 pub mod proxy;
 pub mod session;
+pub mod ttd;
 
 pub use error::{DbgFlowError, Result};

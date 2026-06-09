@@ -10,6 +10,7 @@ param(
     [string]$DbgEngDir,
     [string]$SymbolPath,
     [string]$SysinternalsDir,
+    [string]$TtdDir,
     [switch]$NoProxy,
     [switch]$NonInteractive
 )
@@ -101,6 +102,12 @@ function Test-SysinternalsDirectory {
 
     return (Test-Path -LiteralPath (Join-Path $Path "Procmon64.exe") -PathType Leaf) -or
         (Test-Path -LiteralPath (Join-Path $Path "Procmon.exe") -PathType Leaf)
+}
+
+function Test-TtdDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return (Test-Path -LiteralPath (Join-Path $Path "TTD.exe") -PathType Leaf)
 }
 
 function Get-ExeArchitectureInfo {
@@ -274,6 +281,60 @@ function Find-SysinternalsDir {
     return $null
 }
 
+function Find-StoreTtdDir {
+    if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+
+    $packages = @(Get-AppxPackage -Name "Microsoft.TimeTravelDebugging" -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstallLocation } |
+        Sort-Object Version -Descending)
+
+    foreach ($package in $packages) {
+        if (Test-TtdDirectory -Path $package.InstallLocation) {
+            return (Get-FullPath -Path $package.InstallLocation)
+        }
+    }
+    return $null
+}
+
+function Resolve-TtdFromDbgEngDir {
+    param([string]$DbgEngDir)
+
+    if (-not $DbgEngDir) {
+        return $null
+    }
+
+    $candidate = Join-Path $DbgEngDir "ttd"
+    if (Test-TtdDirectory -Path $candidate) {
+        return (Get-FullPath -Path $candidate)
+    }
+    return $null
+}
+
+function Find-TtdDir {
+    param([string]$DbgEngDir)
+
+    $derived = Resolve-TtdFromDbgEngDir -DbgEngDir $DbgEngDir
+    if ($derived) {
+        return $derived
+    }
+
+    $store = Find-StoreTtdDir
+    if ($store) {
+        return $store
+    }
+
+    $command = Get-Command "TTD.exe" -ErrorAction SilentlyContinue
+    if ($command -and $command.Source) {
+        $dir = Split-Path -Parent $command.Source
+        if ($dir -and (Test-TtdDirectory -Path $dir)) {
+            return (Get-FullPath -Path $dir)
+        }
+    }
+    return $null
+}
+
 function Get-ProxyConfig {
     if ($NoProxy -and $ProxyUrl) {
         throw "-ProxyUrl and -NoProxy cannot be used together"
@@ -344,6 +405,7 @@ function Write-DbgFlowConfig {
         [string]$ResolvedDbgEngDir,
         [string]$ResolvedSymbolPath,
         [string]$ResolvedSysinternalsDir,
+        [string]$ResolvedTtdDir,
         [Parameter(Mandatory = $true)]$ProxyConfig
     )
 
@@ -369,10 +431,15 @@ function Write-DbgFlowConfig {
             $lines.Add("symbol_path = $(ConvertTo-TomlString $ResolvedSymbolPath)")
         }
     }
-    if ($ResolvedSysinternalsDir) {
+    if ($ResolvedSysinternalsDir -or $ResolvedTtdDir) {
         $lines.Add("")
         $lines.Add("[tools]")
-        $lines.Add("sysinternals_dir = $(ConvertTo-TomlString $ResolvedSysinternalsDir)")
+        if ($ResolvedSysinternalsDir) {
+            $lines.Add("sysinternals_dir = $(ConvertTo-TomlString $ResolvedSysinternalsDir)")
+        }
+        if ($ResolvedTtdDir) {
+            $lines.Add("ttd_dir = $(ConvertTo-TomlString $ResolvedTtdDir)")
+        }
     }
 
     $lines.Add("")
@@ -462,6 +529,16 @@ try {
         $resolvedSysinternalsDir = Find-SysinternalsDir
     }
 
+    $resolvedTtdDir = $TtdDir
+    if ($resolvedTtdDir) {
+        $resolvedTtdDir = Get-FullPath -Path $resolvedTtdDir
+        if (-not (Test-TtdDirectory -Path $resolvedTtdDir)) {
+            throw "TTD directory must contain TTD.exe: $resolvedTtdDir"
+        }
+    } else {
+        $resolvedTtdDir = Find-TtdDir -DbgEngDir $resolvedDbgEngDir
+    }
+
     $proxyConfig = Get-ProxyConfig
     $resolvedSymbolPath = Get-SymbolPathConfig
 
@@ -476,6 +553,7 @@ try {
     Write-Host "DbgEng dir: $(if ($resolvedDbgEngDir) { $resolvedDbgEngDir } else { 'not configured' })"
     Write-Host "Symbol path: $(if ($resolvedSymbolPath) { 'configured' } else { 'not configured' })"
     Write-Host "Sysinternals dir: $(if ($resolvedSysinternalsDir) { $resolvedSysinternalsDir } else { 'not configured' })"
+    Write-Host "TTD dir: $(if ($resolvedTtdDir) { $resolvedTtdDir } else { 'not configured' })"
     Write-Host "Proxy mode: $($proxyConfig.Mode)"
     if ($proxyConfig.Url) {
         Write-Host "Proxy URL: $($proxyConfig.Url)"
@@ -492,7 +570,7 @@ try {
         }
     }
 
-    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedSysinternalsDir $resolvedSysinternalsDir -ProxyConfig $proxyConfig
+    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedSysinternalsDir $resolvedSysinternalsDir -ResolvedTtdDir $resolvedTtdDir -ProxyConfig $proxyConfig
 
     & $Exe service install --config $ConfigPath
     exit $LASTEXITCODE

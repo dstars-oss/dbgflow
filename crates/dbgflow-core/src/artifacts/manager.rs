@@ -1,5 +1,6 @@
 use crate::profile::ProfileId;
 use crate::session::SessionId;
+use crate::ttd::TtdRecordingId;
 use crate::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -42,6 +43,14 @@ impl ArtifactManager {
         self.ensure_profile_dir_unlocked(profile_id)
     }
 
+    pub fn ensure_ttd_recording_dir(&self, recording_id: TtdRecordingId) -> Result<PathBuf> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        self.ensure_ttd_recording_dir_unlocked(recording_id)
+    }
+
     pub fn initialize_session_artifacts(&self, session_id: SessionId) -> Result<PathBuf> {
         let _guard = self
             .lock
@@ -67,6 +76,29 @@ impl ArtifactManager {
         fs::create_dir_all(dir.join("collectors"))
             .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
         touch(&dir.join("events.jsonl"))?;
+        Ok(dir)
+    }
+
+    pub fn initialize_ttd_recording_artifacts(
+        &self,
+        recording_id: TtdRecordingId,
+    ) -> Result<PathBuf> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let dir = self.ensure_ttd_recording_dir_unlocked(recording_id)?;
+        fs::create_dir_all(dir.join("recorder"))
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        fs::create_dir_all(dir.join("target"))
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        fs::create_dir_all(dir.join("traces"))
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        touch(&dir.join("events.jsonl"))?;
+        touch(&dir.join("recorder").join("stdout.txt"))?;
+        touch(&dir.join("recorder").join("stderr.txt"))?;
+        touch(&dir.join("target").join("stdout.txt"))?;
+        touch(&dir.join("target").join("stderr.txt"))?;
         Ok(dir)
     }
 
@@ -155,6 +187,59 @@ impl ArtifactManager {
             .join(file_name)
     }
 
+    pub fn ttd_recording_metadata_path(&self, recording_id: TtdRecordingId) -> PathBuf {
+        self.root
+            .join("ttd_recordings")
+            .join(recording_id.to_string())
+            .join("recording.json")
+    }
+
+    pub fn ttd_recording_events_path(&self, recording_id: TtdRecordingId) -> PathBuf {
+        self.root
+            .join("ttd_recordings")
+            .join(recording_id.to_string())
+            .join("events.jsonl")
+    }
+
+    pub fn ttd_recording_traces_dir(&self, recording_id: TtdRecordingId) -> PathBuf {
+        self.root
+            .join("ttd_recordings")
+            .join(recording_id.to_string())
+            .join("traces")
+    }
+
+    pub fn ttd_recorder_stdout_path(&self, recording_id: TtdRecordingId) -> PathBuf {
+        self.root
+            .join("ttd_recordings")
+            .join(recording_id.to_string())
+            .join("recorder")
+            .join("stdout.txt")
+    }
+
+    pub fn ttd_recorder_stderr_path(&self, recording_id: TtdRecordingId) -> PathBuf {
+        self.root
+            .join("ttd_recordings")
+            .join(recording_id.to_string())
+            .join("recorder")
+            .join("stderr.txt")
+    }
+
+    pub fn ttd_recorder_stop_stdout_path(&self, recording_id: TtdRecordingId) -> PathBuf {
+        self.root
+            .join("ttd_recordings")
+            .join(recording_id.to_string())
+            .join("recorder")
+            .join("stop_stdout.txt")
+    }
+
+    pub fn ttd_recorder_stop_stderr_path(&self, recording_id: TtdRecordingId) -> PathBuf {
+        self.root
+            .join("ttd_recordings")
+            .join(recording_id.to_string())
+            .join("recorder")
+            .join("stop_stderr.txt")
+    }
+
     pub fn append_event(&self, session_id: SessionId, event: &SessionArtifactEvent) -> Result<()> {
         let _guard = self
             .lock
@@ -179,6 +264,21 @@ impl ArtifactManager {
         let line = serde_json::to_string(event)
             .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
         append_jsonl(&profile_dir.join("events.jsonl"), &line)
+    }
+
+    pub fn append_ttd_recording_event(
+        &self,
+        recording_id: TtdRecordingId,
+        event: &TtdRecordingArtifactEvent,
+    ) -> Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let recording_dir = self.ensure_ttd_recording_dir_unlocked(recording_id)?;
+        let line = serde_json::to_string(event)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        append_jsonl(&recording_dir.join("events.jsonl"), &line)
     }
 
     pub fn append_transcript(&self, session_id: SessionId, text: &str) -> Result<()> {
@@ -213,6 +313,15 @@ impl ArtifactManager {
 
     fn ensure_profile_dir_unlocked(&self, profile_id: ProfileId) -> Result<PathBuf> {
         let dir = self.root.join("profiles").join(profile_id.to_string());
+        fs::create_dir_all(&dir).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(dir)
+    }
+
+    fn ensure_ttd_recording_dir_unlocked(&self, recording_id: TtdRecordingId) -> Result<PathBuf> {
+        let dir = self
+            .root
+            .join("ttd_recordings")
+            .join(recording_id.to_string());
         fs::create_dir_all(&dir).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
         Ok(dir)
     }
@@ -274,6 +383,27 @@ impl ArtifactManager {
             path: metadata_path,
         })
     }
+
+    pub fn write_ttd_recording_metadata(
+        &self,
+        recording_id: TtdRecordingId,
+        metadata: &Value,
+    ) -> Result<ArtifactRef> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let recording_dir = self.ensure_ttd_recording_dir_unlocked(recording_id)?;
+        let metadata_path = recording_dir.join("recording.json");
+        let text = serde_json::to_string_pretty(metadata)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        fs::write(&metadata_path, text)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(ArtifactRef {
+            kind: ArtifactKind::TtdRecordingMetadata,
+            path: metadata_path,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +423,13 @@ pub enum ArtifactKind {
     ProfileCollectorTrace,
     ProfileCollectorSummary,
     ProfileCollectorEvents,
+    TtdTrace,
+    TtdTraceIndex,
+    TtdRecorderOutput,
+    TtdRecordingMetadata,
+    TtdRecordingEvents,
+    TtdTargetStdout,
+    TtdTargetStderr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +453,16 @@ pub struct ProfileArtifactEvent {
     pub timestamp_unix_ms: u128,
     pub event: String,
     pub profile_id: String,
+    pub artifact_path: Option<PathBuf>,
+    pub error: Option<String>,
+    pub fields: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtdRecordingArtifactEvent {
+    pub timestamp_unix_ms: u128,
+    pub event: String,
+    pub recording_id: String,
     pub artifact_path: Option<PathBuf>,
     pub error: Option<String>,
     pub fields: Map<String, Value>,
@@ -456,5 +603,33 @@ mod tests {
         assert!(events.contains("profile_created"));
         let metadata = std::fs::read_to_string(dir.join("profile.json")).expect("read metadata");
         assert!(metadata.contains("completed"));
+    }
+
+    #[test]
+    fn ttd_recording_artifacts_are_initialized_under_ttd_recordings_directory() {
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-ttd-artifacts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let artifacts = ArtifactManager::new(&root);
+        let recording_id = TtdRecordingId::new();
+
+        let dir = artifacts
+            .initialize_ttd_recording_artifacts(recording_id)
+            .expect("initialize ttd artifacts");
+
+        assert_eq!(
+            dir,
+            root.join("ttd_recordings").join(recording_id.to_string())
+        );
+        assert!(dir.join("events.jsonl").is_file());
+        assert!(dir.join("recorder").join("stdout.txt").is_file());
+        assert!(dir.join("recorder").join("stderr.txt").is_file());
+        assert!(dir.join("target").join("stdout.txt").is_file());
+        assert!(dir.join("target").join("stderr.txt").is_file());
+        assert!(dir.join("traces").is_dir());
+        assert_eq!(
+            artifacts.ttd_recording_metadata_path(recording_id),
+            dir.join("recording.json")
+        );
     }
 }

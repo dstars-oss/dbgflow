@@ -23,6 +23,7 @@ endpoint, and Windows service install / uninstall subcommands:
 - main-service proxy configuration for session workers and SymSrv symbol downloads
 - install-time DbgEng symbol path configuration
 - launch-only profiling with native ETW and optional Sysinternals Procmon collectors
+- Time Travel Debugging recording with `TTD.exe` for launch, attach, and bounded monitor scenarios
 
 Initial tool names:
 
@@ -33,6 +34,7 @@ Initial tool names:
 - `eval`
 - `set_symbols`
 - `run_profile`
+- `record_ttd`
 
 `create_session` uses get-or-create semantics and returns quickly with a
 `Starting` session while the backend opens the target in the background. Use
@@ -145,6 +147,35 @@ Procmon writes `capture.pml` as the authoritative artifact and exports
 `events.jsonl`; when stack capture is requested, dbgflow also requests an XML
 export with stack data.
 
+`record_ttd` records Microsoft Time Travel Debugging traces by running
+`TTD.exe` with typed launch, attach, or monitor targets. Configure
+`[tools].ttd_dir` to override the recorder location; otherwise dbgflow derives
+`TTD.exe` from `[debugger].dbgeng_dir\ttd` when available, then falls back to
+`PATH`. dbgflow does not download or install TTD, does not accept arbitrary
+recorder command lines, and always writes recorder output and generated `.run`
+/ `.out` / `.err` / `.idx` files under
+`artifacts\ttd_recordings\<recording_id>`. TTD recording usually
+requires administrator privileges, can slow the target significantly, and can
+produce large files. Treat TTD artifacts as sensitive because traces can contain
+memory, file paths, registry data, and file contents.
+
+Example TTD recording request:
+
+```json
+{
+  "target": {
+    "kind": "launch",
+    "executable": "C:\\Windows\\System32\\cmd.exe",
+    "args": ["/C", "echo dbgflow"]
+  },
+  "timeout_ms": 30000,
+  "options": {
+    "accept_eula": true,
+    "max_file_mb": 2048
+  }
+}
+```
+
 `eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a
 `last_operation` summary with status, timing, artifact, error, and output-size
@@ -184,6 +215,8 @@ symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 
 [tools]
 sysinternals_dir = "C:\\Users\\dstars\\Bin\\SysinternalsSuite"
+# Optional when debugger.dbgeng_dir\ttd contains TTD.exe.
+ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
 
 [proxy]
 mode = "url"
@@ -223,8 +256,8 @@ not automatically removed.
 
 For troubleshooting, start with the daily runtime log to correlate HTTP/MCP
 requests, tool calls, worker lifecycle, DbgEng operations, profile jobs, service
-startup/shutdown, durations, errors, and artifact paths. Then inspect the
-session or profile artifact directory referenced by the log. Runtime logs do not
+startup/shutdown, TTD recording jobs, durations, errors, and artifact paths.
+Then inspect the session, profile, or TTD recording artifact directory referenced by the log. Runtime logs do not
 include debugger command output or full HTTP request bodies; command output is
 kept in the per-command output artifacts and session transcript.
 
@@ -246,13 +279,16 @@ service, and checks `/healthz`.
 The install script detects DbgEng from Microsoft Store WinDbg packages first,
 then Windows Kits / WDK Debuggers, then System32. Sysinternals is optional; if
 no Sysinternals directory is configured, the service still installs and runs,
-but Procmon-based profiling is unavailable. Use `-ProxyUrl <url>`, `-NoProxy`,
-or existing proxy environment variables to control the generated `[proxy]`
-section. Use `-SymbolPath <path>` to write `[debugger].symbol_path`; if omitted,
-the install script persists `_NT_ALT_SYMBOL_PATH` and `_NT_SYMBOL_PATH` from the
-current environment when present, and otherwise leaves the field unset. It does
-not default to Microsoft's public symbol server. Use `-NonInteractive` to write
-the detected/default config without the final confirmation prompt.
+but Procmon-based profiling is unavailable. TTD is also optional; the script
+first derives it from the resolved DbgEng directory as `<dbgeng_dir>\ttd`, then
+falls back to standalone TTD discovery and `PATH`. Use `-TtdDir <path>` to
+override that location. Use `-ProxyUrl <url>`, `-NoProxy`, or existing proxy environment
+variables to control the generated `[proxy]` section. Use `-SymbolPath <path>`
+to write `[debugger].symbol_path`; if omitted, the install script persists
+`_NT_ALT_SYMBOL_PATH` and `_NT_SYMBOL_PATH` from the current environment when
+present, and otherwise leaves the field unset. It does not default to
+Microsoft's public symbol server. Use `-NonInteractive` to write the
+detected/default config without the final confirmation prompt.
 
 Uninstall queries the installed service command line from the Windows Service
 Control Manager to recover the installed executable path and `--config` path,

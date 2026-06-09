@@ -359,6 +359,24 @@ fallback。
 * 符号下载代理行为对用户更符合预期，同时保留显式 `_NT_SYMBOL_PROXY` 的优先级。
 * 避免把 socks、带认证信息或带路径的通用代理值错误传给 SymSrv。
 
+### D-013: TTD recording 使用独立 `record_ttd` tool
+
+决定：
+
+第一版 TTD recording 通过独立 `record_ttd` tool 编排 Microsoft `TTD.exe`，
+支持 launch、attach 和有界 monitor recording。TTD recorder 目录来自
+`config.toml` 的 `[tools].ttd_dir`、`[debugger].dbgeng_dir\ttd` 推导目录或
+Windows `PATH`，不接受请求内传入 recorder 路径，不下载或安装 TTD，也不暴露任意
+recorder command line。生成的 `.run`、`.out`、`.err` 和 `.idx` 文件写入
+`artifacts\ttd_recordings\<recording_id>`，并按敏感 artifact 管理。
+
+原因：
+
+* TTD launch recording 必须由 `TTD.exe` 启动目标，不符合 `run_profile`
+  “先启动 collector、再由 dbgflow 启动 target”的生命周期模型。
+* 独立 tool 能清晰表达 TTD 的 admin 权限、性能开销、文件大小和敏感数据边界。
+* typed options 比透传命令行更容易审计，也避免把 dbgflow 扩展成通用 shell wrapper。
+
 ## 8. 当前待办
 
 ### P0
@@ -402,8 +420,8 @@ fallback。
 * [x] 支持 Streamable HTTP SSE stream。
 * [x] 支持 native ETW launch-only `run_profile` MVP。
 * [x] 支持并行 profile collectors 和可选 Procmon collector MVP。
-* [ ] 支持 TTD recording。
-* [ ] 支持 TTD trace artifact。
+* [x] 支持 TTD recording。
+* [x] 支持 TTD trace artifact。
 * [ ] 支持 debugger-gated profiling。
 * [ ] 支持 ETL 后处理和报告生成。
 * [ ] 支持调试报告生成。
