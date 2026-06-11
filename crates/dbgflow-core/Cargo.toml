@@ -20,6 +20,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Diagnostics_Etw",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemServices",
+    "Win32_System_Time",
     "Win32_System_Threading",
 ] }
 windows-core = "0.62.2"
@@ -32,5 +33,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Win32_System_Memory",
+    "Win32_System_Time",
     "Win32_System_Threading",
 ] }

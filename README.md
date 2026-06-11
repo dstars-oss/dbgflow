@@ -83,13 +83,22 @@ implemented by relying on worker environment variables.
 
 `trace.record_profile` launches a local executable and records one or more profiling
 collectors around the same target lifetime. The default collector is
-`native_etw/system_overview`, which writes a standard `.etl` trace. The tool
-also accepts `collectors[]` for parallel collection; the legacy single
-`collector` field remains accepted for compatibility. Collection stops when the
+`native_etw` with `scope.kind=target_process`, `event_sets=["process_lifecycle"]`,
+and stack capture enabled. It writes a standard `.etl` trace plus filtered
+`events.jsonl` and `summary.json` artifacts for the target PID. The tool also
+accepts `collectors[]` for parallel collection. Collection stops when the
 target exits or when `timeout_ms` expires. Timeout stops collection but does not
 terminate the target process by default. Profile metadata, lifecycle events,
 collector artifacts, and captured target stdout/stderr are written under
 `artifacts\profiles\<profile_id>`.
+
+Native ETW `process_lifecycle` captures process start/end, thread start/end, and
+image load/unload kernel events. The raw `trace.etl` may still contain
+system-wide lifecycle events; dbgflow's `events.jsonl` and `summary.json`
+post-processing artifacts are filtered to the launched target PID. Stack frames
+are emitted as a compact string array: `module+0xoffset` when the address can be
+matched to the target PID's image load interval, otherwise the raw `0x...`
+address is kept. Symbols are not resolved.
 
 Example profile request:
 
@@ -100,11 +109,7 @@ Example profile request:
     "executable": "C:\\Windows\\System32\\cmd.exe",
     "args": ["/C", "echo dbgflow"]
   },
-  "timeout_ms": 10000,
-  "collector": {
-    "kind": "native_etw",
-    "preset": "system_overview"
-  }
+  "timeout_ms": 10000
 }
 ```
 
@@ -121,7 +126,9 @@ Parallel collectors example:
   "collectors": [
     {
       "kind": "native_etw",
-      "preset": "system_overview"
+      "scope": { "kind": "target_process" },
+      "event_sets": ["process_lifecycle"],
+      "stacks": { "enabled": true }
     },
     {
       "kind": "procmon",

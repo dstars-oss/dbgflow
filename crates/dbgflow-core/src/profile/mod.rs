@@ -13,9 +13,9 @@ pub use collector::{
 pub use id::ProfileId;
 pub use manager::ProfileManager;
 pub use model::{
-    ProcmonFilterConfig, ProfileArtifacts, ProfileCollectorConfig, ProfileCollectorKind,
-    ProfileCollectorResult, ProfileCollectorStatus, ProfileCompletionReason, ProfilePreset,
-    ProfileResult, ProfileStatus, ProfileTarget, RunProfile,
+    EtwEventSet, EtwProfileScope, EtwStackConfig, ProcmonFilterConfig, ProfileArtifacts,
+    ProfileCollectorConfig, ProfileCollectorKind, ProfileCollectorResult, ProfileCollectorStatus,
+    ProfileCompletionReason, ProfileResult, ProfileStatus, ProfileTarget, RunProfile,
 };
 pub use procmon::ProcmonRuntime;
 pub use target::{

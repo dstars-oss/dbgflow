@@ -35,7 +35,10 @@ pub enum ProfileTarget {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProfileCollectorConfig {
     NativeEtw {
-        preset: ProfilePreset,
+        scope: EtwProfileScope,
+        event_sets: Vec<EtwEventSet>,
+        #[serde(default)]
+        stacks: EtwStackConfig,
     },
     Procmon {
         #[serde(default)]
@@ -64,8 +67,34 @@ impl ProfileCollectorConfig {
 impl Default for ProfileCollectorConfig {
     fn default() -> Self {
         Self::NativeEtw {
-            preset: ProfilePreset::SystemOverview,
+            scope: EtwProfileScope::TargetProcess,
+            event_sets: vec![EtwEventSet::ProcessLifecycle],
+            stacks: EtwStackConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EtwProfileScope {
+    TargetProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EtwEventSet {
+    ProcessLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EtwStackConfig {
+    pub enabled: bool,
+}
+
+impl Default for EtwStackConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -83,12 +112,6 @@ pub struct ProcmonFilterConfig {
 pub enum ProfileCollectorKind {
     NativeEtw,
     Procmon,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProfilePreset {
-    SystemOverview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

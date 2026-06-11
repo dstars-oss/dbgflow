@@ -1,10 +1,10 @@
 use dbgflow_core::artifacts::{ArtifactKind, ArtifactRef};
 use dbgflow_core::logging::{LogEvent, LogSink};
 use dbgflow_core::profile::{
-    validate_profile_target, CollectorFactory, CollectorStart, CollectorStop, NoopTargetEventSink,
-    ProfileCollector, ProfileCollectorConfig, ProfileCollectorKind, ProfileCompletionReason,
-    ProfileManager, ProfilePreset, ProfileStatus, ProfileTarget, RunProfile, TargetEventSink,
-    TargetExit, TargetRunner,
+    validate_profile_target, CollectorFactory, CollectorStart, CollectorStop, EtwEventSet,
+    EtwProfileScope, EtwStackConfig, NoopTargetEventSink, ProfileCollector, ProfileCollectorConfig,
+    ProfileCollectorKind, ProfileCompletionReason, ProfileManager, ProfileStatus, ProfileTarget,
+    RunProfile, TargetEventSink, TargetExit, TargetRunner,
 };
 use dbgflow_core::Result;
 use std::fs;
@@ -59,20 +59,22 @@ fn profile_launch_target_canonicalizes_existing_executable_and_rejects_nul_args(
 }
 
 #[test]
-fn default_profile_collector_is_native_etw_system_overview() {
+fn default_profile_collector_is_native_etw_process_lifecycle() {
     let config = ProfileCollectorConfig::default();
 
     assert_eq!(config.kind(), ProfileCollectorKind::NativeEtw);
     assert!(matches!(
         config,
         ProfileCollectorConfig::NativeEtw {
-            preset: ProfilePreset::SystemOverview
-        }
+            scope: EtwProfileScope::TargetProcess,
+            ref event_sets,
+            stacks: EtwStackConfig { enabled: true }
+        } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
     ));
 }
 
 #[test]
-fn default_run_profile_collectors_is_native_etw_system_overview() {
+fn default_run_profile_collectors_is_native_etw_process_lifecycle() {
     let request = RunProfile {
         target: ProfileTarget::Launch {
             executable: std::env::current_exe().expect("current exe"),
@@ -87,8 +89,10 @@ fn default_run_profile_collectors_is_native_etw_system_overview() {
     assert!(matches!(
         request.collectors[0],
         ProfileCollectorConfig::NativeEtw {
-            preset: ProfilePreset::SystemOverview
-        }
+            scope: EtwProfileScope::TargetProcess,
+            ref event_sets,
+            stacks: EtwStackConfig { enabled: true }
+        } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
     ));
 }
 
@@ -191,6 +195,13 @@ impl ProfileCollector for TestCollector {
         Ok(CollectorStart {
             warnings: Vec::new(),
         })
+    }
+
+    fn target_started(&self, target_pid: u32) {
+        self.state
+            .lock()
+            .expect("state")
+            .push(format!("target_started:{}:{target_pid}", self.name));
     }
 
     fn stop(&self, _target_pid: Option<u32>) -> Result<CollectorStop> {
@@ -306,6 +317,7 @@ fn run_profile_starts_collector_launches_target_stops_collector_and_writes_artif
         collector_state.lock().expect("state").as_slice(),
         &[
             "start:native_etw".to_string(),
+            "target_started:native_etw:1234".to_string(),
             "stop:native_etw".to_string()
         ]
     );
@@ -484,9 +496,7 @@ fn run_profile_starts_and_stops_collectors_in_reverse_stop_order() {
             },
             timeout_ms: 1000,
             collectors: vec![
-                ProfileCollectorConfig::NativeEtw {
-                    preset: ProfilePreset::SystemOverview,
-                },
+                native_etw_config(),
                 ProfileCollectorConfig::Procmon {
                     capture_stacks: true,
                     filters: Default::default(),
@@ -502,6 +512,8 @@ fn run_profile_starts_and_stops_collectors_in_reverse_stop_order() {
         &[
             "start:native_etw".to_string(),
             "start:procmon".to_string(),
+            "target_started:native_etw:1234".to_string(),
+            "target_started:procmon:1234".to_string(),
             "stop:procmon".to_string(),
             "stop:native_etw".to_string(),
         ]
@@ -532,9 +544,7 @@ fn run_profile_start_failure_stops_already_started_collectors() {
             },
             timeout_ms: 1000,
             collectors: vec![
-                ProfileCollectorConfig::NativeEtw {
-                    preset: ProfilePreset::SystemOverview,
-                },
+                native_etw_config(),
                 ProfileCollectorConfig::Procmon {
                     capture_stacks: false,
                     filters: Default::default(),
@@ -580,9 +590,7 @@ fn run_profile_start_failure_cleans_up_failing_collector() {
                 args: Vec::new(),
             },
             timeout_ms: 1000,
-            collectors: vec![ProfileCollectorConfig::NativeEtw {
-                preset: ProfilePreset::SystemOverview,
-            }],
+            collectors: vec![native_etw_config()],
         })
         .expect_err("collector start fails");
 
@@ -614,14 +622,7 @@ fn run_profile_rejects_duplicate_collector_kinds() {
                 args: Vec::new(),
             },
             timeout_ms: 1000,
-            collectors: vec![
-                ProfileCollectorConfig::NativeEtw {
-                    preset: ProfilePreset::SystemOverview,
-                },
-                ProfileCollectorConfig::NativeEtw {
-                    preset: ProfilePreset::SystemOverview,
-                },
-            ],
+            collectors: vec![native_etw_config(), native_etw_config()],
         })
         .expect_err("duplicate collectors rejected");
 
@@ -633,6 +634,14 @@ fn test_profile_root(name: &str) -> std::path::PathBuf {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create root");
     root
+}
+
+fn native_etw_config() -> ProfileCollectorConfig {
+    ProfileCollectorConfig::NativeEtw {
+        scope: EtwProfileScope::TargetProcess,
+        event_sets: vec![EtwEventSet::ProcessLifecycle],
+        stacks: EtwStackConfig::default(),
+    }
 }
 
 fn only_profile_metadata(root: &Path) -> String {
@@ -789,6 +798,53 @@ fn target_launch_failure_after_collector_start_returns_failed_result_and_stops_c
         &[
             "start:native_etw".to_string(),
             "stop:native_etw".to_string()
+        ]
+    );
+}
+
+#[test]
+fn run_profile_stop_failure_runs_collector_cleanup() {
+    let root = test_profile_root("stop-failure-cleanup");
+    let collector_state = Arc::new(Mutex::new(Vec::new()));
+    let manager = ProfileManager::with_components(
+        &root,
+        Arc::new(TestCollectorFactory {
+            state: collector_state.clone(),
+            fail_start: false,
+            fail_stop: true,
+            fail_start_for: None,
+            fail_stop_for: None,
+        }),
+        Arc::new(TestTargetRunner {
+            exit: TargetExit::Exited {
+                pid: 1234,
+                exit_code: Some(0),
+            },
+        }),
+    );
+
+    let result = manager
+        .run_profile(RunProfile {
+            target: ProfileTarget::Launch {
+                executable: std::env::current_exe().expect("current exe"),
+                args: Vec::new(),
+            },
+            timeout_ms: 1000,
+            collectors: vec![ProfileCollectorConfig::default()],
+        })
+        .expect("profile returns failed collector result");
+
+    assert!(result
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("collector native_etw stop failed")));
+    assert_eq!(
+        collector_state.lock().expect("state").as_slice(),
+        &[
+            "start:native_etw".to_string(),
+            "target_started:native_etw:1234".to_string(),
+            "stop:native_etw".to_string(),
+            "cleanup:native_etw".to_string()
         ]
     );
 }

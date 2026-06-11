@@ -277,7 +277,7 @@ impl ProfileManager {
                         None,
                         collector_fields(config),
                     );
-                    started_collectors.push(collector);
+                    started_collectors.push(Arc::from(collector));
                 }
                 Err(error) => {
                     let mut fields = collector_fields(config);
@@ -341,6 +341,7 @@ impl ProfileManager {
             Arc::new(ProfileTargetEventSink {
                 manager: self.clone(),
                 profile_id,
+                collectors: started_collectors.clone(),
             }),
         );
 
@@ -371,6 +372,35 @@ impl ProfileManager {
                         stop_error = Some(error.clone());
                     }
                     warnings.push(format!("collector {name} stop failed: {error}"));
+                    let mut fields = fields;
+                    match collector.cleanup() {
+                        Ok(()) => {
+                            self.record_event(
+                                profile_id,
+                                "collector_cleanup_finished",
+                                None,
+                                None,
+                                fields.clone(),
+                            );
+                        }
+                        Err(cleanup_error) => {
+                            let cleanup_error = cleanup_error.to_string();
+                            warnings.push(format!(
+                                "collector {name} cleanup after stop failure failed: {cleanup_error}"
+                            ));
+                            fields.insert(
+                                "cleanup_error".to_string(),
+                                Value::String(cleanup_error.clone()),
+                            );
+                            self.record_event(
+                                profile_id,
+                                "collector_cleanup_failed",
+                                None,
+                                Some(cleanup_error),
+                                fields.clone(),
+                            );
+                        }
+                    }
                     self.record_event(
                         profile_id,
                         "profile_error",
@@ -681,11 +711,15 @@ impl ProfileManager {
 struct ProfileTargetEventSink {
     manager: ProfileManager,
     profile_id: ProfileId,
+    collectors: Vec<Arc<dyn ProfileCollector>>,
 }
 
 impl TargetEventSink for ProfileTargetEventSink {
     fn target_started(&self, pid: u32) {
         self.manager.record_target_started(self.profile_id, pid);
+        for collector in &self.collectors {
+            collector.target_started(pid);
+        }
     }
 }
 
@@ -799,7 +833,7 @@ fn legacy_trace_artifact(results: &[ProfileCollectorResult]) -> Option<ArtifactR
 fn stop_started_collectors_for_start_failure(
     manager: &ProfileManager,
     profile_id: ProfileId,
-    started_collectors: &mut Vec<Box<dyn ProfileCollector>>,
+    started_collectors: &mut Vec<Arc<dyn ProfileCollector>>,
 ) -> Vec<ProfileCollectorResult> {
     let mut results = Vec::new();
     while let Some(collector) = started_collectors.pop() {

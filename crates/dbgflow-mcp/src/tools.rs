@@ -247,44 +247,6 @@ impl ToolService {
                             "minimum": 1,
                             "description": "Stop collection when the target exits or this timeout expires."
                         },
-                        "collector": {
-                            "type": "object",
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "kind": { "type": "string", "const": "native_etw" },
-                                        "preset": { "type": "string", "const": "system_overview" }
-                                    },
-                                    "required": ["kind", "preset"],
-                                    "additionalProperties": false
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "kind": { "type": "string", "const": "procmon" },
-                                        "capture_stacks": { "type": "boolean" },
-                                        "filters": {
-                                            "type": "object",
-                                            "properties": {
-                                                "operations": {
-                                                    "type": "array",
-                                                    "items": { "type": "string" }
-                                                },
-                                                "paths": {
-                                                    "type": "array",
-                                                    "items": { "type": "string" }
-                                                }
-                                            },
-                                            "additionalProperties": false
-                                        }
-                                    },
-                                    "required": ["kind"],
-                                    "additionalProperties": false
-                                }
-                            ],
-                            "description": "Legacy single collector form. Do not pass together with collectors."
-                        },
                         "collectors": {
                             "type": "array",
                             "minItems": 1,
@@ -294,9 +256,28 @@ impl ToolService {
                                         "type": "object",
                                         "properties": {
                                             "kind": { "type": "string", "const": "native_etw" },
-                                            "preset": { "type": "string", "const": "system_overview" }
+                                            "scope": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "kind": { "type": "string", "const": "target_process" }
+                                                },
+                                                "required": ["kind"],
+                                                "additionalProperties": false
+                                            },
+                                            "event_sets": {
+                                                "type": "array",
+                                                "items": { "type": "string", "enum": ["process_lifecycle"] },
+                                                "minItems": 1
+                                            },
+                                            "stacks": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "enabled": { "type": "boolean" }
+                                                },
+                                                "additionalProperties": false
+                                            }
                                         },
-                                        "required": ["kind", "preset"],
+                                        "required": ["kind", "scope", "event_sets"],
                                         "additionalProperties": false
                                     },
                                     {
@@ -324,7 +305,7 @@ impl ToolService {
                                     }
                                 ]
                             },
-                            "description": "Collectors to run around the same launched target. Do not pass together with collector."
+                            "description": "Collectors to run around the same launched target. Omit to use native_etw target_process process_lifecycle with stacks enabled."
                         }
                     },
                     "required": ["target", "timeout_ms"],
@@ -635,7 +616,7 @@ impl From<RunProfileRequest> for RunProfile {
 struct RawRunProfileRequest {
     target: dbgflow_core::profile::ProfileTarget,
     timeout_ms: u64,
-    collector: Option<ProfileCollectorConfig>,
+    #[serde(default)]
     collectors: Option<Vec<ProfileCollectorConfig>>,
 }
 
@@ -715,15 +696,9 @@ impl<'de> Deserialize<'de> for RunProfileRequest {
         D: serde::Deserializer<'de>,
     {
         let raw = RawRunProfileRequest::deserialize(deserializer)?;
-        if raw.collector.is_some() && raw.collectors.is_some() {
-            return Err(serde::de::Error::custom(
-                "collector and collectors cannot both be set",
-            ));
-        }
-        let collectors = match (raw.collector, raw.collectors) {
-            (Some(collector), None) => vec![collector],
-            (None, None) => vec![ProfileCollectorConfig::default()],
-            (None, Some(collectors)) => {
+        let collectors = match raw.collectors {
+            None => vec![ProfileCollectorConfig::default()],
+            Some(collectors) => {
                 if collectors.is_empty() {
                     return Err(serde::de::Error::custom(
                         "collectors must contain at least one collector",
@@ -731,7 +706,6 @@ impl<'de> Deserialize<'de> for RunProfileRequest {
                 }
                 collectors
             }
-            (Some(_), Some(_)) => unreachable!("checked above"),
         };
         Ok(Self {
             target: raw.target,
@@ -744,7 +718,9 @@ impl<'de> Deserialize<'de> for RunProfileRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbgflow_core::profile::{ProfileCollectorKind, ProfilePreset};
+    use dbgflow_core::profile::{
+        EtwEventSet, EtwProfileScope, EtwStackConfig, ProfileCollectorKind,
+    };
     use dbgflow_core::ttd::{
         RecordTtd, TtdRecordMode, TtdRecordingOptions, TtdReplayCpuSupport, TtdTarget,
     };
@@ -791,10 +767,14 @@ mod tests {
                 "args": ["/C", "echo dbgflow"]
             },
             "timeout_ms": 1000,
-            "collector": {
-                "kind": "native_etw",
-                "preset": "system_overview"
-            }
+            "collectors": [
+                {
+                    "kind": "native_etw",
+                    "scope": { "kind": "target_process" },
+                    "event_sets": ["process_lifecycle"],
+                    "stacks": { "enabled": true }
+                }
+            ]
         });
 
         let request: RunProfileRequest = decode_arguments(value).expect("decode request");
@@ -807,13 +787,37 @@ mod tests {
         assert!(matches!(
             request.collectors[0],
             ProfileCollectorConfig::NativeEtw {
-                preset: ProfilePreset::SystemOverview
-            }
+                scope: EtwProfileScope::TargetProcess,
+                ref event_sets,
+                stacks: EtwStackConfig { enabled: true }
+            } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
         ));
     }
 
     #[test]
-    fn run_profile_arguments_decode_legacy_collector_to_collectors() {
+    fn run_profile_arguments_decode_default_native_etw() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000
+        });
+
+        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
+        assert_eq!(request.collectors.len(), 1);
+        assert!(matches!(
+            request.collectors[0],
+            ProfileCollectorConfig::NativeEtw {
+                scope: EtwProfileScope::TargetProcess,
+                ref event_sets,
+                stacks: EtwStackConfig { enabled: true }
+            } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
+        ));
+    }
+
+    #[test]
+    fn run_profile_arguments_reject_legacy_collector() {
         let value = json!({
             "target": {
                 "kind": "launch",
@@ -826,14 +830,31 @@ mod tests {
             }
         });
 
-        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
-        assert_eq!(request.collectors.len(), 1);
-        assert!(matches!(
-            request.collectors[0],
-            ProfileCollectorConfig::NativeEtw {
-                preset: ProfilePreset::SystemOverview
-            }
-        ));
+        let error =
+            decode_arguments::<RunProfileRequest>(value).expect_err("reject legacy collector");
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("collector"));
+    }
+
+    #[test]
+    fn run_profile_arguments_reject_legacy_native_etw_preset() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collectors": [
+                {
+                    "kind": "native_etw",
+                    "preset": "system_overview"
+                }
+            ]
+        });
+
+        let error = decode_arguments::<RunProfileRequest>(value).expect_err("reject legacy preset");
+        assert!(error.to_string().contains("unknown field"));
+        assert!(error.to_string().contains("preset"));
     }
 
     #[test]
@@ -847,7 +868,8 @@ mod tests {
             "collectors": [
                 {
                     "kind": "native_etw",
-                    "preset": "system_overview"
+                    "scope": { "kind": "target_process" },
+                    "event_sets": ["process_lifecycle"]
                 },
                 {
                     "kind": "procmon",
@@ -866,32 +888,6 @@ mod tests {
             request.collectors[1],
             ProfileCollectorConfig::Procmon { .. }
         ));
-    }
-
-    #[test]
-    fn run_profile_arguments_reject_both_collector_forms() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "collector": {
-                "kind": "native_etw",
-                "preset": "system_overview"
-            },
-            "collectors": [
-                {
-                    "kind": "native_etw",
-                    "preset": "system_overview"
-                }
-            ]
-        });
-
-        let error = decode_arguments::<RunProfileRequest>(value).expect_err("reject both forms");
-        assert!(error
-            .to_string()
-            .contains("collector and collectors cannot both be set"));
     }
 
     #[test]
@@ -937,10 +933,12 @@ mod tests {
                 "executable": "C:\\Windows\\System32\\cmd.exe"
             },
             "timeout_ms": 1000,
-            "collector": {
-                "kind": "procmon",
-                "sysinternals_dir": "C:\\Sysinternals"
-            }
+            "collectors": [
+                {
+                    "kind": "procmon",
+                    "sysinternals_dir": "C:\\Sysinternals"
+                }
+            ]
         });
 
         let error = decode_arguments::<RunProfileRequest>(value)
