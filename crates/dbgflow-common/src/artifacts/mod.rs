@@ -2,5 +2,5 @@ mod manager;
 
 pub use manager::{
     ArtifactKind, ArtifactManager, ArtifactRef, CommandArtifactRecord, ProfileArtifactEvent,
-    SessionArtifactEvent, TtdRecordingArtifactEvent,
+    ReverseSessionArtifactEvent, SessionArtifactEvent, TtdRecordingArtifactEvent,
 };

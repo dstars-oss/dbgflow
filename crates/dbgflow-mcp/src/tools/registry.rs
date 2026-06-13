@@ -2,6 +2,10 @@ use super::adapters::{decode_arguments, to_value};
 use dbgflow_common::{DbgFlowError, Result};
 use dbgflow_debug::backend::DebugTarget;
 use dbgflow_debug::session::{EvalSessionResult, Session, SessionId, SessionManager};
+use dbgflow_reverse::ida::{
+    CreateIdaSession, IdaRuntimeConfig, IdaSessionManager, ListFunctionsResult, ListSegmentsResult,
+    ReverseSession,
+};
 use dbgflow_trace::profile::{ProfileCollectorConfig, ProfileManager, ProfileResult, RunProfile};
 use dbgflow_trace::ttd::{RecordTtd, TtdRecordingManager, TtdRecordingResult};
 use serde::{Deserialize, Serialize};
@@ -18,6 +22,12 @@ pub const EVAL: &str = "dbg.eval";
 pub const ADD_SYMBOLS: &str = "dbg.add_symbols";
 pub const RECORD_PROFILE: &str = "trace.record_profile";
 pub const RECORD_TTD: &str = "trace.record_ttd";
+pub const IDA_CREATE_SESSION: &str = "ida.create_session";
+pub const IDA_GET_SESSION: &str = "ida.get_session";
+pub const IDA_LIST_SESSIONS: &str = "ida.list_sessions";
+pub const IDA_CLOSE_SESSION: &str = "ida.close_session";
+pub const IDA_LIST_SEGMENTS: &str = "ida.list_segments";
+pub const IDA_LIST_FUNCTIONS: &str = "ida.list_functions";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -32,6 +42,7 @@ pub struct ToolService {
     sessions: SessionManager,
     profiles: ProfileManager,
     ttd_recordings: TtdRecordingManager,
+    ida_sessions: IdaSessionManager,
 }
 
 impl ToolService {
@@ -40,6 +51,7 @@ impl ToolService {
             sessions,
             profiles: ProfileManager::new("artifacts"),
             ttd_recordings: TtdRecordingManager::new("artifacts"),
+            ida_sessions: IdaSessionManager::new("artifacts", IdaRuntimeConfig::default()),
         }
     }
 
@@ -48,6 +60,7 @@ impl ToolService {
             sessions,
             profiles,
             ttd_recordings: TtdRecordingManager::new("artifacts"),
+            ida_sessions: IdaSessionManager::new("artifacts", IdaRuntimeConfig::default()),
         }
     }
 
@@ -60,6 +73,21 @@ impl ToolService {
             sessions,
             profiles,
             ttd_recordings,
+            ida_sessions: IdaSessionManager::new("artifacts", IdaRuntimeConfig::default()),
+        }
+    }
+
+    pub fn with_profiles_ttd_and_reverse(
+        sessions: SessionManager,
+        profiles: ProfileManager,
+        ttd_recordings: TtdRecordingManager,
+        ida_sessions: IdaSessionManager,
+    ) -> Self {
+        Self {
+            sessions,
+            profiles,
+            ttd_recordings,
+            ida_sessions,
         }
     }
 
@@ -72,6 +100,7 @@ impl ToolService {
             sessions: SessionManager::with_artifact_root(&root),
             profiles: ProfileManager::new(&root),
             ttd_recordings: TtdRecordingManager::new(&root),
+            ida_sessions: IdaSessionManager::new(&root, IdaRuntimeConfig::default()),
         }
     }
 
@@ -109,6 +138,30 @@ impl ToolService {
 
     pub fn record_ttd(&self, request: RecordTtd) -> Result<TtdRecordingResult> {
         super::trace::record_ttd(&self.ttd_recordings, request)
+    }
+
+    pub fn create_ida_session(&self, request: CreateIdaSession) -> Result<ReverseSession> {
+        self.ida_sessions.create_session(request)
+    }
+
+    pub fn get_ida_session(&self, session_id: SessionId) -> Result<ReverseSession> {
+        self.ida_sessions.get_session(session_id)
+    }
+
+    pub fn list_ida_sessions(&self) -> Result<Vec<ReverseSession>> {
+        self.ida_sessions.list_sessions()
+    }
+
+    pub fn close_ida_session(&self, session_id: SessionId) -> Result<ReverseSession> {
+        self.ida_sessions.close_session(session_id)
+    }
+
+    pub fn list_ida_segments(&self, session_id: SessionId) -> Result<ListSegmentsResult> {
+        self.ida_sessions.list_segments(session_id)
+    }
+
+    pub fn list_ida_functions(&self, session_id: SessionId) -> Result<ListFunctionsResult> {
+        self.ida_sessions.list_functions(session_id)
     }
 
     pub fn subscribe_session_updates(&self) -> mpsc::Receiver<SessionId> {
@@ -157,6 +210,38 @@ impl ToolService {
                 .record_ttd(decode_arguments(arguments)?)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
+            IDA_CREATE_SESSION => self
+                .create_ida_session(decode_arguments(arguments)?)
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            IDA_GET_SESSION => {
+                let request: GetIdaSessionRequest = decode_arguments(arguments)?;
+                self.get_ida_session(request.session_id)
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_SESSIONS => self
+                .list_ida_sessions()
+                .map_err(ToolCallError::execution)
+                .and_then(to_value),
+            IDA_CLOSE_SESSION => {
+                let request: CloseIdaSessionRequest = decode_arguments(arguments)?;
+                self.close_ida_session(request.session_id)
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_SEGMENTS => {
+                let request: ListIdaSegmentsRequest = decode_arguments(arguments)?;
+                self.list_ida_segments(request.session_id)
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_FUNCTIONS => {
+                let request: ListIdaFunctionsRequest = decode_arguments(arguments)?;
+                self.list_ida_functions(request.session_id)
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
             _ => Err(ToolCallError::invalid_request(format!(
                 "unknown tool: {name}"
             ))),
@@ -210,6 +295,30 @@ pub struct CloseSessionRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetSessionRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetIdaSessionRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseIdaSessionRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListIdaSegmentsRequest {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListIdaFunctionsRequest {
     pub session_id: SessionId,
 }
 
@@ -374,6 +483,70 @@ mod tests {
             .expect("target variants")
             .iter()
             .any(|target| target["properties"]["kind"]["const"] == "monitor"));
+    }
+
+    #[test]
+    fn tool_descriptors_include_ida_session_tools() {
+        let service = ToolService::new_for_tests();
+
+        let descriptors = service.tool_descriptors();
+
+        assert!(descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == IDA_CREATE_SESSION));
+        assert!(descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == IDA_LIST_SEGMENTS));
+        assert!(descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == IDA_LIST_FUNCTIONS));
+    }
+
+    #[test]
+    fn ida_create_session_arguments_decode_binary_target() {
+        let value = json!({
+            "target": {
+                "kind": "binary",
+                "path": "C:\\samples\\a.exe"
+            },
+            "run_auto_analysis": true,
+            "startup_timeout_ms": 60000
+        });
+
+        let request: CreateIdaSession = decode_arguments(value).expect("decode ida create");
+
+        assert!(matches!(
+            request.target,
+            dbgflow_reverse::ida::IdaTarget::Binary { .. }
+        ));
+        assert!(request.run_auto_analysis);
+        assert_eq!(request.startup_timeout_ms, Some(60000));
+    }
+
+    #[test]
+    fn ida_create_session_arguments_reject_unknown_target_kind() {
+        let value = json!({
+            "target": {
+                "kind": "probe",
+                "path": "C:\\samples\\a.exe"
+            }
+        });
+
+        let error =
+            decode_arguments::<CreateIdaSession>(value).expect_err("reject unknown ida target");
+
+        assert!(error.to_string().contains("probe"));
+    }
+
+    #[test]
+    fn tools_call_lists_ida_sessions_without_ida_runtime() {
+        let service = ToolService::new_for_tests();
+
+        let value = service
+            .call_tool(IDA_LIST_SESSIONS, json!({}))
+            .expect("list ida sessions");
+
+        assert_eq!(value.as_array().expect("sessions array").len(), 0);
     }
 
     #[test]

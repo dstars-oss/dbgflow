@@ -4,6 +4,9 @@ use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_debug::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
 use dbgflow_debug::session::SessionId;
+use dbgflow_reverse::ida::{
+    IdaRuntimeConfig, IdaSessionManager, ProcessReverseWorkerLauncher, ReverseWorkerLauncher,
+};
 use dbgflow_trace::profile::ProfileManager;
 use dbgflow_trace::ttd::{TtdRecorderRuntime, TtdRecordingManager};
 use serde::Deserialize;
@@ -29,6 +32,7 @@ pub struct McpServerConfig {
     pub data_dir: PathBuf,
     pub proxy: ProxyEnvironment,
     pub ttd_dir: Option<PathBuf>,
+    pub ida_install_dir: Option<PathBuf>,
     pub symbol_path: Option<String>,
     pub logger: Arc<dyn LogSink>,
 }
@@ -39,6 +43,7 @@ impl McpServerConfig {
             data_dir: data_dir.into(),
             proxy: ProxyEnvironment::none(),
             ttd_dir: None,
+            ida_install_dir: None,
             symbol_path: None,
             logger,
         }
@@ -51,6 +56,11 @@ impl McpServerConfig {
 
     pub fn with_ttd_dir(mut self, ttd_dir: Option<PathBuf>) -> Self {
         self.ttd_dir = ttd_dir;
+        self
+    }
+
+    pub fn with_ida_install_dir(mut self, ida_install_dir: Option<PathBuf>) -> Self {
+        self.ida_install_dir = ida_install_dir;
         self
     }
 
@@ -462,13 +472,23 @@ pub fn server_with_data_dir_and_proxy(
     data_dir: impl Into<PathBuf>,
     proxy: ProxyEnvironment,
 ) -> std::result::Result<McpServer, String> {
-    server_with_data_dir_proxy_ttd_and_symbol_path(data_dir, proxy, None, None)
+    server_with_data_dir_proxy_ttd_ida_and_symbol_path(data_dir, proxy, None, None, None)
 }
 
 pub fn server_with_data_dir_proxy_ttd_and_symbol_path(
     data_dir: impl Into<PathBuf>,
     proxy: ProxyEnvironment,
     ttd_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
+) -> std::result::Result<McpServer, String> {
+    server_with_data_dir_proxy_ttd_ida_and_symbol_path(data_dir, proxy, ttd_dir, None, symbol_path)
+}
+
+pub fn server_with_data_dir_proxy_ttd_ida_and_symbol_path(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    ttd_dir: Option<PathBuf>,
+    ida_install_dir: Option<PathBuf>,
     symbol_path: Option<String>,
 ) -> std::result::Result<McpServer, String> {
     let data_dir = data_dir.into();
@@ -480,6 +500,7 @@ pub fn server_with_data_dir_proxy_ttd_and_symbol_path(
         McpServerConfig::new(data_dir, logger)
             .with_proxy(proxy)
             .with_ttd_dir(ttd_dir)
+            .with_ida_install_dir(ida_install_dir)
             .with_symbol_path(symbol_path),
     ))
 }
@@ -521,10 +542,29 @@ pub fn server_with_data_dir_proxy_ttd_symbol_path_and_logger(
     symbol_path: Option<String>,
     logger: Arc<dyn LogSink>,
 ) -> McpServer {
+    server_with_data_dir_proxy_ttd_ida_symbol_path_and_logger(
+        data_dir,
+        proxy,
+        ttd_dir,
+        None,
+        symbol_path,
+        logger,
+    )
+}
+
+pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_and_logger(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    ttd_dir: Option<PathBuf>,
+    ida_install_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
+    logger: Arc<dyn LogSink>,
+) -> McpServer {
     server_from_config(
         McpServerConfig::new(data_dir, logger)
             .with_proxy(proxy)
             .with_ttd_dir(ttd_dir)
+            .with_ida_install_dir(ida_install_dir)
             .with_symbol_path(symbol_path),
     )
 }
@@ -548,8 +588,21 @@ pub fn server_from_config(config: McpServerConfig) -> McpServer {
             .unwrap_or_else(TtdRecorderRuntime::unavailable),
         config.logger.clone(),
     );
+    let ida_sessions = IdaSessionManager::with_worker_launcher_runtime_and_logger(
+        default_process_reverse_worker_launcher(),
+        &artifact_root,
+        IdaRuntimeConfig {
+            install_dir: config.ida_install_dir,
+        },
+        config.logger.clone(),
+    );
     McpServer::new_with_logger(
-        ToolService::with_profiles_and_ttd(sessions, profiles, ttd_recordings),
+        ToolService::with_profiles_ttd_and_reverse(
+            sessions,
+            profiles,
+            ttd_recordings,
+            ida_sessions,
+        ),
         config.logger,
     )
 }
@@ -564,6 +617,18 @@ fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {
         })
         .unwrap_or_else(|_| PathBuf::from("dbgflow-mcp"));
     Arc::new(ProcessWorkerLauncher::with_executable(executable))
+}
+
+fn default_process_reverse_worker_launcher() -> Arc<dyn ReverseWorkerLauncher> {
+    let executable = std::env::current_exe()
+        .or_else(|_| {
+            std::env::args_os()
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current exe"))
+        })
+        .unwrap_or_else(|_| PathBuf::from("dbgflow-mcp"));
+    Arc::new(ProcessReverseWorkerLauncher::with_executable(executable))
 }
 
 fn is_valid_request_id(id: &Value) -> bool {
@@ -706,6 +771,28 @@ mod tests {
             .iter()
             .any(|tool| tool["name"] == "trace.record_profile"));
         assert!(tools.iter().any(|tool| tool["name"] == "trace.record_ttd"));
+        let ida_create = tools
+            .iter()
+            .find(|tool| tool["name"] == "ida.create_session")
+            .expect("ida.create_session tool");
+        let ida_target_schema = &ida_create["inputSchema"]["properties"]["target"]["oneOf"];
+        assert!(ida_target_schema
+            .as_array()
+            .expect("ida target variants")
+            .iter()
+            .any(|target| target["properties"]["kind"]["const"] == "binary"));
+        assert!(ida_target_schema
+            .as_array()
+            .expect("ida target variants")
+            .iter()
+            .any(|target| target["properties"]["kind"]["const"] == "database"));
+        assert!(tools.iter().any(|tool| {
+            tool["name"] == "ida.list_segments"
+                && tool["inputSchema"]["required"][0] == "session_id"
+        }));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "ida.list_functions"));
         assert!(!tools.iter().any(|tool| tool["name"] == "set_symbols"));
     }
 
@@ -892,6 +979,25 @@ mod tests {
             .as_str()
             .expect("error message")
             .contains("unknown field"));
+    }
+
+    #[test]
+    fn tools_call_lists_ida_sessions() {
+        let server = test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "ida.list_sessions",
+                    "arguments": {}
+                }
+            }))
+            .expect("response");
+
+        let sessions = tool_text_json(&response);
+        assert_eq!(sessions.as_array().expect("sessions array").len(), 0);
     }
 
     #[test]

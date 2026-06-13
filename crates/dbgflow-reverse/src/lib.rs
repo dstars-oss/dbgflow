@@ -1,7 +1,9 @@
-//! Reverse-analysis crate boundary reserved for future `ida.*` work.
+//! Reverse-analysis crate boundary for `ida.*` work.
 //!
-//! This crate intentionally does not expose a reverse session, backend trait, or
-//! MCP tool surface yet. It exists so future IDA/idalib work can grow behind a
-//! separate domain boundary instead of copying debug or trace session code.
+//! The first IDA implementation deliberately uses runtime dynamic loading of
+//! IDA DLLs. Building dbgflow must not require the IDA SDK, Clang, bindgen, or
+//! an IDA installation.
+
+pub mod ida;
 
 pub use dbgflow_common::{DbgFlowError, Result};

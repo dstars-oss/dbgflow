@@ -178,7 +178,7 @@ dbgflow-mcp
   |     |-- TtdRecordingManager / TTD.exe
   |     |-- Artifact Manager from dbgflow-common
   |
-  |-- future ida.* MCP Tool Layer -> dbgflow-reverse
+  |-- ida.* MCP Tool Layer -> dbgflow-reverse
         |
         |-- ReverseSessionManager
         |-- ReverseTarget Validation
@@ -189,12 +189,11 @@ dbgflow-mcp
       Per-analysis worker process
         |
         v
-      ReverseBackend trait
+      IDA dynamic binding worker
         |
-        |-- IdaLibBackend
-              |-- Rust API facade
-              |-- C / C++ FFI shim
-              |-- IDA SDK / idalib
+        |-- runtime load idalib.dll / ida.dll
+        |-- minimal C ABI
+        |-- no build-time IDA SDK dependency
 ```
 
 推荐优先级：
@@ -620,6 +619,23 @@ reverse API。
   跨领域基础设施，集中到 `dbgflow-common` 可避免未来 `ida.*` 复制现有 profile / TTD 模式。
 * facade 保持现有 Rust 调用路径和测试兼容，让内部架构可以演进而不破坏 MCP wire API。
 
+### D-022: IDA MVP 采用运行时动态绑定而非构建期 SDK 绑定
+
+决定：
+
+`ida.*` session MVP 使用 Rust worker 在运行时动态加载 `idalib.dll` 和 `ida.dll`，
+手写最小 C ABI 绑定。dbgflow 源码编译不依赖 IDA SDK、Clang、bindgen、
+`idalib-rs` 或 IDA 安装目录。首版只绑定 session 打开 / 关闭、IDA 版本查询、
+segment 列表和 function 列表，不返回 qstring/name，不暴露 IDAPython、任意 eval、
+decompile、xref、rename、comment 或 patch。
+
+原因：
+
+* 源码使用者即使没有 IDA/SDK/Clang 也应能编译和运行非 IDA 能力。
+* IDA runtime 只在真实调用 `ida.create_session` 的机器上成为必要依赖。
+* 最小只读 ABI 降低 C++ layout 和 IDA SDK 版本漂移风险，为后续增量能力保留空间。
+* session worker 子进程隔离能在 IDA 加载失败、阻塞或崩溃时保护主 MCP server。
+
 ## 8. 当前待办
 
 ### P0
@@ -674,11 +690,12 @@ reverse API。
 
 ### P4
 
-* [ ] 完成 idalib / IDA SDK runtime 探测和配置设计。
-* [ ] 定义 `ReverseBackend`、`ReverseSessionManager` 和 reverse worker 协议。
-* [ ] 实现 Rust-first + C / C++ FFI shim 的 IdaLibBackend spike。
-* [ ] 设计 `ida.*` MCP tool schema 和 session lifecycle。
-* [ ] 支持 headless binary / IDB analysis session MVP。
+* [x] 完成 IDA runtime 探测和 `[reverse.ida] install_dir` 配置设计。
+* [x] 定义 `ReverseSessionManager` 和 reverse IDA worker 协议。
+* [x] 实现 Rust-first、no-SDK build-time dependency 的 IDA dynamic binding worker MVP。
+* [x] 设计 `ida.*` MCP tool schema 和 session lifecycle。
+* [x] 支持 headless binary / IDB analysis session MVP。
+* [x] 支持只读 segment / function 列表 MVP，不返回 names。
 * [ ] 支持函数、基本块、反汇编、字符串、imports / exports、xrefs、类型和伪代码查询。
 * [ ] 支持受控 IDB 标注修改：rename、comment 和 type。
 * [ ] 支持 reverse artifacts、审计日志、敏感输出记录和后续 redaction。

@@ -24,6 +24,7 @@ endpoint, and Windows service install / uninstall subcommands:
 - install-time DbgEng symbol path configuration
 - launch-only profiling with native ETW collectors
 - Time Travel Debugging recording with `TTD.exe` for launch, attach, and bounded monitor scenarios
+- IDA dynamic-binding reverse-analysis session MVP without IDA SDK build-time dependencies
 
 Current tool names:
 
@@ -35,6 +36,12 @@ Current tool names:
 - `dbg.add_symbols`
 - `trace.record_profile`
 - `trace.record_ttd`
+- `ida.create_session`
+- `ida.get_session`
+- `ida.list_sessions`
+- `ida.close_session`
+- `ida.list_segments`
+- `ida.list_functions`
 
 `dbg.create_session` uses get-or-create semantics and returns quickly with a
 `Starting` session while the backend opens the target in the background. Use
@@ -188,6 +195,34 @@ Example TTD recording request:
 }
 ```
 
+`ida.create_session` opens an IDA database or an IDA loader-recognized binary
+input in a long-lived reverse-analysis session. The IDA worker is a separate
+subprocess per reverse session and dynamically loads `idalib.dll` and `ida.dll`
+at runtime. Building dbgflow does not require the IDA SDK, Clang, bindgen,
+`idalib-rs`, or an IDA installation. The MVP is read-only: it supports
+session lifecycle plus `ida.list_segments` and `ida.list_functions`, and it does
+not expose arbitrary IDA eval, IDAPython, decompilation, xrefs, names, rename,
+comments, or patching.
+
+Configure IDA with `[reverse.ida].install_dir`; when omitted, dbgflow uses
+`DBGFLOW_IDA_DIR` when present and then probes
+`C:\Program Files\IDA Professional 9.3`. A
+configured install directory must contain `ida.exe`, `ida.dll`, `idalib.dll`,
+and `ida.hlp`. Reverse artifacts are written under
+`artifacts\reverse_sessions\<session_id>` with `request.json`, `session.json`,
+`events.jsonl`, `worker.log`, and `outputs\segments.json` /
+`outputs\functions.json`.
+
+Example IDA session request:
+
+```json
+{
+  "target": { "kind": "binary", "path": "C:\\samples\\a.exe" },
+  "run_auto_analysis": true,
+  "startup_timeout_ms": 60000
+}
+```
+
 `dbg.eval` is synchronous and does not expose per-command timeout knobs. While a
 command is running, the session exposes `current_operation` plus a
 `last_operation` summary with status, timing, artifact, error, and output-size
@@ -228,6 +263,9 @@ symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 [tools]
 # Optional when debugger.dbgeng_dir\ttd contains TTD.exe.
 ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
+
+[reverse.ida]
+install_dir = "C:\\Program Files\\IDA Professional 9.3"
 
 [proxy]
 mode = "url"

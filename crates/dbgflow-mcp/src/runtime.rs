@@ -1,5 +1,6 @@
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_debug::backend::dbgeng::DBGFLOW_DBGENG_DIR_ENV;
+use dbgflow_reverse::ida::DBGFLOW_IDA_DIR_ENV;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -30,6 +31,7 @@ pub struct AppConfig {
     pub proxy: ProxyEnvironment,
     pub ttd_dir: Option<PathBuf>,
     pub dbgeng_dir: Option<PathBuf>,
+    pub ida_install_dir: Option<PathBuf>,
     pub symbol_path: Option<String>,
 }
 
@@ -105,6 +107,13 @@ impl RuntimeConfig {
             .map(|path| parse_ttd_dir_path(path, "tools.ttd_dir"))
             .transpose()?
             .or_else(|| infer_ttd_dir_from_dbgeng_dir(dbgeng_dir.as_deref()));
+        let reverse = raw.reverse;
+        let ida_install_dir = reverse
+            .as_ref()
+            .and_then(|reverse| reverse.ida.as_ref())
+            .and_then(|ida| ida.install_dir.as_ref())
+            .map(|path| parse_ida_install_dir_path(path, "reverse.ida.install_dir"))
+            .transpose()?;
         let proxy = proxy_from_config(raw.proxy)?;
 
         Ok(Self {
@@ -120,6 +129,7 @@ impl RuntimeConfig {
                 proxy,
                 ttd_dir,
                 dbgeng_dir,
+                ida_install_dir,
                 symbol_path,
             },
         })
@@ -263,6 +273,7 @@ fn parse_legacy_http_options(args: Vec<OsString>) -> Result<AppConfig, String> {
         proxy,
         ttd_dir: None,
         dbgeng_dir: None,
+        ida_install_dir: None,
         symbol_path: None,
     })
 }
@@ -418,7 +429,7 @@ where
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp http --bind <addr> --data-dir <path> [options]\n  dbgflow-mcp http --config <path>                Run local HTTP MCP transport\n  dbgflow-mcp service run --config <path>         Run as a Windows service process\n  dbgflow-mcp service install --config <path>     Install and start the Windows service\n  dbgflow-mcp service uninstall [options]         Stop, uninstall, and remove install root\n  dbgflow-mcp worker session                      Run an internal session worker process\n\nHTTP options:\n  --bind <addr>                                   Loopback bind address; default 127.0.0.1:7331\n  --data-dir <path>                               Required for direct HTTP mode\n  --proxy-url <url>                               Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars\n  --no-proxy                                     Clears known proxy vars for session workers"
+    "Usage:\n  dbgflow-mcp http --bind <addr> --data-dir <path> [options]\n  dbgflow-mcp http --config <path>                Run local HTTP MCP transport\n  dbgflow-mcp service run --config <path>         Run as a Windows service process\n  dbgflow-mcp service install --config <path>     Install and start the Windows service\n  dbgflow-mcp service uninstall [options]         Stop, uninstall, and remove install root\n  dbgflow-mcp worker session                      Run an internal debug session worker process\n  dbgflow-mcp worker reverse-ida                  Run an internal IDA reverse worker process\n\nHTTP options:\n  --bind <addr>                                   Loopback bind address; default 127.0.0.1:7331\n  --data-dir <path>                               Required for direct HTTP mode\n  --proxy-url <url>                               Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars\n  --no-proxy                                     Clears known proxy vars for session workers"
 }
 
 pub fn service_install_help_text() -> &'static str {
@@ -434,6 +445,11 @@ pub fn apply_runtime_environment(config: &AppConfig) {
         std::env::set_var(DBGFLOW_DBGENG_DIR_ENV, dbgeng_dir);
     } else {
         std::env::remove_var(DBGFLOW_DBGENG_DIR_ENV);
+    }
+    if let Some(ida_install_dir) = &config.ida_install_dir {
+        std::env::set_var(DBGFLOW_IDA_DIR_ENV, ida_install_dir);
+    } else {
+        std::env::remove_var(DBGFLOW_IDA_DIR_ENV);
     }
 }
 
@@ -518,6 +534,7 @@ struct RawRuntimeConfig {
     server: RawServerConfig,
     debugger: Option<RawDebuggerConfig>,
     tools: Option<RawToolsConfig>,
+    reverse: Option<RawReverseConfig>,
     proxy: Option<RawProxyConfig>,
 }
 
@@ -543,6 +560,16 @@ struct RawDebuggerConfig {
 #[derive(Debug, Deserialize)]
 struct RawToolsConfig {
     ttd_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReverseConfig {
+    ida: Option<RawReverseIdaConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReverseIdaConfig {
+    install_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,6 +682,13 @@ fn parse_ttd_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(path)
+}
+
+fn parse_ida_install_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = parse_existing_dir_path(path, label)?;
+    dbgflow_reverse::ida::validate_ida_install_dir(&path)
+        .map(|install| install.install_dir)
+        .map_err(|error| error.to_string())
 }
 
 fn infer_ttd_dir_from_dbgeng_dir(dbgeng_dir: Option<&Path>) -> Option<PathBuf> {
@@ -915,10 +949,14 @@ mod tests {
         let root = unique_test_dir("runtime-config");
         let dbgeng = root.join("dbgeng");
         let ttd = root.join("ttd");
+        let ida = root.join("ida");
         std::fs::create_dir_all(&dbgeng).expect("create dbgeng dir");
         std::fs::create_dir_all(&ttd).expect("create ttd dir");
         touch(dbgeng.join("dbgeng.dll"));
         touch(ttd.join("TTD.exe"));
+        for file_name in ["ida.exe", "ida.dll", "idalib.dll", "ida.hlp"] {
+            touch(ida.join(file_name));
+        }
         let config_path = root.join("config.toml");
         write_config(
             &config_path,
@@ -942,6 +980,9 @@ symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 [tools]
 ttd_dir = "{}"
 
+[reverse.ida]
+install_dir = "{}"
+
 [proxy]
 mode = "url"
 url = "http://127.0.0.1:7897"
@@ -950,6 +991,7 @@ url = "http://127.0.0.1:7897"
                 toml_path(&root.join("var")),
                 toml_path(&dbgeng),
                 toml_path(&ttd),
+                toml_path(&ida),
             ),
         );
 
@@ -967,6 +1009,11 @@ url = "http://127.0.0.1:7897"
             Some("srv*C:\\symbols*https://msdl.microsoft.com/download/symbols")
         );
         assert_eq!(config.app.ttd_dir.as_deref(), Some(ttd.as_path()));
+        let canonical_ida = ida.canonicalize().expect("canonical ida");
+        assert_eq!(
+            config.app.ida_install_dir.as_deref(),
+            Some(canonical_ida.as_path())
+        );
     }
 
     #[test]

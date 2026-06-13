@@ -1,5 +1,5 @@
 use dbgflow_mcp::http::{run_http, HttpConfig};
-use dbgflow_mcp::mcp::server_with_data_dir_proxy_ttd_and_symbol_path;
+use dbgflow_mcp::mcp::server_with_data_dir_proxy_ttd_ida_and_symbol_path;
 use dbgflow_mcp::runtime::{
     apply_runtime_environment, help_text, parse_options, parse_service_install_options,
     parse_service_uninstall_options,
@@ -15,6 +15,7 @@ enum CommandMode {
     ServiceInstall,
     ServiceUninstall,
     WorkerSession,
+    WorkerReverseIda,
     Help,
 }
 
@@ -31,14 +32,18 @@ fn run() -> Result<(), String> {
         CommandMode::WorkerSession => {
             run_session_worker().map_err(|error| format!("session worker error: {error}"))
         }
+        CommandMode::WorkerReverseIda => {
+            run_reverse_ida_worker().map_err(|error| format!("reverse IDA worker error: {error}"))
+        }
         CommandMode::Http => {
             let config = parse_options(args.into_iter().skip(1))?;
             apply_runtime_environment(&config);
             let (_shutdown_tx, shutdown_rx) = mpsc::channel();
-            let server = server_with_data_dir_proxy_ttd_and_symbol_path(
+            let server = server_with_data_dir_proxy_ttd_ida_and_symbol_path(
                 config.data_dir,
                 config.proxy,
                 config.ttd_dir,
+                config.ida_install_dir,
                 config.symbol_path,
             )?;
             run_http(server, HttpConfig { bind: config.bind }, shutdown_rx)
@@ -81,6 +86,14 @@ where
                 .into_string()
                 .map_err(|_| "worker kind must be valid UTF-8".to_string())?;
             if kind != dbgflow_debug::session::worker::SESSION_WORKER_KIND_SESSION {
+                if kind == dbgflow_reverse::ida::worker::REVERSE_WORKER_KIND_IDA {
+                    if args.next().is_some() {
+                        return Err(
+                            "worker reverse-ida does not accept extra arguments".to_string()
+                        );
+                    }
+                    return Ok(CommandMode::WorkerReverseIda);
+                }
                 return Err(format!("unknown worker kind: {kind}"));
             }
             if args.next().is_some() {
@@ -114,6 +127,14 @@ where
 fn run_session_worker() -> io::Result<()> {
     let stdin = io::stdin();
     dbgflow_debug::session::worker::run_session_worker_stdio(
+        BufReader::new(stdin.lock()),
+        io::stdout(),
+    )
+}
+
+fn run_reverse_ida_worker() -> io::Result<()> {
+    let stdin = io::stdin();
+    dbgflow_reverse::ida::worker::run_reverse_ida_worker_stdio(
         BufReader::new(stdin.lock()),
         io::stdout(),
     )
@@ -165,6 +186,12 @@ mod tests {
     fn parses_internal_worker_session_command() {
         let args = [OsString::from("worker"), OsString::from("session")].into_iter();
         assert_eq!(parse_command_mode(args), Ok(CommandMode::WorkerSession));
+    }
+
+    #[test]
+    fn parses_internal_worker_reverse_ida_command() {
+        let args = [OsString::from("worker"), OsString::from("reverse-ida")].into_iter();
+        assert_eq!(parse_command_mode(args), Ok(CommandMode::WorkerReverseIda));
     }
 
     #[test]

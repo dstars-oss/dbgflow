@@ -48,6 +48,14 @@ impl ArtifactManager {
         self.ensure_ttd_recording_dir_unlocked(recording_id)
     }
 
+    pub fn ensure_reverse_session_dir(&self, session_id: SessionId) -> Result<PathBuf> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        self.ensure_reverse_session_dir_unlocked(session_id)
+    }
+
     pub fn initialize_session_artifacts(&self, session_id: SessionId) -> Result<PathBuf> {
         let _guard = self
             .lock
@@ -96,6 +104,19 @@ impl ArtifactManager {
         touch(&dir.join("recorder").join("stderr.txt"))?;
         touch(&dir.join("target").join("stdout.txt"))?;
         touch(&dir.join("target").join("stderr.txt"))?;
+        Ok(dir)
+    }
+
+    pub fn initialize_reverse_session_artifacts(&self, session_id: SessionId) -> Result<PathBuf> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let dir = self.ensure_reverse_session_dir_unlocked(session_id)?;
+        fs::create_dir_all(dir.join("outputs"))
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        touch(&dir.join("events.jsonl"))?;
+        touch(&dir.join("worker.log"))?;
         Ok(dir)
     }
 
@@ -237,6 +258,35 @@ impl ArtifactManager {
             .join("stop_stderr.txt")
     }
 
+    pub fn reverse_session_metadata_path(&self, session_id: SessionId) -> PathBuf {
+        self.root
+            .join("reverse_sessions")
+            .join(session_id.to_string())
+            .join("session.json")
+    }
+
+    pub fn reverse_session_request_path(&self, session_id: SessionId) -> PathBuf {
+        self.root
+            .join("reverse_sessions")
+            .join(session_id.to_string())
+            .join("request.json")
+    }
+
+    pub fn reverse_session_worker_log_path(&self, session_id: SessionId) -> PathBuf {
+        self.root
+            .join("reverse_sessions")
+            .join(session_id.to_string())
+            .join("worker.log")
+    }
+
+    pub fn reverse_session_output_path(&self, session_id: SessionId, file_name: &str) -> PathBuf {
+        self.root
+            .join("reverse_sessions")
+            .join(session_id.to_string())
+            .join("outputs")
+            .join(file_name)
+    }
+
     pub fn append_event(&self, session_id: SessionId, event: &SessionArtifactEvent) -> Result<()> {
         let _guard = self
             .lock
@@ -276,6 +326,21 @@ impl ArtifactManager {
         let line = serde_json::to_string(event)
             .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
         append_jsonl(&recording_dir.join("events.jsonl"), &line)
+    }
+
+    pub fn append_reverse_session_event(
+        &self,
+        session_id: SessionId,
+        event: &ReverseSessionArtifactEvent,
+    ) -> Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let session_dir = self.ensure_reverse_session_dir_unlocked(session_id)?;
+        let line = serde_json::to_string(event)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        append_jsonl(&session_dir.join("events.jsonl"), &line)
     }
 
     pub fn append_transcript(&self, session_id: SessionId, text: &str) -> Result<()> {
@@ -319,6 +384,15 @@ impl ArtifactManager {
             .root
             .join("ttd_recordings")
             .join(recording_id.to_string());
+        fs::create_dir_all(&dir).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(dir)
+    }
+
+    fn ensure_reverse_session_dir_unlocked(&self, session_id: SessionId) -> Result<PathBuf> {
+        let dir = self
+            .root
+            .join("reverse_sessions")
+            .join(session_id.to_string());
         fs::create_dir_all(&dir).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
         Ok(dir)
     }
@@ -401,6 +475,81 @@ impl ArtifactManager {
             path: metadata_path,
         })
     }
+
+    pub fn write_reverse_session_request(
+        &self,
+        session_id: SessionId,
+        request: &Value,
+    ) -> Result<ArtifactRef> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let session_dir = self.ensure_reverse_session_dir_unlocked(session_id)?;
+        let request_path = session_dir.join("request.json");
+        let text = serde_json::to_string_pretty(request)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        fs::write(&request_path, text)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(ArtifactRef {
+            kind: ArtifactKind::ReverseSessionRequest,
+            path: request_path,
+        })
+    }
+
+    pub fn write_reverse_session_metadata(
+        &self,
+        session_id: SessionId,
+        metadata: &Value,
+    ) -> Result<ArtifactRef> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let session_dir = self.ensure_reverse_session_dir_unlocked(session_id)?;
+        let metadata_path = session_dir.join("session.json");
+        let text = serde_json::to_string_pretty(metadata)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        fs::write(&metadata_path, text)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(ArtifactRef {
+            kind: ArtifactKind::ReverseSessionMetadata,
+            path: metadata_path,
+        })
+    }
+
+    pub fn write_reverse_session_output(
+        &self,
+        session_id: SessionId,
+        file_name: &str,
+        output: &Value,
+    ) -> Result<ArtifactRef> {
+        if file_name.is_empty()
+            || file_name
+                .chars()
+                .any(|ch| matches!(ch, '/' | '\\') || ch.is_control())
+        {
+            return Err(DbgFlowError::Artifact(
+                "reverse output artifact name is invalid".to_string(),
+            ));
+        }
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DbgFlowError::Artifact("artifact manager lock poisoned".to_string()))?;
+        let session_dir = self.ensure_reverse_session_dir_unlocked(session_id)?;
+        let outputs_dir = session_dir.join("outputs");
+        fs::create_dir_all(&outputs_dir)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        let output_path = outputs_dir.join(file_name);
+        let text = serde_json::to_string_pretty(output)
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        fs::write(&output_path, text).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(ArtifactRef {
+            kind: ArtifactKind::ReverseSessionOutput,
+            path: output_path,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +576,10 @@ pub enum ArtifactKind {
     TtdRecordingEvents,
     TtdTargetStdout,
     TtdTargetStderr,
+    ReverseSessionRequest,
+    ReverseSessionMetadata,
+    ReverseSessionEvents,
+    ReverseSessionOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +613,19 @@ pub struct TtdRecordingArtifactEvent {
     pub timestamp_unix_ms: u128,
     pub event: String,
     pub recording_id: String,
+    pub artifact_path: Option<PathBuf>,
+    pub error: Option<String>,
+    pub fields: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReverseSessionArtifactEvent {
+    pub timestamp_unix_ms: u128,
+    pub event: String,
+    pub session_id: String,
+    pub previous_state: Option<String>,
+    pub new_state: Option<String>,
+    pub operation: Option<String>,
     pub artifact_path: Option<PathBuf>,
     pub error: Option<String>,
     pub fields: Map<String, Value>,

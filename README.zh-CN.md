@@ -22,6 +22,7 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - 安装时配置 DbgEng 初始 symbol path
 - launch-only profiling，支持 native ETW collector
 - 通过 `TTD.exe` 录制 Time Travel Debugging trace，支持 launch、attach 和有界 monitor 场景
+- 不依赖 IDA SDK 构建的 IDA dynamic-binding 逆向分析 session MVP
 
 当前公开 tool 名称：
 
@@ -33,6 +34,12 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - `dbg.add_symbols`
 - `trace.record_profile`
 - `trace.record_ttd`
+- `ida.create_session`
+- `ida.get_session`
+- `ida.list_sessions`
+- `ida.close_session`
+- `ida.list_segments`
+- `ida.list_functions`
 
 `dbg.create_session` 采用 get-or-create 语义，并会快速返回 `Starting` session；后端打开 target 在后台完成。调用方可以通过 `dbg.get_session`、`dbg.list_sessions` 或 HTTP resource update stream 观察状态转为 `Ready`、`Break`、`Closed` 或 `Error`。
 `target` 现在是必填参数；MCP tool schema 不再暴露 mock target。
@@ -168,6 +175,31 @@ TTD recording 请求示例：
 }
 ```
 
+`ida.create_session` 会打开已有 IDA database，或打开 IDA loader 可识别的本地
+binary input，并返回一个长期存在的 reverse-analysis session。每个 reverse
+session 使用独立 IDA worker 子进程；worker 在运行时动态加载 `idalib.dll` 和
+`ida.dll`。编译 dbgflow 源码不需要 IDA SDK、Clang、bindgen、`idalib-rs` 或
+IDA 安装目录。当前 MVP 只读，只支持 session lifecycle、`ida.list_segments`
+和 `ida.list_functions`；不暴露任意 IDA eval、IDAPython、decompile、xref、
+names、rename、comment 或 patch。
+
+可通过 `[reverse.ida].install_dir` 配置 IDA 安装目录；未配置时，dbgflow 会优先使用
+`DBGFLOW_IDA_DIR`，再默认探测 `C:\Program Files\IDA Professional 9.3`。
+配置的目录必须包含 `ida.exe`、`ida.dll`、`idalib.dll` 和 `ida.hlp`。Reverse
+artifacts 写入 `artifacts\reverse_sessions\<session_id>`，包括 `request.json`、
+`session.json`、`events.jsonl`、`worker.log`，以及 `outputs\segments.json` /
+`outputs\functions.json`。
+
+IDA session 请求示例：
+
+```json
+{
+  "target": { "kind": "binary", "path": "C:\\samples\\a.exe" },
+  "run_auto_analysis": true,
+  "startup_timeout_ms": 60000
+}
+```
+
 `dbg.eval` 保持同步返回，但不再对外暴露单条命令 timeout 设置。命令运行期间，session 会暴露 `current_operation`，并在 `last_operation` 中记录状态、耗时、artifact、错误和输出大小。如果 DbgEng 报告目标正在运行，session state 会变为 `Running`；下一次 debug event 返回后恢复为 `Break`，如果 backend 报告 no debuggee 则变为 `Closed`。调用方可以通过 `dbg.get_session`、`resources/read` 或 HTTP resource update stream 观察进度。旧请求中的 timeout 字段仍兼容接收，但会被忽略并写入 warning 日志。若正在执行命令时调用 `dbg.close_session`，服务会先请求 backend cancellation，再关闭 session。
 如果 worker 卡住，主进程可以终止该 session 对应的 worker 子进程，不会拖垮其他 session 或 MCP server。
 
@@ -198,6 +230,9 @@ symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 [tools]
 # 当 debugger.dbgeng_dir\ttd 包含 TTD.exe 时可省略。
 ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
+
+[reverse.ida]
+install_dir = "C:\\Program Files\\IDA Professional 9.3"
 
 [proxy]
 mode = "url"

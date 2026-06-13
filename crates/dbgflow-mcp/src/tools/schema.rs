@@ -1,6 +1,7 @@
 use super::registry::{
-    ToolDescriptor, ADD_SYMBOLS, CLOSE_SESSION, CREATE_SESSION, EVAL, GET_SESSION, LIST_SESSIONS,
-    RECORD_PROFILE, RECORD_TTD,
+    ToolDescriptor, ADD_SYMBOLS, CLOSE_SESSION, CREATE_SESSION, EVAL, GET_SESSION,
+    IDA_CLOSE_SESSION, IDA_CREATE_SESSION, IDA_GET_SESSION, IDA_LIST_FUNCTIONS, IDA_LIST_SEGMENTS,
+    IDA_LIST_SESSIONS, LIST_SESSIONS, RECORD_PROFILE, RECORD_TTD,
 };
 use serde_json::json;
 
@@ -311,6 +312,126 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
                         }
                     },
                     "required": ["target", "timeout_ms"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_CREATE_SESSION,
+                description:
+                    "Open an IDA database or binary input in a long-lived reverse-analysis session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "object",
+                            "description": "IDA target.",
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "binary" },
+                                        "path": {
+                                            "type": "string",
+                                            "description": "Path to a local PE, ELF, or other IDA loader-recognized input file."
+                                        }
+                                    },
+                                    "required": ["kind", "path"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "const": "database" },
+                                        "path": {
+                                            "type": "string",
+                                            "description": "Path to a local .idb or .i64 database."
+                                        }
+                                    },
+                                    "required": ["kind", "path"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        },
+                        "run_auto_analysis": {
+                            "type": "boolean",
+                            "description": "Whether IDA should run auto-analysis while opening the database. Defaults to true."
+                        },
+                        "startup_timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum time to wait for the IDA worker to open the target. Defaults to 60000."
+                        }
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_GET_SESSION,
+                description: "Get the current state of an IDA reverse-analysis session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by ida.create_session."
+                        }
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_SESSIONS,
+                description: "List IDA reverse-analysis sessions.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_CLOSE_SESSION,
+                description: "Close an IDA reverse-analysis session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by ida.create_session."
+                        }
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_SEGMENTS,
+                description: "List segments from an open IDA session without resolving names.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by ida.create_session."
+                        }
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_FUNCTIONS,
+                description: "List functions from an open IDA session without resolving names.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session id returned by ida.create_session."
+                        }
+                    },
+                    "required": ["session_id"],
                     "additionalProperties": false
                 }),
             },
