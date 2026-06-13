@@ -24,21 +24,13 @@ pub struct ProfileManager {
 
 impl ProfileManager {
     pub fn new(artifact_root: impl Into<PathBuf>) -> Self {
-        Self::with_runtime(artifact_root, super::ProcmonRuntime::unavailable())
+        Self::with_logger(artifact_root, noop_logger())
     }
 
-    pub fn with_runtime(artifact_root: impl Into<PathBuf>, procmon: super::ProcmonRuntime) -> Self {
-        Self::with_runtime_and_logger(artifact_root, procmon, noop_logger())
-    }
-
-    pub fn with_runtime_and_logger(
-        artifact_root: impl Into<PathBuf>,
-        procmon: super::ProcmonRuntime,
-        logger: Arc<dyn LogSink>,
-    ) -> Self {
+    pub fn with_logger(artifact_root: impl Into<PathBuf>, logger: Arc<dyn LogSink>) -> Self {
         Self::with_components_and_logger(
             artifact_root,
-            Arc::new(super::DefaultProfileCollectorFactory::new(procmon)),
+            Arc::new(super::DefaultProfileCollectorFactory::new()),
             Arc::new(ProcessTargetRunner),
             logger,
         )

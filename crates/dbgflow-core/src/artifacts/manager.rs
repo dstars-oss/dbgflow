@@ -553,7 +553,7 @@ mod tests {
         let profile_id = ProfileId::new();
 
         let dir = artifacts
-            .profile_collector_dir(profile_id, "procmon")
+            .profile_collector_dir(profile_id, "native_etw")
             .expect("collector dir");
 
         assert_eq!(
@@ -561,12 +561,12 @@ mod tests {
             root.join("profiles")
                 .join(profile_id.to_string())
                 .join("collectors")
-                .join("procmon")
+                .join("native_etw")
         );
         assert!(dir.is_dir());
         assert_eq!(
-            artifacts.profile_collector_artifact_path(profile_id, "procmon", "capture.pml"),
-            dir.join("capture.pml")
+            artifacts.profile_collector_artifact_path(profile_id, "native_etw", "trace.etl"),
+            dir.join("trace.etl")
         );
     }
 

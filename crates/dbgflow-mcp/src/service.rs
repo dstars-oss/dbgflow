@@ -1,6 +1,6 @@
 use crate::http::{run_http, HttpConfig};
 use crate::logging::FileLogSink;
-use crate::mcp::server_with_data_dir_proxy_sysinternals_ttd_symbol_path_and_logger;
+use crate::mcp::server_with_data_dir_proxy_ttd_symbol_path_and_logger;
 use crate::runtime::{
     apply_runtime_environment, parse_installed_service_command,
     service_process_options_from_command_line, validate_install_root_removal, RuntimeConfig,
@@ -75,14 +75,6 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
             .field("data_dir", config.app.data_dir.display().to_string())
             .field("proxy_source", format!("{:?}", config.app.proxy.source()))
             .field(
-                "sysinternals_dir",
-                config
-                    .app
-                    .sysinternals_dir
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-            )
-            .field(
                 "ttd_dir",
                 config
                     .app
@@ -121,10 +113,9 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
     )?;
 
     let result = run_http(
-        server_with_data_dir_proxy_sysinternals_ttd_symbol_path_and_logger(
+        server_with_data_dir_proxy_ttd_symbol_path_and_logger(
             data_dir,
             config.app.proxy.clone(),
-            config.app.sysinternals_dir.clone(),
             config.app.ttd_dir.clone(),
             config.app.symbol_path.clone(),
             logger.clone(),

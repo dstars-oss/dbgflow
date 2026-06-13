@@ -9,7 +9,6 @@ param(
     [string]$ProxyUrl,
     [string]$DbgEngDir,
     [string]$SymbolPath,
-    [string]$SysinternalsDir,
     [string]$TtdDir,
     [switch]$NoProxy,
     [switch]$NonInteractive
@@ -95,13 +94,6 @@ function Test-DbgEngDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     return (Test-Path -LiteralPath (Join-Path $Path "dbgeng.dll") -PathType Leaf)
-}
-
-function Test-SysinternalsDirectory {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    return (Test-Path -LiteralPath (Join-Path $Path "Procmon64.exe") -PathType Leaf) -or
-        (Test-Path -LiteralPath (Join-Path $Path "Procmon.exe") -PathType Leaf)
 }
 
 function Test-TtdDirectory {
@@ -223,61 +215,6 @@ function Find-DbgEngDir {
         return (Get-FullPath -Path $system32)
     }
 
-    return $null
-}
-
-function Resolve-SysinternalsFromDependencyRoot {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    if (Test-SysinternalsDirectory -Path $Path) {
-        return (Get-FullPath -Path $Path)
-    }
-    foreach ($child in @("SysinternalsSuite", "Sysinternals")) {
-        $candidate = Join-Path $Path $child
-        if (Test-SysinternalsDirectory -Path $candidate) {
-            return (Get-FullPath -Path $candidate)
-        }
-    }
-    return $null
-}
-
-function Find-SysinternalsDir {
-    $candidates = New-Object System.Collections.Generic.List[string]
-    foreach ($key in @("DBGFLOW_SYSINTERNALS_DIR", "SysinternalsDir")) {
-        $value = [System.Environment]::GetEnvironmentVariable($key)
-        if ($value) {
-            $candidates.Add($value)
-        }
-    }
-    if ($env:PATH) {
-        foreach ($entry in $env:PATH.Split([System.IO.Path]::PathSeparator)) {
-            if ($entry) {
-                $candidates.Add($entry)
-            }
-        }
-    }
-    if ($env:USERPROFILE) {
-        $candidates.Add((Join-Path $env:USERPROFILE "Bin"))
-    }
-    $candidates.Add((Join-Path $RepoRoot "Sysinternals"))
-    $parent = Split-Path -Parent $RepoRoot
-    if ($parent) {
-        $candidates.Add((Join-Path $parent "Sysinternals"))
-    }
-    $candidates.Add("C:\Tools\Sysinternals")
-    $candidates.Add("C:\Sysinternals")
-    $candidates.Add("C:\Program Files\Sysinternals")
-
-    $seen = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($candidate in $candidates) {
-        if (-not $seen.Add($candidate)) {
-            continue
-        }
-        $resolved = Resolve-SysinternalsFromDependencyRoot -Path $candidate
-        if ($resolved) {
-            return $resolved
-        }
-    }
     return $null
 }
 
@@ -404,7 +341,6 @@ function Write-DbgFlowConfig {
         [Parameter(Mandatory = $true)][string]$DataDir,
         [string]$ResolvedDbgEngDir,
         [string]$ResolvedSymbolPath,
-        [string]$ResolvedSysinternalsDir,
         [string]$ResolvedTtdDir,
         [Parameter(Mandatory = $true)]$ProxyConfig
     )
@@ -431,15 +367,10 @@ function Write-DbgFlowConfig {
             $lines.Add("symbol_path = $(ConvertTo-TomlString $ResolvedSymbolPath)")
         }
     }
-    if ($ResolvedSysinternalsDir -or $ResolvedTtdDir) {
+    if ($ResolvedTtdDir) {
         $lines.Add("")
         $lines.Add("[tools]")
-        if ($ResolvedSysinternalsDir) {
-            $lines.Add("sysinternals_dir = $(ConvertTo-TomlString $ResolvedSysinternalsDir)")
-        }
-        if ($ResolvedTtdDir) {
-            $lines.Add("ttd_dir = $(ConvertTo-TomlString $ResolvedTtdDir)")
-        }
+        $lines.Add("ttd_dir = $(ConvertTo-TomlString $ResolvedTtdDir)")
     }
 
     $lines.Add("")
@@ -519,16 +450,6 @@ try {
         $resolvedDbgEngDir = Find-DbgEngDir -StoreArch $arch.StoreArch -SdkArch $arch.SdkArch
     }
 
-    $resolvedSysinternalsDir = $SysinternalsDir
-    if ($resolvedSysinternalsDir) {
-        $resolvedSysinternalsDir = Get-FullPath -Path $resolvedSysinternalsDir
-        if (-not (Test-SysinternalsDirectory -Path $resolvedSysinternalsDir)) {
-            throw "Sysinternals directory must contain Procmon64.exe or Procmon.exe: $resolvedSysinternalsDir"
-        }
-    } else {
-        $resolvedSysinternalsDir = Find-SysinternalsDir
-    }
-
     $resolvedTtdDir = $TtdDir
     if ($resolvedTtdDir) {
         $resolvedTtdDir = Get-FullPath -Path $resolvedTtdDir
@@ -552,7 +473,6 @@ try {
     Write-Host "Data dir: $DataDir"
     Write-Host "DbgEng dir: $(if ($resolvedDbgEngDir) { $resolvedDbgEngDir } else { 'not configured' })"
     Write-Host "Symbol path: $(if ($resolvedSymbolPath) { 'configured' } else { 'not configured' })"
-    Write-Host "Sysinternals dir: $(if ($resolvedSysinternalsDir) { $resolvedSysinternalsDir } else { 'not configured' })"
     Write-Host "TTD dir: $(if ($resolvedTtdDir) { $resolvedTtdDir } else { 'not configured' })"
     Write-Host "Proxy mode: $($proxyConfig.Mode)"
     if ($proxyConfig.Url) {
@@ -570,7 +490,7 @@ try {
         }
     }
 
-    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedSysinternalsDir $resolvedSysinternalsDir -ResolvedTtdDir $resolvedTtdDir -ProxyConfig $proxyConfig
+    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedTtdDir $resolvedTtdDir -ProxyConfig $proxyConfig
 
     & $Exe service install --config $ConfigPath
     exit $LASTEXITCODE

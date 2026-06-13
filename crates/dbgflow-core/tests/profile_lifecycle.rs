@@ -97,26 +97,6 @@ fn default_run_profile_collectors_is_native_etw_process_and_file_io() {
 }
 
 #[test]
-fn procmon_collector_config_defaults_to_no_stacks_and_empty_filters() {
-    let config = ProfileCollectorConfig::Procmon {
-        capture_stacks: false,
-        filters: Default::default(),
-    };
-
-    assert_eq!(config.kind(), ProfileCollectorKind::Procmon);
-    let ProfileCollectorConfig::Procmon {
-        capture_stacks,
-        filters,
-    } = config
-    else {
-        panic!("expected procmon config");
-    };
-    assert!(!capture_stacks);
-    assert!(filters.operations.is_empty());
-    assert!(filters.paths.is_empty());
-}
-
-#[test]
 fn fake_collector_records_start_and_stop_calls() {
     let state = Arc::new(Mutex::new(Vec::new()));
     let collector = TestCollector {
@@ -436,138 +416,6 @@ fn run_profile_collector_start_failure_does_not_launch_target() {
 }
 
 #[test]
-fn run_profile_procmon_without_sysinternals_dir_does_not_launch_target() {
-    let root = test_profile_root("procmon-unavailable");
-    let manager = ProfileManager::with_components(
-        &root,
-        Arc::new(dbgflow_core::profile::DefaultProfileCollectorFactory::new(
-            dbgflow_core::profile::ProcmonRuntime::unavailable(),
-        )),
-        Arc::new(PanicTargetRunner),
-    );
-
-    let error = manager
-        .run_profile(RunProfile {
-            target: ProfileTarget::Launch {
-                executable: std::env::current_exe().expect("current exe"),
-                args: Vec::new(),
-            },
-            timeout_ms: 1,
-            collectors: vec![ProfileCollectorConfig::Procmon {
-                capture_stacks: false,
-                filters: Default::default(),
-            }],
-        })
-        .expect_err("procmon unavailable");
-
-    assert!(error.to_string().contains("Sysinternals directory"));
-    let metadata = only_profile_metadata(&root);
-    assert!(metadata.contains("\"status\": \"failed\""));
-    assert!(metadata.contains("\"completion_reason\": \"collector_error\""));
-    assert!(metadata.contains("Sysinternals directory"));
-}
-
-#[test]
-fn run_profile_starts_and_stops_collectors_in_reverse_stop_order() {
-    let root = test_profile_root("multi-collector");
-    let collector_state = Arc::new(Mutex::new(Vec::new()));
-    let manager = ProfileManager::with_components(
-        &root,
-        Arc::new(TestCollectorFactory {
-            state: collector_state.clone(),
-            fail_start: false,
-            fail_stop: false,
-            fail_start_for: None,
-            fail_stop_for: None,
-        }),
-        Arc::new(TestTargetRunner {
-            exit: TargetExit::Exited {
-                pid: 1234,
-                exit_code: Some(0),
-            },
-        }),
-    );
-
-    let result = manager
-        .run_profile(RunProfile {
-            target: ProfileTarget::Launch {
-                executable: std::env::current_exe().expect("current exe"),
-                args: Vec::new(),
-            },
-            timeout_ms: 1000,
-            collectors: vec![
-                native_etw_config(),
-                ProfileCollectorConfig::Procmon {
-                    capture_stacks: true,
-                    filters: Default::default(),
-                },
-            ],
-        })
-        .expect("run profile");
-
-    assert_eq!(result.status, ProfileStatus::Completed);
-    assert_eq!(result.collector_results.len(), 2);
-    assert_eq!(
-        collector_state.lock().expect("state").as_slice(),
-        &[
-            "start:native_etw".to_string(),
-            "start:procmon".to_string(),
-            "target_started:native_etw:1234".to_string(),
-            "target_started:procmon:1234".to_string(),
-            "stop:procmon".to_string(),
-            "stop:native_etw".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn run_profile_start_failure_stops_already_started_collectors() {
-    let root = test_profile_root("multi-start-failure");
-    let collector_state = Arc::new(Mutex::new(Vec::new()));
-    let manager = ProfileManager::with_components(
-        &root,
-        Arc::new(TestCollectorFactory {
-            state: collector_state.clone(),
-            fail_start: false,
-            fail_stop: false,
-            fail_start_for: Some("procmon".to_string()),
-            fail_stop_for: None,
-        }),
-        Arc::new(PanicTargetRunner),
-    );
-
-    let error = manager
-        .run_profile(RunProfile {
-            target: ProfileTarget::Launch {
-                executable: std::env::current_exe().expect("current exe"),
-                args: Vec::new(),
-            },
-            timeout_ms: 1000,
-            collectors: vec![
-                native_etw_config(),
-                ProfileCollectorConfig::Procmon {
-                    capture_stacks: false,
-                    filters: Default::default(),
-                },
-            ],
-        })
-        .expect_err("collector start fails");
-
-    assert!(error
-        .to_string()
-        .contains("collector start failed: procmon"));
-    assert_eq!(
-        collector_state.lock().expect("state").as_slice(),
-        &[
-            "start:native_etw".to_string(),
-            "start:procmon".to_string(),
-            "cleanup:procmon".to_string(),
-            "stop:native_etw".to_string(),
-        ]
-    );
-}
-
-#[test]
 fn run_profile_start_failure_cleans_up_failing_collector() {
     let root = test_profile_root("start-failure-cleanup");
     let collector_state = Arc::new(Mutex::new(Vec::new()));
@@ -692,10 +540,7 @@ impl CollectorFactory for TestCollectorFactory {
     ) -> Result<Box<dyn ProfileCollector>> {
         let name = _config.artifact_name().to_string();
         let kind = _config.kind();
-        let artifact_path = match kind {
-            ProfileCollectorKind::NativeEtw => Some(_output_dir.join("trace.etl")),
-            ProfileCollectorKind::Procmon => Some(_output_dir.join("capture.pml")),
-        };
+        let artifact_path = Some(_output_dir.join("trace.etl"));
         let fail_start = self.fail_start || self.fail_start_for.as_deref() == Some(name.as_str());
         let fail_stop = self.fail_stop || self.fail_stop_for.as_deref() == Some(name.as_str());
         Ok(Box::new(TestCollector {

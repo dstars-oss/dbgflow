@@ -221,7 +221,7 @@ impl ToolService {
             ToolDescriptor {
                 name: RECORD_PROFILE,
                 description:
-                    "Launch a process and record a native ETW profile trace as a standard ETL artifact. Procmon collectors use the server runtime's configured Sysinternals directory.",
+                    "Launch a process and record a native ETW profile trace as a standard ETL artifact.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -251,59 +251,32 @@ impl ToolService {
                             "type": "array",
                             "minItems": 1,
                             "items": {
-                                "oneOf": [
-                                    {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "type": "string", "const": "native_etw" },
+                                    "scope": {
                                         "type": "object",
                                         "properties": {
-                                            "kind": { "type": "string", "const": "native_etw" },
-                                            "scope": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "kind": { "type": "string", "const": "target_process" }
-                                                },
-                                                "required": ["kind"],
-                                                "additionalProperties": false
-                                            },
-                                            "event_sets": {
-                                                "type": "array",
-                                                "items": { "type": "string", "enum": ["process", "file_io"] },
-                                                "minItems": 1
-                                            },
-                                            "stacks": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "enabled": { "type": "boolean" }
-                                                },
-                                                "additionalProperties": false
-                                            }
-                                        },
-                                        "required": ["kind", "scope", "event_sets"],
-                                        "additionalProperties": false
-                                    },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "kind": { "type": "string", "const": "procmon" },
-                                            "capture_stacks": { "type": "boolean" },
-                                            "filters": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "operations": {
-                                                        "type": "array",
-                                                        "items": { "type": "string" }
-                                                    },
-                                                    "paths": {
-                                                        "type": "array",
-                                                        "items": { "type": "string" }
-                                                    }
-                                                },
-                                                "additionalProperties": false
-                                            }
+                                            "kind": { "type": "string", "const": "target_process" }
                                         },
                                         "required": ["kind"],
                                         "additionalProperties": false
+                                    },
+                                    "event_sets": {
+                                        "type": "array",
+                                        "items": { "type": "string", "enum": ["process", "file_io"] },
+                                        "minItems": 1
+                                    },
+                                    "stacks": {
+                                        "type": "object",
+                                        "properties": {
+                                            "enabled": { "type": "boolean" }
+                                        },
+                                        "additionalProperties": false
                                     }
-                                ]
+                                },
+                                "required": ["kind", "scope", "event_sets"],
+                                "additionalProperties": false
                             },
                             "description": "Collectors to run around the same launched target. Omit to use native_etw target_process process and file_io with stacks enabled."
                         }
@@ -737,8 +710,12 @@ mod tests {
 
         assert!(record_profile.description.contains("profile"));
         assert_eq!(record_profile.input_schema["type"], "object");
-        let event_set_enum = record_profile.input_schema["properties"]["collectors"]["items"]
-            ["oneOf"][0]["properties"]["event_sets"]["items"]["enum"]
+        let collector_schema = &record_profile.input_schema["properties"]["collectors"]["items"];
+        assert_eq!(
+            collector_schema["properties"]["kind"]["const"],
+            Value::String("native_etw".to_string())
+        );
+        let event_set_enum = collector_schema["properties"]["event_sets"]["items"]["enum"]
             .as_array()
             .expect("event set enum");
         assert!(event_set_enum.contains(&Value::String("process".to_string())));
@@ -917,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn run_profile_arguments_decode_procmon_collectors_array() {
+    fn run_profile_arguments_reject_procmon_collector() {
         let value = json!({
             "target": {
                 "kind": "launch",
@@ -925,11 +902,6 @@ mod tests {
             },
             "timeout_ms": 1000,
             "collectors": [
-                {
-                    "kind": "native_etw",
-                    "scope": { "kind": "target_process" },
-                    "event_sets": ["process"]
-                },
                 {
                     "kind": "procmon",
                     "capture_stacks": true,
@@ -941,12 +913,9 @@ mod tests {
             ]
         });
 
-        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
-        assert_eq!(request.collectors.len(), 2);
-        assert!(matches!(
-            request.collectors[1],
-            ProfileCollectorConfig::Procmon { .. }
-        ));
+        let error =
+            decode_arguments::<RunProfileRequest>(value).expect_err("reject procmon collector");
+        assert!(error.to_string().contains("procmon"));
     }
 
     #[test]
@@ -964,47 +933,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("collectors must contain at least one collector"));
-    }
-
-    #[test]
-    fn run_profile_arguments_reject_top_level_sysinternals_dir() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "sysinternals_dir": "C:\\Sysinternals"
-        });
-
-        let error = decode_arguments::<RunProfileRequest>(value)
-            .expect_err("reject top-level sysinternals_dir");
-
-        assert!(error.to_string().contains("unknown field"));
-        assert!(error.to_string().contains("sysinternals_dir"));
-    }
-
-    #[test]
-    fn run_profile_arguments_reject_procmon_sysinternals_dir() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "collectors": [
-                {
-                    "kind": "procmon",
-                    "sysinternals_dir": "C:\\Sysinternals"
-                }
-            ]
-        });
-
-        let error = decode_arguments::<RunProfileRequest>(value)
-            .expect_err("reject procmon sysinternals_dir");
-
-        assert!(error.to_string().contains("unknown field"));
-        assert!(error.to_string().contains("sysinternals_dir"));
     }
 
     #[test]

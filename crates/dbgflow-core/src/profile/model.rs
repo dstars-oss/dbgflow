@@ -40,26 +40,18 @@ pub enum ProfileCollectorConfig {
         #[serde(default)]
         stacks: EtwStackConfig,
     },
-    Procmon {
-        #[serde(default)]
-        capture_stacks: bool,
-        #[serde(default)]
-        filters: ProcmonFilterConfig,
-    },
 }
 
 impl ProfileCollectorConfig {
     pub fn kind(&self) -> ProfileCollectorKind {
         match self {
             Self::NativeEtw { .. } => ProfileCollectorKind::NativeEtw,
-            Self::Procmon { .. } => ProfileCollectorKind::Procmon,
         }
     }
 
     pub fn artifact_name(&self) -> &'static str {
         match self {
             Self::NativeEtw { .. } => "native_etw",
-            Self::Procmon { .. } => "procmon",
         }
     }
 }
@@ -99,20 +91,10 @@ impl Default for EtwStackConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProcmonFilterConfig {
-    #[serde(default)]
-    pub operations: Vec<String>,
-    #[serde(default)]
-    pub paths: Vec<PathBuf>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileCollectorKind {
     NativeEtw,
-    Procmon,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

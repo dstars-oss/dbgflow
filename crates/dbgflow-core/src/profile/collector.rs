@@ -20,13 +20,11 @@ pub trait CollectorFactory: Send + Sync {
     ) -> Result<Box<dyn ProfileCollector>>;
 }
 
-pub struct DefaultProfileCollectorFactory {
-    procmon: super::ProcmonRuntime,
-}
+pub struct DefaultProfileCollectorFactory;
 
 impl DefaultProfileCollectorFactory {
-    pub fn new(procmon: super::ProcmonRuntime) -> Self {
-        Self { procmon }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -39,10 +37,6 @@ impl CollectorFactory for DefaultProfileCollectorFactory {
         match config {
             ProfileCollectorConfig::NativeEtw { .. } => {
                 super::native_etw::NativeEtwCollectorFactory.create(config, output_dir)
-            }
-            ProfileCollectorConfig::Procmon { .. } => {
-                super::procmon::ProcmonCollectorFactory::new(self.procmon.clone())
-                    .create(config, output_dir)
             }
         }
     }

@@ -28,7 +28,6 @@ pub struct AppConfig {
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
     pub proxy: ProxyEnvironment,
-    pub sysinternals_dir: Option<PathBuf>,
     pub ttd_dir: Option<PathBuf>,
     pub dbgeng_dir: Option<PathBuf>,
     pub symbol_path: Option<String>,
@@ -100,11 +99,6 @@ impl RuntimeConfig {
             .map(|symbol_path| parse_symbol_path(&symbol_path, "debugger.symbol_path"))
             .transpose()?;
         let tools = raw.tools;
-        let sysinternals_dir = tools
-            .as_ref()
-            .and_then(|tools| tools.sysinternals_dir.as_ref())
-            .map(|path| parse_sysinternals_dir_path(path, "tools.sysinternals_dir"))
-            .transpose()?;
         let ttd_dir = tools
             .as_ref()
             .and_then(|tools| tools.ttd_dir.as_ref())
@@ -124,7 +118,6 @@ impl RuntimeConfig {
                 bind,
                 data_dir,
                 proxy,
-                sysinternals_dir,
                 ttd_dir,
                 dbgeng_dir,
                 symbol_path,
@@ -448,7 +441,6 @@ struct RawDebuggerConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawToolsConfig {
-    sysinternals_dir: Option<PathBuf>,
     ttd_dir: Option<PathBuf>,
 }
 
@@ -553,17 +545,6 @@ fn parse_dbgeng_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn parse_sysinternals_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
-    let path = parse_existing_dir_path(path, label)?;
-    if !is_sysinternals_dir(&path) {
-        return Err(format!(
-            "{label} must point to a directory containing Procmon64.exe or Procmon.exe: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
 fn parse_ttd_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> {
     let path = parse_existing_dir_path(path, label)?;
     if !path.join("TTD.exe").is_file() {
@@ -603,10 +584,6 @@ fn parse_existing_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> 
         ));
     }
     Ok(path)
-}
-
-fn is_sysinternals_dir(path: &Path) -> bool {
-    path.join("Procmon64.exe").is_file() || path.join("Procmon.exe").is_file()
 }
 
 fn proxy_from_config(config: Option<RawProxyConfig>) -> Result<ProxyEnvironment, String> {
@@ -836,13 +813,10 @@ mod tests {
     fn parses_runtime_config() {
         let root = unique_test_dir("runtime-config");
         let dbgeng = root.join("dbgeng");
-        let sysinternals = root.join("sysinternals");
         let ttd = root.join("ttd");
         std::fs::create_dir_all(&dbgeng).expect("create dbgeng dir");
-        std::fs::create_dir_all(&sysinternals).expect("create sysinternals dir");
         std::fs::create_dir_all(&ttd).expect("create ttd dir");
         touch(dbgeng.join("dbgeng.dll"));
-        touch(sysinternals.join("Procmon64.exe"));
         touch(ttd.join("TTD.exe"));
         let config_path = root.join("config.toml");
         write_config(
@@ -865,7 +839,6 @@ dbgeng_dir = "{}"
 symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 
 [tools]
-sysinternals_dir = "{}"
 ttd_dir = "{}"
 
 [proxy]
@@ -875,7 +848,6 @@ url = "http://127.0.0.1:7897"
                 toml_path(&root),
                 toml_path(&root.join("var")),
                 toml_path(&dbgeng),
-                toml_path(&sysinternals),
                 toml_path(&ttd),
             ),
         );

@@ -17,12 +17,7 @@ fn native_etw_settings(config: &ProfileCollectorConfig) -> Result<NativeEtwSetti
         scope,
         event_sets,
         stacks,
-    } = config
-    else {
-        return Err(DbgFlowError::Backend(
-            "unsupported native ETW profile collector configuration".to_string(),
-        ));
-    };
+    } = config;
     if scope != &EtwProfileScope::TargetProcess {
         return Err(DbgFlowError::Backend(
             "native ETW scope must be target_process".to_string(),

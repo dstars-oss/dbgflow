@@ -22,7 +22,7 @@ endpoint, and Windows service install / uninstall subcommands:
 - native Windows service install / uninstall subcommands
 - main-service proxy configuration for session workers and SymSrv symbol downloads
 - install-time DbgEng symbol path configuration
-- launch-only profiling with native ETW and optional Sysinternals Procmon collectors
+- launch-only profiling with native ETW collectors
 - Time Travel Debugging recording with `TTD.exe` for launch, attach, and bounded monitor scenarios
 
 Current tool names:
@@ -81,17 +81,19 @@ The runtime config can also provide an initial DbgEng symbol path. dbgflow
 applies this through the DbgEng symbols API before opening the target; it is not
 implemented by relying on worker environment variables.
 
-`trace.record_profile` launches a local executable and records one or more profiling
-collectors around the same target lifetime. The default collector is
+`trace.record_profile` launches a local executable and records a native ETW
+collector around the same target lifetime. The default collector is
 `native_etw` with `scope.kind=target_process`,
 `event_sets=["process", "file_io"]`, and stack capture enabled. It
 writes a standard `.etl` trace plus target-PID-filtered
 `process.jsonl`, `file_io.jsonl`, and `summary.json` artifacts. The
-tool also accepts `collectors[]` for parallel collection. Collection stops when
-the target exits or when `timeout_ms` expires. Timeout stops collection but does
-not terminate the target process by default. Profile metadata, audit lifecycle
-events, collector artifacts, and captured target stdout/stderr are written under
-`artifacts\profiles\<profile_id>`.
+tool also accepts `collectors[]`, but it currently only accepts `native_etw`;
+the shape is reserved for future internal collectors such as hook-based
+collection. dbgflow no longer includes Procmon/Sysinternals external tool
+collectors. Collection stops when the target exits or when `timeout_ms`
+expires. Timeout stops collection but does not terminate the target process by
+default. Profile metadata, audit lifecycle events, collector artifacts, and
+captured target stdout/stderr are written under `artifacts\profiles\<profile_id>`.
 
 Native ETW `process` captures process start/end, thread start/end, and
 image load/unload kernel events. The raw `trace.etl` may still contain
@@ -125,7 +127,7 @@ Example profile request:
 }
 ```
 
-Parallel collectors example:
+Explicit collector example:
 
 ```json
 {
@@ -141,32 +143,10 @@ Parallel collectors example:
       "scope": { "kind": "target_process" },
       "event_sets": ["process", "file_io"],
       "stacks": { "enabled": true }
-    },
-    {
-      "kind": "procmon",
-      "capture_stacks": true,
-      "filters": {
-        "operations": ["CreateFile", "ReadFile", "WriteFile"],
-        "paths": ["C:\\data\\large_input.bin"]
-      }
     }
   ]
 }
 ```
-
-The `procmon` collector is optional and depends on Sysinternals Process Monitor.
-Configure `[tools].sysinternals_dir` in `config.toml`; dbgflow derives
-`Procmon64.exe` or `Procmon.exe` from that directory. If it is not configured,
-Sysinternals-dependent features return a clear error and the target is not
-launched. `trace.record_profile` requests do not accept a Sysinternals path; this is
-server runtime configuration. dbgflow does not download Procmon, does not scan
-the whole machine, and does not accept a standalone Procmon executable path.
-Procmon writes `capture.pml` as the authoritative artifact and exports
-`events.csv` plus a best-effort target PID / operation / path filtered
-`events.jsonl`; when stack capture is requested, dbgflow also requests an XML
-export with stack data. Procmon remains the higher-fidelity collector for file
-and registry evidence when the native ETW `file_io` event set is not detailed
-enough.
 
 `trace.record_ttd` records Microsoft Time Travel Debugging traces by running
 `TTD.exe` with typed launch, attach, or monitor targets. Configure
@@ -235,7 +215,6 @@ dbgeng_dir = "C:\\Program Files\\WindowsApps\\Microsoft.WinDbg_...\\amd64"
 symbol_path = "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"
 
 [tools]
-sysinternals_dir = "C:\\Users\\dstars\\Bin\\SysinternalsSuite"
 # Optional when debugger.dbgeng_dir\ttd contains TTD.exe.
 ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
 
@@ -298,14 +277,12 @@ installs it as LocalSystem with `service run --config <path>`, starts the
 service, and checks `/healthz`.
 
 The install script detects DbgEng from Microsoft Store WinDbg packages first,
-then Windows Kits / WDK Debuggers, then System32. Sysinternals is optional; if
-no Sysinternals directory is configured, the service still installs and runs,
-but Procmon-based profiling is unavailable. TTD is also optional; the script
+then Windows Kits / WDK Debuggers, then System32. TTD is optional; the script
 first derives it from the resolved DbgEng directory as `<dbgeng_dir>\ttd`, then
 falls back to standalone TTD discovery and `PATH`. Use `-TtdDir <path>` to
-override that location. Use `-ProxyUrl <url>`, `-NoProxy`, or existing proxy environment
-variables to control the generated `[proxy]` section. Use `-SymbolPath <path>`
-to write `[debugger].symbol_path`; if omitted, the install script persists
+override that location. Use `-ProxyUrl <url>`, `-NoProxy`, or existing proxy
+environment variables to control the generated `[proxy]` section. Use
+`-SymbolPath <path>` to write `[debugger].symbol_path`; if omitted, the install script persists
 `_NT_ALT_SYMBOL_PATH` and `_NT_SYMBOL_PATH` from the current environment when
 present, and otherwise leaves the field unset. It does not default to
 Microsoft's public symbol server. Use `-NonInteractive` to write the
