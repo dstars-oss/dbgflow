@@ -53,13 +53,13 @@ dbg.close_session
 
 `dbg.create_session` 采用 get-or-create 语义：同一 target 已存在 active session 时返回现有详情，否则创建新 session 并返回相同详情结构。
 
-后续 tool 应优先表达调试目标、会话控制或受控配置动作，例如：
+除 session 生命周期和受控配置动作外，调试分析优先通过 WinDbg / DbgEng
+原生命令完成，不为常见 WinDbg 命令重复设计 typed wrapper。新增 tool 应聚焦
+dbgflow 自身必须管理的边界，例如 session、target、artifact、配置或跨后端编排。
+例如：
 
 ```text
-open_dump
 dbg.add_symbols
-continue_until_event
-break_execution
 ```
 
 文本命令接口用于可信本机调试，例如：
@@ -68,7 +68,9 @@ break_execution
 dbg.eval
 ```
 
-`dbg.eval` 透传原生 debugger command，除空命令外不做 denylist 过滤；调用方必须把它视为可信本机能力。
+`dbg.eval` 是调试主入口，透传原生 debugger command，除空命令外不做 denylist
+过滤；调用方必须把它视为可信本机能力。agent 应优先使用 WinDbg / DbgEng
+原生命令和语法，而不是期待 dbgflow 为每条调试命令提供单独 tool。
 
 工具返回应包含 session 状态、结果、warnings 和 artifact 引用。`dbg.eval` 可以返回调试器原始输出，但必须同时写入 artifact 并记录审计信息。
 
@@ -97,7 +99,10 @@ Closed
 Error
 ```
 
-运行控制类操作应单独建模，例如 `continue_until_event` 和 `break_execution`。执行状态必须来自 backend 状态事件或最终状态，不要用 `g`、`p`、`t` 等命令文本识别结果冒充可靠状态。
+运行控制可以通过 `dbg.eval` 发送 WinDbg 原生命令，例如 `g`、`p`、`t`。
+session 状态必须来自 backend 状态事件或最终状态，不要用命令文本识别结果冒充
+可靠状态。只有当某个运行控制能力需要 dbgflow 管理额外生命周期、取消、artifact
+或跨后端语义时，才新增 typed tool。
 
 ## 5. 安全规则
 

@@ -108,7 +108,7 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
             },
             ToolDescriptor {
                 name: EVAL,
-                description: "Evaluate a native debugger command in a session.",
+                description: "Evaluate a native WinDbg/DbgEng command in a session. This is the primary debugging interface, including run-control and TTD analysis commands; avoid long serial stepping/navigation loops and prefer targeted debugger queries.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -216,7 +216,7 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
             ToolDescriptor {
                 name: RECORD_TTD,
                 description:
-                    "Record a Time Travel Debugging trace with TTD.exe. Supports launch, attach, and bounded monitor recording into controlled artifacts.",
+                    "Record a Time Travel Debugging trace with TTD.exe. Supports launch, attach, and bounded monitor recording into controlled artifacts. This records traces only; analyze .run files with native WinDbg TTD commands through dbg.eval after opening them in a debug session, and avoid long serial stepping/navigation command loops.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {

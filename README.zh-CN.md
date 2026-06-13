@@ -58,7 +58,17 @@ Target 示例：
 { "kind": "launch", "executable": "C:\\app\\app.exe", "args": ["--flag"] }
 ```
 
-Dump target 可以指向任意已存在的本地文件；如果文件不是受支持的 dump，由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在 DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、event record 和日志仍写入受控运行目录。`dbg.eval` 除空命令外会将原生 debugger command 透传给 DbgEng；请仅在可信本地环境中使用。session 状态不再从命令文本识别运行控制，而是由 backend execution status 事件和最终状态更新。`dbg.add_symbols` 追加原生 WinDbg symbol path 字符串，包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server 路径。
+Dump target 可以指向任意已存在的本地文件；如果文件不是 DbgEng 支持的文件，
+由 DbgEng 返回错误。Launch 使用 suspended Win32 process creation 路径，并在
+DbgEng attach 后再恢复目标进程。Executable 必须是已存在路径；shell invocation、
+自定义 cwd 和自定义 env 不属于当前 MVP。命令输出、transcript、command record、
+event record 和日志仍写入受控运行目录。`dbg.eval` 除空命令外会将原生 debugger
+command 透传给 DbgEng；请仅在可信本地环境中使用。调试主线以 WinDbg / DbgEng
+原生命令为稳定接口，包括运行控制命令；dbgflow 不为常见 WinDbg 命令重复暴露
+typed wrapper。session 状态不再从命令文本识别运行控制，而是由 backend execution
+status 事件和最终状态更新。`dbg.add_symbols` 追加原生 WinDbg symbol path 字符串，
+包括 `srv*C:\symbols*https://msdl.microsoft.com/download/symbols` 这类 symbol server
+路径。
 运行配置也可以提供初始 DbgEng symbol path。dbgflow 会在打开 target 前通过
 DbgEng symbols API 应用该路径，而不是依赖 worker 环境变量生效。
 
@@ -133,6 +143,13 @@ command line，并始终把 recorder 输出以及生成的 `.run` / `.out` / `.e
 `artifacts\ttd_recordings\<recording_id>`。TTD recording 通常需要管理员权限，
 会显著拖慢目标进程，也可能生成很大的文件。TTD artifact 可能包含内存、路径、
 注册表数据和文件内容，应按敏感文件处理。
+
+当前没有单独的 `trace.open_ttd` / `trace.open_run` 或并行 TTD analyzer tool。
+生成的 `.run` trace 后续分析应优先复用 WinDbg / DbgEng 的 TTD 原生命令和
+`dbg.eval`。现有 `dbg.create_session` 的文件 target 会把本地文件交给 DbgEng；
+`.run` 是否可按该路径打开取决于本机 DbgEng/WinDbg 能力，目前需要单独 smoke
+验证后再作为公开承诺写入文档。agent 分析 TTD 时应避免长串串行 stepping /
+navigation 循环，优先使用 WinDbg TTD 的索引、事件、异常和查询类命令做定点分析。
 
 TTD recording 请求示例：
 
@@ -240,4 +257,5 @@ DbgEng 目录按 `<dbgeng_dir>\ttd` 推导，
 `config.toml`、logs 和 artifacts。如果服务已经不存在，可向
 `scripts\uninstall-service.ps1` 传入 `-ConfigPath <path>` 作为 fallback。
 
-Live process DbgEng 集成测试默认 ignored，因为 attach / launch 行为依赖本机调试权限和目标进程状态；验证进程调试能力时需要显式运行这些测试。live HTTP E2E 测试会启动 `dbgflow-mcp http`、调用 `/mcp`，并覆盖 attach / launch 的 worker 子进程链路。
+需要验证真实 DbgEng / ETW / TTD 环境时，优先使用受控 smoke 脚本或手动 MCP 调用。
+仓库默认测试不包含需要提权或依赖本机 live 调试环境的 ignored 测试。

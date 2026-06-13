@@ -65,16 +65,18 @@ Example targets:
 ```
 
 Dump targets may point to any existing local file; DbgEng reports an error if
-the file is not a supported dump. Launch uses a suspended Win32 process creation
+the file is not supported by the local DbgEng runtime. Launch uses a suspended Win32 process creation
 path and attaches DbgEng before resuming the target. The executable must be an
 existing path; shell invocation, custom current directories, and custom
 environments are not part of this MVP.
 Command output, transcripts, command records, event records, and logs are still
 written under controlled runtime directories.
 `dbg.eval` passes native debugger commands through to DbgEng except for empty
-commands. Use it only in a trusted local environment. Run-control commands
-are not detected from command text; session state is updated from backend
-execution-status events and final backend status.
+commands. Use it only in a trusted local environment. Native WinDbg / DbgEng
+commands are the stable debugging interface, including run-control commands;
+dbgflow does not duplicate common WinDbg commands as typed wrappers. Run-control
+commands are not detected from command text; session state is updated from
+backend execution-status events and final backend status.
 `dbg.add_symbols` appends native WinDbg symbol path strings, including symbol
 server paths such as `srv*C:\symbols*https://msdl.microsoft.com/download/symbols`.
 The runtime config can also provide an initial DbgEng symbol path. dbgflow
@@ -159,6 +161,15 @@ recorder command lines, and always writes recorder output and generated `.run`
 requires administrator privileges, can slow the target significantly, and can
 produce large files. Treat TTD artifacts as sensitive because traces can contain
 memory, file paths, registry data, and file contents.
+
+dbgflow does not currently expose a separate `trace.open_ttd`, `trace.open_run`,
+or parallel TTD analyzer tool. Analyze generated `.run` traces with native
+WinDbg / DbgEng TTD commands through `dbg.eval` when the trace has been opened
+in a debug session. The existing file target passes local files to DbgEng; `.run`
+support on that path depends on the local DbgEng/WinDbg runtime and should be
+smoke-tested before it is treated as a public contract. Agents should avoid long
+serial stepping/navigation loops for TTD analysis and prefer targeted WinDbg TTD
+event, exception, index, and query commands.
 
 Example TTD recording request:
 
@@ -294,8 +305,6 @@ then deletes the service and the entire configured install root, including
 `bin`, `config.toml`, logs, and artifacts. If the service is already missing,
 pass `-ConfigPath <path>` to `scripts\uninstall-service.ps1` as a fallback.
 
-Live process DbgEng integration tests are ignored by default because attach and
-launch behavior depends on local debugger permissions and target process state.
-Run them explicitly when validating live process support. The live HTTP E2E
-tests start `dbgflow-mcp http`, call `/mcp`, and cover the worker subprocess
-path for attach and launch.
+Use controlled smoke scripts or manual MCP calls when validating real DbgEng,
+ETW, or TTD environments. The default repository test suite does not include
+ignored tests that require elevation or a live local debugging environment.
