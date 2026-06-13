@@ -1,7 +1,11 @@
 [workspace]
 members = [
+    "crates/dbgflow-common",
     "crates/dbgflow-core",
+    "crates/dbgflow-debug",
     "crates/dbgflow-mcp",
+    "crates/dbgflow-reverse",
+    "crates/dbgflow-trace",
 ]
 resolver = "2"
 

@@ -188,13 +188,21 @@ artifacts/
 
 ```text
 crates/
+  dbgflow-common/
+  dbgflow-debug/
+  dbgflow-trace/
+  dbgflow-reverse/
   dbgflow-core/
   dbgflow-mcp/
 ```
 
 要求：
 
-* `dbgflow-core` 承载 session、backend、validation、artifacts、error 等核心逻辑。
+* `dbgflow-common` 承载 error、logging、proxy、typed ids、通用 validation、artifacts 和跨领域 job guard。
+* `dbgflow-debug` 承载 debug backend、debug session、session worker、DbgEng backend 和调试 target validation。
+* `dbgflow-trace` 承载 profiling、native ETW collector / post-processing 和 TTD recording。
+* `dbgflow-reverse` 是未来 idalib / reverse analysis 的 crate 边界；未完成设计前不要暴露 `ida.*` tool 或未定型 API。
+* `dbgflow-core` 是兼容 facade，继续 re-export 旧 Rust 路径；新增内部实现优先放入领域 crate。
 * `dbgflow-mcp` 承载 MCP-facing tool facade，不污染核心层。
 * backend 实现不得污染 MCP schema。
 * target/path 处理集中管理。

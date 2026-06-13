@@ -1,17 +1,27 @@
 [package]
-name = "dbgflow-core"
+name = "dbgflow-debug"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 dbgflow-common = { path = "../dbgflow-common" }
-dbgflow-debug = { path = "../dbgflow-debug" }
-dbgflow-reverse = { path = "../dbgflow-reverse" }
-dbgflow-trace = { path = "../dbgflow-trace" }
-
-[dev-dependencies]
+serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_Debug_Extensions",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_System_Time",
+    "Win32_System_Threading",
+] }
+windows-core = "0.62.2"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62.2", features = [

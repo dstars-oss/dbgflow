@@ -138,12 +138,28 @@ TTD trace 必须作为敏感 artifact 管理。
 当前推荐架构：
 
 ```text
-Rust MCP Server
+crates/
+  dbgflow-common
+    error / logging / proxy / ids / validation / artifacts / job guards
+  dbgflow-debug
+    session manager / session worker / DebugBackend / DbgEngBackend
+  dbgflow-trace
+    profile manager / native ETW / TTD recording
+  dbgflow-reverse
+    reserved boundary for future idalib reverse analysis
+  dbgflow-core
+    compatibility facade for existing Rust paths
+  dbgflow-mcp
+    HTTP transport / MCP protocol / tool registry and schemas
+
+Runtime flow:
+
+dbgflow-mcp
   |
-  |-- Debug / Trace MCP Tool Layer
+  |-- dbg.* MCP Tool Layer -> dbgflow-debug
   |     |-- Session Manager
   |     |-- Target Validation
-  |     |-- Artifact Manager
+  |     |-- Artifact Manager from dbgflow-common
   |     |-- SessionWorker launcher
   |           |
   |           v
@@ -157,12 +173,16 @@ Rust MCP Server
   |           |     |-- event callbacks
   |           |
   |           |-- TTD backend optional
+  |-- trace.* MCP Tool Layer -> dbgflow-trace
+  |     |-- ProfileManager / native ETW
+  |     |-- TtdRecordingManager / TTD.exe
+  |     |-- Artifact Manager from dbgflow-common
   |
-  |-- Reverse Analysis MCP Tool Layer
+  |-- future ida.* MCP Tool Layer -> dbgflow-reverse
         |
         |-- ReverseSessionManager
         |-- ReverseTarget Validation
-        |-- Artifact Manager
+        |-- Artifact Manager from dbgflow-common
         |-- ReverseWorker launcher
         |
         v
@@ -188,6 +208,7 @@ Rust MCP Server
 6. 后端能力逐步增强
 7. 将 idalib 逆向能力作为独立 `ida.*` tool family 设计
 8. 先实现 ReverseBackend / worker spike，再扩展查询和标注工具
+9. 新增跨领域基础设施优先放入 `dbgflow-common`，避免 debug / trace / reverse 重复实现
 ```
 
 ## 6. 后续里程碑
@@ -581,6 +602,24 @@ decompile、list xrefs、rename 和 set comment。
 * 任意脚本执行会绕过 dbgflow 的 target validation、artifact 管理和审计边界。
 * typed tools 更容易为 AI agent 提供稳定、可测试、可回放的逆向分析接口。
 
+### D-021: workspace 按 common/debug/trace/reverse 分层
+
+决定：
+
+workspace 拆分为 `dbgflow-common`、`dbgflow-debug`、`dbgflow-trace`、
+`dbgflow-reverse`、`dbgflow-core` 和 `dbgflow-mcp`。`dbgflow-core` 保留为
+compatibility facade，继续 re-export 旧 Rust module 路径；`dbgflow-mcp` 直接依赖
+领域 crate。`dbgflow-reverse` 暂只作为 crate 边界，不暴露 `ida.*` tool 或未定型
+reverse API。
+
+原因：
+
+* debug session、trace recording 和未来 reverse analysis 的生命周期相似但语义不同，
+  需要独立领域边界。
+* artifacts、logging、proxy、typed ids、validation 和 single-active-job guard 属于
+  跨领域基础设施，集中到 `dbgflow-common` 可避免未来 `ida.*` 复制现有 profile / TTD 模式。
+* facade 保持现有 Rust 调用路径和测试兼容，让内部架构可以演进而不破坏 MCP wire API。
+
 ## 8. 当前待办
 
 ### P0
@@ -594,6 +633,7 @@ decompile、list xrefs、rename 和 set comment。
 * [x] 实现测试用 fake worker。
 * [x] 实现基础 artifact manager。
 * [x] 实现基础命令审计和 artifact 写入。
+* [x] 将 workspace 重分层为 common / debug / trace / reverse / core facade / MCP。
 
 ### P1
 

@@ -1,4 +1,4 @@
-use dbgflow_core::logging::{LogEvent, LogSink};
+use dbgflow_common::logging::{LogEvent, LogSink};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -100,7 +100,7 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::{log_file_name, FileLogSink};
-    use dbgflow_core::logging::{LogEvent, LogLevel, LogSink};
+    use dbgflow_common::logging::{LogEvent, LogLevel, LogSink};
     use std::fs;
     use std::time::{Duration, SystemTime};
 

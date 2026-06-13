@@ -27,13 +27,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "dbgflow-core"
+name = "dbgflow-common"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "dbgflow-core"
+version = "0.1.0"
+dependencies = [
+ "dbgflow-common",
+ "dbgflow-debug",
+ "dbgflow-reverse",
+ "dbgflow-trace",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "dbgflow-debug"
+version = "0.1.0"
+dependencies = [
+ "dbgflow-common",
+ "serde",
+ "serde_json",
  "windows",
  "windows-core",
 ]
@@ -42,12 +63,33 @@ dependencies = [
 name = "dbgflow-mcp"
 version = "0.1.0"
 dependencies = [
- "dbgflow-core",
+ "dbgflow-common",
+ "dbgflow-debug",
+ "dbgflow-trace",
  "serde",
  "serde_json",
  "toml",
  "windows-service",
  "windows-sys",
+]
+
+[[package]]
+name = "dbgflow-reverse"
+version = "0.1.0"
+dependencies = [
+ "dbgflow-common",
+]
+
+[[package]]
+name = "dbgflow-trace"
+version = "0.1.0"
+dependencies = [
+ "dbgflow-common",
+ "serde",
+ "serde_json",
+ "uuid",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

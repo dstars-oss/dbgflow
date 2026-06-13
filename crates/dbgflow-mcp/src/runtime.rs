@@ -1,5 +1,5 @@
-use dbgflow_core::backend::dbgeng::DBGFLOW_DBGENG_DIR_ENV;
-use dbgflow_core::proxy::ProxyEnvironment;
+use dbgflow_common::proxy::ProxyEnvironment;
+use dbgflow_debug::backend::dbgeng::DBGFLOW_DBGENG_DIR_ENV;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -199,8 +199,109 @@ pub fn parse_options<I>(args: I) -> Result<AppConfig, String>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let config_path = parse_required_config_path(args, help_text())?;
-    Ok(RuntimeConfig::load(config_path)?.app)
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.iter().any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--config" || arg.starts_with("--config="))
+    }) {
+        let config_path = parse_required_config_path(args, help_text())?;
+        return Ok(RuntimeConfig::load(config_path)?.app);
+    }
+    parse_legacy_http_options(args)
+}
+
+fn parse_legacy_http_options(args: Vec<OsString>) -> Result<AppConfig, String> {
+    let mut bind = parse_bind(DEFAULT_BIND)?;
+    let mut data_dir = None;
+    let mut proxy_url = None;
+    let mut no_proxy = false;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        let arg = arg
+            .into_string()
+            .map_err(|_| "arguments must be valid UTF-8".to_string())?;
+
+        if let Some(value) = arg.strip_prefix("--bind=") {
+            bind = parse_bind(value)?;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--data-dir=") {
+            data_dir = Some(normalize_cli_path(Path::new(value), "--data-dir")?);
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--proxy-url=") {
+            proxy_url = Some(parse_non_empty(value, "--proxy-url")?);
+            continue;
+        }
+
+        match arg.as_str() {
+            "--bind" => {
+                let value = next_value(&mut args, "--bind")?;
+                bind = parse_bind(&value)?;
+            }
+            "--data-dir" => {
+                let value = next_value(&mut args, "--data-dir")?;
+                data_dir = Some(normalize_cli_path(Path::new(&value), "--data-dir")?);
+            }
+            "--proxy-url" => {
+                let value = next_value(&mut args, "--proxy-url")?;
+                proxy_url = Some(parse_non_empty(&value, "--proxy-url")?);
+            }
+            "--no-proxy" => no_proxy = true,
+            "--help" | "-h" => return Err(help_text().to_string()),
+            other => return Err(format!("unknown option: {other}\n\n{}", help_text())),
+        }
+    }
+
+    let data_dir =
+        data_dir.ok_or_else(|| format!("missing required --data-dir <path>\n\n{}", help_text()))?;
+    let proxy = resolve_legacy_proxy(proxy_url, no_proxy)?;
+    Ok(AppConfig {
+        bind,
+        data_dir,
+        proxy,
+        ttd_dir: None,
+        dbgeng_dir: None,
+        symbol_path: None,
+    })
+}
+
+fn resolve_legacy_proxy(
+    proxy_url: Option<String>,
+    no_proxy: bool,
+) -> Result<ProxyEnvironment, String> {
+    if no_proxy && proxy_url.is_some() {
+        return Err("--proxy-url and --no-proxy cannot be used together".to_string());
+    }
+    if no_proxy {
+        return Ok(ProxyEnvironment::disabled());
+    }
+    if let Some(proxy_url) = proxy_url {
+        return ProxyEnvironment::from_cli_proxy_url(&proxy_url).map_err(|error| error.to_string());
+    }
+    ProxyEnvironment::from_current_environment().map_err(|error| error.to_string())
+}
+
+fn parse_non_empty(value: &str, label: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_cli_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("read current directory for {label}: {error}"))?
+            .join(path)
+    };
+    normalize_path_lexically(&path)
 }
 
 pub fn parse_service_process_options<I>(args: I) -> Result<ServiceProcessConfig, String>
@@ -317,7 +418,7 @@ where
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp http --config <path>                Run local HTTP MCP transport\n  dbgflow-mcp service run --config <path>         Run as a Windows service process\n  dbgflow-mcp service install --config <path>     Install and start the Windows service\n  dbgflow-mcp service uninstall [options]         Stop, uninstall, and remove install root\n  dbgflow-mcp worker session                      Run an internal session worker process"
+    "Usage:\n  dbgflow-mcp http --bind <addr> --data-dir <path> [options]\n  dbgflow-mcp http --config <path>                Run local HTTP MCP transport\n  dbgflow-mcp service run --config <path>         Run as a Windows service process\n  dbgflow-mcp service install --config <path>     Install and start the Windows service\n  dbgflow-mcp service uninstall [options]         Stop, uninstall, and remove install root\n  dbgflow-mcp worker session                      Run an internal session worker process\n\nHTTP options:\n  --bind <addr>                                   Loopback bind address; default 127.0.0.1:7331\n  --data-dir <path>                               Required for direct HTTP mode\n  --proxy-url <url>                               Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars\n  --no-proxy                                     Clears known proxy vars for session workers"
 }
 
 pub fn service_install_help_text() -> &'static str {
@@ -804,7 +905,7 @@ fn split_windows_command_line(value: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbgflow_core::proxy::ProxySource;
+    use dbgflow_common::proxy::ProxySource;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -1127,6 +1228,80 @@ data_dir = "{}"
 
         assert_eq!(app.bind.to_string(), "127.0.0.1:7331");
         assert_eq!(app.proxy.source(), ProxySource::None);
+    }
+
+    #[test]
+    fn parses_legacy_http_bind_and_data_dir_options() {
+        let root = unique_test_dir("runtime-http-legacy");
+        let data_dir = root.join("var");
+
+        let app = parse_options([
+            OsString::from("--bind"),
+            OsString::from("127.0.0.1:0"),
+            OsString::from("--data-dir"),
+            data_dir.as_os_str().to_os_string(),
+            OsString::from("--no-proxy"),
+        ])
+        .expect("parse legacy http options");
+
+        assert_eq!(app.bind.to_string(), "127.0.0.1:0");
+        assert_eq!(app.data_dir, data_dir);
+        assert_eq!(app.proxy.source(), ProxySource::Disabled);
+    }
+
+    #[test]
+    fn parses_legacy_http_relative_data_dir() {
+        let app = parse_options([
+            OsString::from("--data-dir"),
+            OsString::from(".\\var"),
+            OsString::from("--no-proxy"),
+        ])
+        .expect("parse relative data dir");
+
+        assert!(app.data_dir.ends_with("var"));
+        assert!(app.data_dir.is_absolute());
+    }
+
+    #[test]
+    fn parses_legacy_http_proxy_url_option() {
+        let root = unique_test_dir("runtime-http-proxy-url");
+        let data_dir = root.join("var");
+
+        let app = parse_options([
+            OsString::from("--data-dir"),
+            data_dir.as_os_str().to_os_string(),
+            OsString::from("--proxy-url=http://127.0.0.1:7897"),
+        ])
+        .expect("parse proxy url");
+
+        assert_eq!(app.proxy.source(), ProxySource::Cli);
+        assert_eq!(
+            app.proxy.value_for("_NT_SYMBOL_PROXY").as_deref(),
+            Some("127.0.0.1:7897")
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_http_without_data_dir() {
+        let error = parse_options([OsString::from("--bind"), OsString::from("127.0.0.1:0")])
+            .expect_err("reject missing data dir");
+
+        assert!(error.contains("missing required --data-dir"));
+    }
+
+    #[test]
+    fn rejects_conflicting_legacy_proxy_options() {
+        let root = unique_test_dir("runtime-http-proxy-conflict");
+        let error = parse_options([
+            OsString::from("--data-dir"),
+            root.join("var").as_os_str().to_os_string(),
+            OsString::from("--proxy-url"),
+            OsString::from("http://127.0.0.1:7897"),
+            OsString::from("--no-proxy"),
+        ])
+        .expect_err("reject conflicting proxy options");
+
+        assert!(error.contains("--proxy-url and --no-proxy"));
     }
 
     #[test]

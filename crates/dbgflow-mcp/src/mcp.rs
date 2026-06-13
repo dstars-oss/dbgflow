@@ -1,11 +1,11 @@
 use crate::logging::FileLogSink;
 use crate::tools::{ToolCallError, ToolService};
-use dbgflow_core::logging::{noop_logger, LogEvent, LogLevel, LogSink};
-use dbgflow_core::profile::ProfileManager;
-use dbgflow_core::proxy::ProxyEnvironment;
-use dbgflow_core::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
-use dbgflow_core::session::SessionId;
-use dbgflow_core::ttd::{TtdRecorderRuntime, TtdRecordingManager};
+use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use dbgflow_common::proxy::ProxyEnvironment;
+use dbgflow_debug::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
+use dbgflow_debug::session::SessionId;
+use dbgflow_trace::profile::ProfileManager;
+use dbgflow_trace::ttd::{TtdRecorderRuntime, TtdRecordingManager};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -22,6 +22,42 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
 pub struct McpServer {
     service: ToolService,
     logger: Arc<dyn LogSink>,
+}
+
+#[derive(Clone)]
+pub struct McpServerConfig {
+    pub data_dir: PathBuf,
+    pub proxy: ProxyEnvironment,
+    pub ttd_dir: Option<PathBuf>,
+    pub symbol_path: Option<String>,
+    pub logger: Arc<dyn LogSink>,
+}
+
+impl McpServerConfig {
+    pub fn new(data_dir: impl Into<PathBuf>, logger: Arc<dyn LogSink>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            proxy: ProxyEnvironment::none(),
+            ttd_dir: None,
+            symbol_path: None,
+            logger,
+        }
+    }
+
+    pub fn with_proxy(mut self, proxy: ProxyEnvironment) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    pub fn with_ttd_dir(mut self, ttd_dir: Option<PathBuf>) -> Self {
+        self.ttd_dir = ttd_dir;
+        self
+    }
+
+    pub fn with_symbol_path(mut self, symbol_path: Option<String>) -> Self {
+        self.symbol_path = symbol_path;
+        self
+    }
 }
 
 impl McpServer {
@@ -440,12 +476,11 @@ pub fn server_with_data_dir_proxy_ttd_and_symbol_path(
         FileLogSink::new(data_dir.join("logs"), 7)
             .map_err(|error| format!("initialize log directory: {error}"))?,
     );
-    Ok(server_with_data_dir_proxy_ttd_symbol_path_and_logger(
-        data_dir,
-        proxy,
-        ttd_dir,
-        symbol_path,
-        logger,
+    Ok(server_from_config(
+        McpServerConfig::new(data_dir, logger)
+            .with_proxy(proxy)
+            .with_ttd_dir(ttd_dir)
+            .with_symbol_path(symbol_path),
     ))
 }
 
@@ -486,27 +521,36 @@ pub fn server_with_data_dir_proxy_ttd_symbol_path_and_logger(
     symbol_path: Option<String>,
     logger: Arc<dyn LogSink>,
 ) -> McpServer {
-    let data_dir = data_dir.into();
-    let artifact_root = data_dir.join("artifacts");
+    server_from_config(
+        McpServerConfig::new(data_dir, logger)
+            .with_proxy(proxy)
+            .with_ttd_dir(ttd_dir)
+            .with_symbol_path(symbol_path),
+    )
+}
+
+pub fn server_from_config(config: McpServerConfig) -> McpServer {
+    let artifact_root = config.data_dir.join("artifacts");
     let sessions =
-        dbgflow_core::session::SessionManager::with_worker_launcher_proxy_symbol_path_and_logger(
+        dbgflow_debug::session::SessionManager::with_worker_launcher_proxy_symbol_path_and_logger(
             default_process_worker_launcher(),
             &artifact_root,
-            proxy,
-            symbol_path,
-            logger.clone(),
+            config.proxy,
+            config.symbol_path,
+            config.logger.clone(),
         );
-    let profiles = ProfileManager::with_logger(&artifact_root, logger.clone());
+    let profiles = ProfileManager::with_logger(&artifact_root, config.logger.clone());
     let ttd_recordings = TtdRecordingManager::with_runtime_and_logger(
         &artifact_root,
-        ttd_dir
+        config
+            .ttd_dir
             .map(TtdRecorderRuntime::with_ttd_dir)
             .unwrap_or_else(TtdRecorderRuntime::unavailable),
-        logger.clone(),
+        config.logger.clone(),
     );
     McpServer::new_with_logger(
         ToolService::with_profiles_and_ttd(sessions, profiles, ttd_recordings),
-        logger,
+        config.logger,
     )
 }
 
@@ -545,11 +589,11 @@ fn with_http_request_id(event: LogEvent, http_request_id: Option<u64>) -> LogEve
 mod tests {
     use super::McpServer;
     use crate::tools::ToolService;
-    use dbgflow_core::backend::{CreateBackendSession, ExecuteBackendResult};
-    use dbgflow_core::proxy::ProxyEnvironment;
-    use dbgflow_core::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
-    use dbgflow_core::session::{SessionId, SessionManager};
-    use dbgflow_core::Result;
+    use dbgflow_common::proxy::ProxyEnvironment;
+    use dbgflow_common::Result;
+    use dbgflow_debug::backend::{CreateBackendSession, ExecuteBackendResult};
+    use dbgflow_debug::session::worker::{SessionWorker, SessionWorkerLauncher, WorkerSession};
+    use dbgflow_debug::session::{SessionId, SessionManager};
     use serde_json::{json, Value};
     use std::fs;
     use std::path::PathBuf;
@@ -1106,7 +1150,7 @@ mod tests {
         fn spawn(
             &self,
             _session_id: SessionId,
-            _logger: Arc<dyn dbgflow_core::logging::LogSink>,
+            _logger: Arc<dyn dbgflow_common::logging::LogSink>,
             _proxy: ProxyEnvironment,
         ) -> Result<Arc<dyn SessionWorker>> {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1134,7 +1178,7 @@ mod tests {
         fn execute(
             &self,
             command: String,
-            _event_sink: std::sync::Arc<dyn dbgflow_core::backend::BackendEventSink>,
+            _event_sink: std::sync::Arc<dyn dbgflow_debug::backend::BackendEventSink>,
         ) -> Result<ExecuteBackendResult> {
             Ok(ExecuteBackendResult {
                 output: format!("fake worker executed: {command}"),
@@ -1155,7 +1199,7 @@ mod tests {
         fn kill(&self, reason: &str) -> Result<()> {
             *self.closed.lock().expect("closed lock") = true;
             if reason == "fail-kill" {
-                return Err(dbgflow_core::DbgFlowError::Backend(
+                return Err(dbgflow_common::DbgFlowError::Backend(
                     "fake kill failed".to_string(),
                 ));
             }

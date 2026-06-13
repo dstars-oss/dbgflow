@@ -6,7 +6,7 @@ use crate::runtime::{
     service_process_options_from_command_line, validate_install_root_removal, RuntimeConfig,
     ServiceInstallConfig, ServiceProcessConfig, ServiceUninstallConfig, SERVICE_DESCRIPTION,
 };
-use dbgflow_core::logging::{LogEvent, LogLevel, LogSink};
+use dbgflow_common::logging::{LogEvent, LogLevel, LogSink};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

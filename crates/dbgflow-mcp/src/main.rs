@@ -73,14 +73,14 @@ where
         .map_err(|_| "command must be valid UTF-8".to_string())?;
 
     match command.as_str() {
-        dbgflow_core::session::worker::SESSION_WORKER_COMMAND => {
+        dbgflow_debug::session::worker::SESSION_WORKER_COMMAND => {
             let Some(kind) = args.next() else {
                 return Err("missing worker kind".to_string());
             };
             let kind = kind
                 .into_string()
                 .map_err(|_| "worker kind must be valid UTF-8".to_string())?;
-            if kind != dbgflow_core::session::worker::SESSION_WORKER_KIND_SESSION {
+            if kind != dbgflow_debug::session::worker::SESSION_WORKER_KIND_SESSION {
                 return Err(format!("unknown worker kind: {kind}"));
             }
             if args.next().is_some() {
@@ -113,7 +113,7 @@ where
 
 fn run_session_worker() -> io::Result<()> {
     let stdin = io::stdin();
-    dbgflow_core::session::worker::run_session_worker_stdio(
+    dbgflow_debug::session::worker::run_session_worker_stdio(
         BufReader::new(stdin.lock()),
         io::stdout(),
     )

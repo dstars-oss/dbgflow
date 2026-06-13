@@ -1,5 +1,5 @@
 use crate::mcp::{session_resource_uri, McpServer};
-use dbgflow_core::logging::{LogEvent, LogLevel};
+use dbgflow_common::logging::{LogEvent, LogLevel};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -480,8 +480,8 @@ mod tests {
     };
     use crate::mcp::McpServer;
     use crate::tools::ToolService;
-    use dbgflow_core::logging::{LogEvent, LogSink};
-    use dbgflow_core::session::SessionManager;
+    use dbgflow_common::logging::{LogEvent, LogSink};
+    use dbgflow_debug::session::SessionManager;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
