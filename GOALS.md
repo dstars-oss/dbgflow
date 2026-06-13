@@ -116,8 +116,8 @@ TTD trace 必须作为敏感 artifact 管理。
   IDA engine：https://docs.hex-rays.com/release-notes/9_0
 * Hex-Rays 9.2 feature overview 继续描述 idalib headless library 能力：
   https://hex-rays.com/feature-overview-ida-8.5-vs-9.2
-* Rust 生态已有 idalib 绑定探索，但 dbgflow 首选 Rust 主体加 C / C++ FFI shim
-  的受控 worker 路线：https://github.com/binarly-io/idalib
+* Rust 生态已有 idalib 绑定探索；dbgflow 当前采用 Rust 主体、runtime-only direct
+  IDA DLL binding 的受控 worker 路线：https://github.com/binarly-io/idalib
 
 ## 4. 非目标
 
@@ -263,22 +263,34 @@ dbgflow-mcp
 * 支持受控标注修改能力：rename、comment 和 type。
 * 支持 reverse artifacts、审计日志和错误记录。
 
-候选 tool 名称暂定：
+当前 MVP tool 名称：
 
 ```text
 ida.create_session
 ida.get_session
 ida.close_session
+ida.get_metadata
+ida.list_segments
 ida.list_functions
+ida.list_strings
+ida.list_imports
+ida.list_exports
+ida.lookup_functions
 ida.disassemble
 ida.decompile
 ida.list_xrefs
+ida.list_basic_blocks
 ida.rename
 ida.set_comment
+ida.set_type
 ```
 
-具体 schema、IDB / i64 持久化策略、artifact 副本策略和原地修改策略留到后续
-设计阶段决定。
+`ida.close_session` 默认请求保存打开的数据库；`.idb` / `.i64` target 默认原地操作。
+当前基础 idalib close ABI 不返回保存成功与否，事件和 session warning 会把保存结果
+记录为 `unknown`。rich reverse tools 通过 Rust direct binding 直接加载官方
+`ida.dll` / `idalib.dll` runtime symbols；缺少 symbol、license 或 processor 支持时
+返回明确 unsupported error，基础 session / metadata / segment / function 查询仍可用。
+分页 rich tools 在 Rust 层统一应用默认 limit 100、最大 limit 10000。
 
 ## 7. 关键设计决策
 
@@ -556,19 +568,21 @@ IDA / idalib，公开名称直接表达后端语义，而不是抽象为 `rev.*`
 * 如果未来增加其他 reverse backend，可在内部保留 `ReverseBackend` 抽象，再单独设计
   兼容或迁移策略。
 
-### D-018: idalib worker 采用 Rust-first + C / C++ FFI shim
+### D-018: idalib worker 采用 Rust-first runtime direct binding
 
 决定：
 
-idalib reverse worker 的首选实现路线是 Rust 主体开发，并通过 C / C++ FFI shim
-接入 IDA SDK / idalib。Python idalib 可用于探索或验证 API 行为，但不作为默认
-生产实现路线。
+idalib reverse worker 的首选实现路线是 Rust 主体开发，并通过 `libloading` 在运行时
+直接加载官方 `idalib.dll` / `ida.dll` symbols。默认构建不依赖 IDA SDK headers、
+C++ 编译器、bindgen、autocxx 或 cxx。Python idalib 可用于探索或验证 API 行为，
+但不作为默认生产实现路线。
 
 原因：
 
 * Rust 主进程、配置、validation、artifacts、日志和 MCP facade 可沿用现有工程边界。
-* IDA SDK / idalib 的 C++ API 更适合作为稳定的 native 边界，由 FFI shim 隔离 ABI
-  和生命周期复杂度。
+* direct binding 删除额外部署 native bridge DLL 的峰值，保持默认构建
+  runtime-only；C++ ABI 风险集中在 `dbgflow-reverse::ida` 私有 wrapper 和 real IDA
+  smoke test 中验证。
 * 不把 Python 运行时、虚拟环境和模块搜索路径作为首版生产依赖，可以降低部署和服务化
   复杂度。
 
@@ -722,10 +736,14 @@ linked elevated token 且配置允许，则优先使用 elevated token。
 * [x] 实现 Rust-first、no-SDK build-time dependency 的 IDA dynamic binding worker MVP。
 * [x] 设计 `ida.*` MCP tool schema 和 session lifecycle。
 * [x] 支持 headless binary / IDB analysis session MVP。
-* [x] 支持只读 segment / function 列表 MVP，不返回 names。
-* [ ] 支持函数、基本块、反汇编、字符串、imports / exports、xrefs、类型和伪代码查询。
-* [ ] 支持受控 IDB 标注修改：rename、comment 和 type。
-* [ ] 支持 reverse artifacts、审计日志、敏感输出记录和后续 redaction。
+* [x] 支持只读 segment / function 列表 MVP；direct rich binding 可返回 name / segment 等增强字段。
+* [x] 暴露函数、基本块、反汇编、字符串、imports / exports、xrefs、类型和伪代码 typed tool surface，并通过 Rust direct binding dispatch。
+* [x] 暴露受控 IDB 标注修改 tool surface：rename、comment 和 type，默认 close 时保存。
+* [x] 支持 reverse query / mutation artifacts、审计日志和敏感输出记录。
+* [x] reverse outputs 使用唯一 artifact 文件名，避免重复查询或修改覆盖旧审计结果。
+* [ ] 强化 Rust direct IDA binding 的 real-runtime layout / call validation、Hex-Rays dispatcher 和版本升级流程。
+* [ ] 增强 close/save 结果来源；基础 idalib ABI 只能记录保存请求和 unknown 结果。
+* [ ] 支持后续 redaction 策略。
 
 ## 9. 近期开发计划
 

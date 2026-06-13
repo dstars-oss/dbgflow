@@ -13,13 +13,29 @@ dbgflow uses an IDA session model:
 - `ida.get_session`
 - `ida.list_sessions`
 - `ida.close_session`
+- `ida.get_metadata`
 - `ida.list_segments`
 - `ida.list_functions`
+- `ida.list_strings`
+- `ida.list_imports`
+- `ida.list_exports`
+- `ida.lookup_functions`
+- `ida.disassemble`
+- `ida.decompile`
+- `ida.list_xrefs`
+- `ida.list_basic_blocks`
+- `ida.rename`
+- `ida.set_comment`
+- `ida.set_type`
 
 The implementation is Rust-first and does not require the IDA SDK, Clang,
 bindgen, `idalib-rs`, or an IDA installation to compile dbgflow. The IDA worker
-loads `idalib.dll` and `ida.dll` dynamically at runtime and binds only a small
-C ABI surface.
+loads `idalib.dll` and `ida.dll` dynamically at runtime. Base session,
+metadata, segment, and function enumeration use direct dynamic binding. Rich
+reverse-analysis tools also use Rust direct bindings to official IDA runtime
+exports. Missing symbols, unavailable Hex-Rays licensing, or unsupported
+processor/runtime capabilities return explicit per-tool errors while the
+session remains usable for other queries.
 
 ## Current Local IDA Runtime
 
@@ -38,8 +54,10 @@ idalib.dll
 ida.hlp
 ```
 
-The MVP validates those files when an IDA install directory is configured or
-when `ida.create_session` resolves the runtime.
+The MVP validates the required IDA runtime files when an install directory is
+configured or when `ida.create_session` resolves the runtime. Rich API symbols
+are probed from the loaded official DLLs after the base runtime is initialized.
+Probe failures are reported through `ida.get_metadata().rich_api`.
 
 ## Runtime Configuration
 
@@ -63,22 +81,70 @@ IDADIR=<install_dir>
 PATH=<install_dir>;<existing PATH>
 ```
 
+## Rust Direct Rich Binding
+
+The worker keeps all IDA C++ ABI handling private to `dbgflow-reverse::ida`.
+The public MCP schema and manager protocol remain typed Rust structures; no
+arbitrary IDA eval, IDAPython, or runtime script execution is exposed.
+
+Direct rich binding currently targets IDA Professional 9.3 x64. At runtime the
+worker probes symbols such as `get_ea_name`, `get_name_ea`,
+`generate_disasm_line`, `tag_remove`, `next_head`, `get_strlit_contents`,
+`enum_import_names`, `get_entry_name`, `xrefblk_t_first_from`,
+`xrefblk_t_first_to`, `set_name`, `set_cmt`, and `apply_cdecl`. The qstring and
+xref wrappers are private, non-`Send`/`Sync` values used only inside the worker
+operation lock.
+
+`ida.get_metadata` exposes a `rich_api` status object:
+
+```json
+{
+  "available": true,
+  "direct_bindings": true,
+  "ida_version_gate": "IDA Professional 9.3 x64",
+  "capabilities": {
+    "names": false,
+    "disassembly": false,
+    "strings": false,
+    "imports": false,
+    "exports": false,
+    "xrefs": false,
+    "basic_blocks": true,
+    "comments": true,
+    "types": true,
+    "decompiler": false
+  },
+  "missing_symbols": [],
+  "hexrays": "not_loaded",
+  "warnings": [
+    "IDA direct qstring layout validation has not passed; qstring-dependent tools are disabled",
+    "Hex-Rays direct decompiler dispatcher is unavailable in this build"
+  ]
+}
+```
+
+Missing direct symbols disable only the affected capabilities. The worker does
+not put the session into `Error` for rich capability failures; the individual
+tool returns a clear unsupported error.
+
 ## Why Dynamic Binding
 
 The original research considered three routes:
 
 - Python `idapro` worker.
-- Native C++/SDK shim.
+- Native C++/SDK bridge DLL.
 - Rust worker with direct runtime DLL binding.
 
-The selected MVP is the third route.
+The selected runtime route is the third route. The project intentionally avoids
+an additional native bridge DLL deployment layer for the MVP, while keeping
+the default Rust source build independent from the SDK and IDA import libraries.
 
 Reasons:
 
 - Source users without IDA, SDK, Clang, or bindgen can still compile dbgflow.
 - The IDA dependency is only required on machines that actually call
   `ida.create_session`.
-- The exposed ABI is intentionally small and read-only.
+- The exposed capability surface remains typed and auditable.
 - The IDA process boundary is a dedicated per-session worker subprocess, which
   protects the main MCP server from IDA load failures, crashes, or stalls.
 
@@ -145,7 +211,9 @@ Layout assumptions checked against IDA 9.3 SDK:
   `uchar align`, `uchar comb`, `uchar perm`, `uchar bitness`
 - `func_t : range_t` then `uint64 flags`
 
-The MVP intentionally does not bind `qstring` or name APIs.
+The direct binding layer contains private qstring/name/xref wrappers, but
+qstring-dependent and xrefblk-dependent capabilities remain disabled until
+real-runtime layout validation passes for the installed IDA 9.3 x64 runtime.
 
 ## ida-pro-mcp Research Summary
 
@@ -171,7 +239,7 @@ Patterns not adopted for dbgflow MVP:
 
 - Arbitrary Python eval/exec.
 - GUI IDA plugin installation.
-- IDB mutation tools before a mutation threat model exists.
+- Unscoped IDB mutation tools without typed request/response and audit records.
 - Deleting IDA sidecar files next to user inputs.
 - Using Python package activation as the default production dependency path.
 
@@ -183,8 +251,20 @@ ida.create_session
 ida.get_session
 ida.list_sessions
 ida.close_session
+ida.get_metadata
 ida.list_segments
 ida.list_functions
+ida.list_strings
+ida.list_imports
+ida.list_exports
+ida.lookup_functions
+ida.disassemble
+ida.decompile
+ida.list_xrefs
+ida.list_basic_blocks
+ida.rename
+ida.set_comment
+ida.set_type
 ```
 
 ## MVP Behavior
@@ -230,6 +310,17 @@ Error
 `ida.create_session` uses get-or-create semantics for the same canonical
 target while the existing session is reusable.
 
+`ida.close_session` defaults to `save: true`. Existing `.idb` / `.i64` database
+targets are operated on in place. Pass `save: false` only when session changes
+should be discarded. The base `idalib` `close_database(bool save)` ABI returns
+`void`, so dbgflow records save intent and an `unknown` save status when using
+the direct binding path instead of claiming a successful save.
+
+Paged tools apply a default limit of 100 and a maximum limit of 10000 before
+calling the worker. `ida.list_segments` and `ida.list_functions` return
+a page in the MCP response, while their artifacts include the complete filtered
+JSON result.
+
 Read-only result examples:
 
 ```json
@@ -238,6 +329,9 @@ Read-only result examples:
     "index": 0,
     "start_ea": "0x140001000",
     "end_ea": "0x140002000",
+    "size": "0x1000",
+    "name": ".text",
+    "class": "CODE",
     "perm": "r-x",
     "bitness": 64
   }
@@ -250,6 +344,10 @@ Read-only result examples:
     "index": 0,
     "start_ea": "0x140001100",
     "end_ea": "0x140001240",
+    "size": "0x140",
+    "name": "main",
+    "segment": ".text",
+    "prototype": "int main()",
     "flags": "0x1"
   }
 ]
@@ -277,8 +375,20 @@ artifacts/
       request.json
       session.json
       outputs/
-        segments.json
-        functions.json
+        segments-<timestamp>-<seq>.json
+        functions-<timestamp>-<seq>.json
+        metadata-<timestamp>-<seq>.json
+        strings-<timestamp>-<seq>.json
+        imports-<timestamp>-<seq>.json
+        exports-<timestamp>-<seq>.json
+        function_lookup-<timestamp>-<seq>.json
+        disassembly-<timestamp>-<seq>.json
+        decompile-<timestamp>-<seq>.json
+        xrefs-<timestamp>-<seq>.json
+        basic_blocks-<timestamp>-<seq>.json
+        rename-<timestamp>-<seq>.json
+        comments-<timestamp>-<seq>.json
+        types-<timestamp>-<seq>.json
 ```
 
 IDA outputs are sensitive and can include proprietary binary structure, symbols,
@@ -290,16 +400,13 @@ The MVP deliberately does not expose:
 
 - Arbitrary eval.
 - IDA Python.
-- Decompile.
-- Xrefs.
-- Strings.
-- Rename/comment/type/patch.
 - IDA debugger integration.
 - Shell or external command execution.
+- Byte or assembly patching.
+- GUI adoption.
 
-Future mutation or richer analysis tools should be added incrementally and must
-preserve session scoping, artifact audit, output limits, and clear threat-model
-boundaries.
+Mutation and richer analysis tools remain typed only and preserve session
+scoping, artifact audit, output limits, and clear threat-model boundaries.
 
 ## Real IDA Smoke Tests
 
@@ -311,6 +418,18 @@ $env:DBGFLOW_IDA_DIR="C:\Program Files\IDA Professional 9.3"
 cargo test -p dbgflow-reverse real_ida_create_binary_session -- --ignored
 cargo test -p dbgflow-reverse real_ida_list_segments_functions -- --ignored
 ```
+
+Direct rich-tool real smoke is gated separately so base IDA validation remains
+independent from qstring/xref/type wrapper validation:
+
+```powershell
+$env:DBGFLOW_REAL_IDA_DIRECT_TEST=1
+$env:DBGFLOW_IDA_DIR="C:\Program Files\IDA Professional 9.3"
+cargo test -p dbgflow-reverse real_ida_rich_tools_direct_bindings -- --ignored
+```
+
+Hex-Rays decompiler smoke should use a separate gate once the direct dispatcher
+is validated for the installed runtime and license.
 
 ## Source Links
 

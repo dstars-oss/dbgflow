@@ -38,8 +38,20 @@ dbgflow 是一个早期阶段的 Windows 调试自动化 MCP server / skills 工
 - `ida.get_session`
 - `ida.list_sessions`
 - `ida.close_session`
+- `ida.get_metadata`
 - `ida.list_segments`
 - `ida.list_functions`
+- `ida.list_strings`
+- `ida.list_imports`
+- `ida.list_exports`
+- `ida.lookup_functions`
+- `ida.disassemble`
+- `ida.decompile`
+- `ida.list_xrefs`
+- `ida.list_basic_blocks`
+- `ida.rename`
+- `ida.set_comment`
+- `ida.set_type`
 
 `dbg.create_session` 采用 get-or-create 语义，并会快速返回 `Starting` session；后端打开 target 在后台完成。调用方可以通过 `dbg.get_session`、`dbg.list_sessions` 或 HTTP resource update stream 观察状态转为 `Ready`、`Break`、`Closed` 或 `Error`。
 `target` 现在是必填参数；MCP tool schema 不再暴露 mock target。
@@ -179,16 +191,29 @@ TTD recording 请求示例：
 binary input，并返回一个长期存在的 reverse-analysis session。每个 reverse
 session 使用独立 IDA worker 子进程；worker 在运行时动态加载 `idalib.dll` 和
 `ida.dll`。编译 dbgflow 源码不需要 IDA SDK、Clang、bindgen、`idalib-rs` 或
-IDA 安装目录。当前 MVP 只读，只支持 session lifecycle、`ida.list_segments`
-和 `ida.list_functions`；不暴露任意 IDA eval、IDAPython、decompile、xref、
-names、rename、comment 或 patch。
+IDA 安装目录。
+
+direct-binding 路径支持 session lifecycle、metadata、segment / function 列表，
+并通过运行时从官方 IDA DLL 加载的符号提供第一版 Rust-only rich reverse tools。
+`ida.get_metadata` 会返回 `rich_api` 能力矩阵，记录 direct binding、缺失符号、
+IDA 9.3 x64 version gate 和 Hex-Rays 状态。缺少某项 rich capability 时，对应
+tool 返回明确的 per-tool unsupported error，session 仍可继续用于其它查询。基于
+qstring 和 xrefblk_t 的工具只有在当前 runtime 的 direct layout validation 通过后才会
+启用。dbgflow 仍不暴露任意 IDA eval、IDAPython、debugger control、byte/assembly
+patching 或 GUI adoption。
+
+`ida.close_session` 默认请求保存打开的数据库（`save: true`）。已有 `.idb` / `.i64`
+database target 默认原地操作；只有需要丢弃 session 内修改时才传 `save: false`。
+基础 `idalib` close ABI 不报告保存是否成功，因此 close event 和 session warning 会把
+保存结果记录为 `unknown`，不会把未知状态伪装成成功。
 
 可通过 `[reverse.ida].install_dir` 配置 IDA 安装目录；未配置时，dbgflow 会优先使用
 `DBGFLOW_IDA_DIR`，再默认探测 `C:\Program Files\IDA Professional 9.3`。
 配置的目录必须包含 `ida.exe`、`ida.dll`、`idalib.dll` 和 `ida.hlp`。Reverse
 artifacts 写入 `artifacts\reverse_sessions\<session_id>`，包括 `request.json`、
-`session.json`、`events.jsonl`、`worker.log`，以及 `outputs\segments.json` /
-`outputs\functions.json`。
+`session.json`、`events.jsonl`、`worker.log`，以及 `outputs\` 下唯一命名的每个
+tool JSON 输出。分页只读 API 的响应会返回受限页面，但 artifact 保留完整过滤后的
+JSON 结果；rich 分页 tools 在 worker 内统一应用默认 limit 100、最大 limit 10000。
 
 IDA session 请求示例：
 

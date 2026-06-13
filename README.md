@@ -40,8 +40,20 @@ Current tool names:
 - `ida.get_session`
 - `ida.list_sessions`
 - `ida.close_session`
+- `ida.get_metadata`
 - `ida.list_segments`
 - `ida.list_functions`
+- `ida.list_strings`
+- `ida.list_imports`
+- `ida.list_exports`
+- `ida.lookup_functions`
+- `ida.disassemble`
+- `ida.decompile`
+- `ida.list_xrefs`
+- `ida.list_basic_blocks`
+- `ida.rename`
+- `ida.set_comment`
+- `ida.set_type`
 
 `dbg.create_session` uses get-or-create semantics and returns quickly with a
 `Starting` session while the backend opens the target in the background. Use
@@ -199,10 +211,24 @@ Example TTD recording request:
 input in a long-lived reverse-analysis session. The IDA worker is a separate
 subprocess per reverse session and dynamically loads `idalib.dll` and `ida.dll`
 at runtime. Building dbgflow does not require the IDA SDK, Clang, bindgen,
-`idalib-rs`, or an IDA installation. The MVP is read-only: it supports
-session lifecycle plus `ida.list_segments` and `ida.list_functions`, and it does
-not expose arbitrary IDA eval, IDAPython, decompilation, xrefs, names, rename,
-comments, or patching.
+`idalib-rs`, or an IDA installation.
+
+The direct-binding path supports session lifecycle, metadata, segment/function
+listing, and the first Rust-only rich reverse tools through runtime symbols
+loaded from official IDA DLLs. `ida.get_metadata` reports a `rich_api`
+capability matrix for direct bindings, missing symbols, the IDA 9.3 x64 version
+gate, and Hex-Rays availability. Missing rich capabilities return clear
+per-tool errors while the session remains usable for other queries. qstring and
+xrefblk_t based tools are enabled only after direct layout validation for the
+installed runtime. dbgflow still does not expose arbitrary IDA eval, IDAPython,
+debugger control, byte/assembly patching, or GUI adoption.
+
+`ida.close_session` requests saving the open database by default (`save: true`).
+Existing `.idb` / `.i64` database targets are operated on in place; pass
+`save: false` only when the session changes should be discarded. The base
+`idalib` close ABI does not report whether saving succeeded, so close events
+and session warnings record that save result as `unknown` rather than claiming
+success.
 
 Configure IDA with `[reverse.ida].install_dir`; when omitted, dbgflow uses
 `DBGFLOW_IDA_DIR` when present and then probes
@@ -210,8 +236,10 @@ Configure IDA with `[reverse.ida].install_dir`; when omitted, dbgflow uses
 configured install directory must contain `ida.exe`, `ida.dll`, `idalib.dll`,
 and `ida.hlp`. Reverse artifacts are written under
 `artifacts\reverse_sessions\<session_id>` with `request.json`, `session.json`,
-`events.jsonl`, `worker.log`, and `outputs\segments.json` /
-`outputs\functions.json`.
+`events.jsonl`, `worker.log`, and unique per-tool JSON outputs under
+`outputs\`. Paged read APIs return a limited page, but their artifacts retain
+the complete filtered JSON result. Rich paged tools apply a default limit of
+100 and a maximum limit of 10000 before calling the worker.
 
 Example IDA session request:
 

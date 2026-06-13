@@ -1,7 +1,9 @@
 use super::registry::{
     ToolDescriptor, ADD_SYMBOLS, CLOSE_SESSION, CREATE_SESSION, EVAL, GET_SESSION,
-    IDA_CLOSE_SESSION, IDA_CREATE_SESSION, IDA_GET_SESSION, IDA_LIST_FUNCTIONS, IDA_LIST_SEGMENTS,
-    IDA_LIST_SESSIONS, LIST_SESSIONS, RECORD_PROFILE, RECORD_TTD,
+    IDA_CLOSE_SESSION, IDA_CREATE_SESSION, IDA_DECOMPILE, IDA_DISASSEMBLE, IDA_GET_METADATA,
+    IDA_GET_SESSION, IDA_LIST_BASIC_BLOCKS, IDA_LIST_EXPORTS, IDA_LIST_FUNCTIONS, IDA_LIST_IMPORTS,
+    IDA_LIST_SEGMENTS, IDA_LIST_SESSIONS, IDA_LIST_STRINGS, IDA_LIST_XREFS, IDA_LOOKUP_FUNCTIONS,
+    IDA_RENAME, IDA_SET_COMMENT, IDA_SET_TYPE, LIST_SESSIONS, RECORD_PROFILE, RECORD_TTD,
 };
 use serde_json::json;
 
@@ -392,48 +394,329 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
             },
             ToolDescriptor {
                 name: IDA_CLOSE_SESSION,
-                description: "Close an IDA reverse-analysis session.",
+                description: "Close an IDA reverse-analysis session. Saves the open database by default.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "session_id": {
                             "type": "string",
                             "description": "Session id returned by ida.create_session."
+                        },
+                        "save": {
+                            "type": "boolean",
+                            "description": "Whether to save the open IDA database before closing. Defaults to true."
                         }
                     },
                     "required": ["session_id"],
                     "additionalProperties": false
                 }),
+            },
+            ToolDescriptor {
+                name: IDA_GET_METADATA,
+                description: "Get metadata for an open IDA reverse-analysis session.",
+                input_schema: session_only_schema(),
             },
             ToolDescriptor {
                 name: IDA_LIST_SEGMENTS,
-                description: "List segments from an open IDA session without resolving names.",
+                description: "List segments from an open IDA session with optional pagination and filtering.",
+                input_schema: paged_session_schema(),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_FUNCTIONS,
+                description: "List functions from an open IDA session with optional pagination and filtering.",
+                input_schema: paged_session_schema(),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_STRINGS,
+                description: "List strings from an open IDA session with optional pagination and filtering.",
+                input_schema: paged_session_schema(),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_IMPORTS,
+                description: "List imports from an open IDA session with optional pagination and filtering.",
+                input_schema: paged_session_schema(),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_EXPORTS,
+                description: "List exports from an open IDA session with optional pagination and filtering.",
+                input_schema: paged_session_schema(),
+            },
+            ToolDescriptor {
+                name: IDA_LOOKUP_FUNCTIONS,
+                description: "Look up IDA functions by address or name.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "session_id": {
                             "type": "string",
                             "description": "Session id returned by ida.create_session."
+                        },
+                        "queries": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "description": "Function addresses or names to resolve."
                         }
                     },
-                    "required": ["session_id"],
+                    "required": ["session_id", "queries"],
                     "additionalProperties": false
                 }),
             },
             ToolDescriptor {
-                name: IDA_LIST_FUNCTIONS,
-                description: "List functions from an open IDA session without resolving names.",
+                name: IDA_DISASSEMBLE,
+                description: "Disassemble a function or address in an open IDA session.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "session_id": {
-                            "type": "string",
-                            "description": "Session id returned by ida.create_session."
+                        "session_id": session_id_property(),
+                        "target": target_property(),
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Instruction offset to start from. Defaults to 0."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 10000,
+                            "description": "Maximum instructions to return. Defaults to 100 and is capped at 10000."
                         }
                     },
-                    "required": ["session_id"],
+                    "required": ["session_id", "target"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_DECOMPILE,
+                description: "Decompile a function in an open IDA session when Hex-Rays is available.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": session_id_property(),
+                        "target": target_property(),
+                        "include_addresses": {
+                            "type": "boolean",
+                            "description": "Whether to include address markers in pseudocode. Defaults to true."
+                        }
+                    },
+                    "required": ["session_id", "target"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_XREFS,
+                description: "List cross-references to or from an address or symbol.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": session_id_property(),
+                        "target": target_property(),
+                        "direction": {
+                            "type": "string",
+                            "enum": ["to", "from", "both"],
+                            "description": "Xref direction. Defaults to both."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["any", "code", "data"],
+                            "description": "Xref kind filter. Defaults to any."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Xref offset to start from. Defaults to 0."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 10000,
+                            "description": "Maximum xrefs to return. Defaults to 100 and is capped at 10000."
+                        }
+                    },
+                    "required": ["session_id", "target"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_LIST_BASIC_BLOCKS,
+                description: "List basic blocks for a function in an open IDA session.",
+                input_schema: target_session_schema(),
+            },
+            ToolDescriptor {
+                name: IDA_RENAME,
+                description: "Rename functions or data symbols in an open IDA session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": session_id_property(),
+                        "items": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "target": target_property(),
+                                    "name": {
+                                        "type": "string",
+                                        "description": "New IDA name."
+                                    },
+                                    "kind": {
+                                        "type": "string",
+                                        "description": "Optional target kind hint such as function or data."
+                                    }
+                                },
+                                "required": ["target", "name"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "Validate without changing the IDB. Defaults to false."
+                        },
+                        "allow_overwrite": {
+                            "type": "boolean",
+                            "description": "Allow overwriting an existing user name. Defaults to false."
+                        }
+                    },
+                    "required": ["session_id", "items"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_SET_COMMENT,
+                description: "Set comments at IDA addresses in an open session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": session_id_property(),
+                        "items": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "target": target_property(),
+                                    "comment": {
+                                        "type": "string",
+                                        "description": "Comment text."
+                                    }
+                                },
+                                "required": ["target", "comment"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "repeatable": {
+                            "type": "boolean",
+                            "description": "Whether to set a repeatable comment. Defaults to false."
+                        },
+                        "view": {
+                            "type": "string",
+                            "enum": ["disassembly", "decompiler", "both"],
+                            "description": "Comment view to update. Defaults to both."
+                        }
+                    },
+                    "required": ["session_id", "items"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolDescriptor {
+                name: IDA_SET_TYPE,
+                description: "Apply function or data types in an open IDA session.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": session_id_property(),
+                        "items": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "target": target_property(),
+                                    "type_text": {
+                                        "type": "string",
+                                        "description": "C type or function declaration text."
+                                    },
+                                    "kind": {
+                                        "type": "string",
+                                        "description": "Optional target kind hint such as function or data."
+                                    }
+                                },
+                                "required": ["target", "type_text"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "Validate without changing the IDB. Defaults to false."
+                        }
+                    },
+                    "required": ["session_id", "items"],
                     "additionalProperties": false
                 }),
             },
         ]
+}
+
+fn session_id_property() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "description": "Session id returned by ida.create_session."
+    })
+}
+
+fn target_property() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "description": "Address, function name, or symbol name."
+    })
+}
+
+fn session_only_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": session_id_property()
+        },
+        "required": ["session_id"],
+        "additionalProperties": false
+    })
+}
+
+fn target_session_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": session_id_property(),
+            "target": target_property()
+        },
+        "required": ["session_id", "target"],
+        "additionalProperties": false
+    })
+}
+
+fn paged_session_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": session_id_property(),
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Item offset to start from. Defaults to 0."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+                "description": "Maximum items to return. Defaults to 100 and is capped at 10000."
+            },
+            "filter": {
+                "type": "string",
+                "description": "Optional case-insensitive text filter."
+            }
+        },
+        "required": ["session_id"],
+        "additionalProperties": false
+    })
 }

@@ -866,6 +866,13 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "ida.list_functions"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.decompile"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.rename"));
+        let ida_close = tools
+            .iter()
+            .find(|tool| tool["name"] == "ida.close_session")
+            .expect("ida.close_session tool");
+        assert!(ida_close["inputSchema"]["properties"].get("save").is_some());
         assert!(!tools.iter().any(|tool| tool["name"] == "set_symbols"));
     }
 

@@ -1,6 +1,11 @@
 use super::dynamic::DynamicIdaApi;
 use super::install::{validate_ida_install_dir, IdaInstall, IDA_INSTALL_ENV};
-use super::model::{FunctionInfo, IdaInfo, SegmentInfo};
+use super::model::{
+    BasicBlocksRequest, BasicBlocksResult, CloseDatabaseResult, DecompileRequest, DecompileResult,
+    DisassembleRequest, Disassembly, ExportInfo, FunctionInfo, FunctionLookup, IdaInfo,
+    IdaMetadata, ImportInfo, ListXrefsRequest, LookupFunctionsRequest, MutationItemResult,
+    PageRequest, RenameRequest, SegmentInfo, SetCommentRequest, SetTypeRequest, StringInfo,
+};
 use super::target::IdaTarget;
 use dbgflow_common::logging::LogSink;
 use dbgflow_common::process::{
@@ -49,10 +54,22 @@ pub trait ReverseWorkerLauncher: Send + Sync {
 
 pub trait ReverseWorker: Send + Sync {
     fn open_database(&self, request: OpenIdaDatabase) -> Result<OpenIdaDatabaseResult>;
+    fn get_metadata(&self) -> Result<IdaMetadata>;
     fn list_segments(&self) -> Result<Vec<SegmentInfo>>;
     fn list_functions(&self) -> Result<Vec<FunctionInfo>>;
+    fn list_strings(&self, request: PageRequest) -> Result<Vec<StringInfo>>;
+    fn list_imports(&self, request: PageRequest) -> Result<Vec<ImportInfo>>;
+    fn list_exports(&self, request: PageRequest) -> Result<Vec<ExportInfo>>;
+    fn lookup_functions(&self, request: LookupFunctionsRequest) -> Result<Vec<FunctionLookup>>;
+    fn disassemble(&self, request: DisassembleRequest) -> Result<Disassembly>;
+    fn decompile(&self, request: DecompileRequest) -> Result<DecompileResult>;
+    fn list_xrefs(&self, request: ListXrefsRequest) -> Result<super::model::XrefsResult>;
+    fn list_basic_blocks(&self, request: BasicBlocksRequest) -> Result<BasicBlocksResult>;
+    fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>>;
+    fn set_comment(&self, request: SetCommentRequest) -> Result<Vec<MutationItemResult>>;
+    fn set_type(&self, request: SetTypeRequest) -> Result<Vec<MutationItemResult>>;
     fn has_exited(&self) -> Result<bool>;
-    fn close(&self) -> Result<()>;
+    fn close(&self, save: bool) -> Result<CloseDatabaseResult>;
     fn kill(&self, reason: &str) -> Result<()>;
 }
 
@@ -255,12 +272,60 @@ impl ReverseWorker for ProcessReverseWorker {
         self.request(WorkerRequest::OpenDatabase(request))
     }
 
+    fn get_metadata(&self) -> Result<IdaMetadata> {
+        self.request(WorkerRequest::GetMetadata)
+    }
+
     fn list_segments(&self) -> Result<Vec<SegmentInfo>> {
         self.request(WorkerRequest::ListSegments)
     }
 
     fn list_functions(&self) -> Result<Vec<FunctionInfo>> {
         self.request(WorkerRequest::ListFunctions)
+    }
+
+    fn list_strings(&self, request: PageRequest) -> Result<Vec<StringInfo>> {
+        self.request(WorkerRequest::ListStrings(request))
+    }
+
+    fn list_imports(&self, request: PageRequest) -> Result<Vec<ImportInfo>> {
+        self.request(WorkerRequest::ListImports(request))
+    }
+
+    fn list_exports(&self, request: PageRequest) -> Result<Vec<ExportInfo>> {
+        self.request(WorkerRequest::ListExports(request))
+    }
+
+    fn lookup_functions(&self, request: LookupFunctionsRequest) -> Result<Vec<FunctionLookup>> {
+        self.request(WorkerRequest::LookupFunctions(request))
+    }
+
+    fn disassemble(&self, request: DisassembleRequest) -> Result<Disassembly> {
+        self.request(WorkerRequest::Disassemble(request))
+    }
+
+    fn decompile(&self, request: DecompileRequest) -> Result<DecompileResult> {
+        self.request(WorkerRequest::Decompile(request))
+    }
+
+    fn list_xrefs(&self, request: ListXrefsRequest) -> Result<super::model::XrefsResult> {
+        self.request(WorkerRequest::ListXrefs(request))
+    }
+
+    fn list_basic_blocks(&self, request: BasicBlocksRequest) -> Result<BasicBlocksResult> {
+        self.request(WorkerRequest::ListBasicBlocks(request))
+    }
+
+    fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>> {
+        self.request(WorkerRequest::Rename(request))
+    }
+
+    fn set_comment(&self, request: SetCommentRequest) -> Result<Vec<MutationItemResult>> {
+        self.request(WorkerRequest::SetComment(request))
+    }
+
+    fn set_type(&self, request: SetTypeRequest) -> Result<Vec<MutationItemResult>> {
+        self.request(WorkerRequest::SetType(request))
     }
 
     fn has_exited(&self) -> Result<bool> {
@@ -271,16 +336,16 @@ impl ReverseWorker for ProcessReverseWorker {
         child.try_wait().map(|status| status.is_some())
     }
 
-    fn close(&self) -> Result<()> {
-        let result: EmptyResult = self.request(WorkerRequest::Close)?;
-        let _ = result;
+    fn close(&self, save: bool) -> Result<CloseDatabaseResult> {
+        let result: CloseDatabaseResult = self.request(WorkerRequest::Close { save })?;
         let deadline = std::time::Instant::now() + EXIT_WAIT_TIMEOUT;
         loop {
             if self.has_exited()? {
-                return Ok(());
+                return Ok(result);
             }
             if std::time::Instant::now() >= deadline {
-                return self.kill("reverse_worker_close_timeout");
+                self.kill("reverse_worker_close_timeout")?;
+                return Ok(result);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -309,9 +374,21 @@ struct WorkerInput {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 enum WorkerRequest {
     OpenDatabase(OpenIdaDatabase),
+    GetMetadata,
     ListSegments,
     ListFunctions,
-    Close,
+    ListStrings(PageRequest),
+    ListImports(PageRequest),
+    ListExports(PageRequest),
+    LookupFunctions(LookupFunctionsRequest),
+    Disassemble(DisassembleRequest),
+    Decompile(DecompileRequest),
+    ListXrefs(ListXrefsRequest),
+    ListBasicBlocks(BasicBlocksRequest),
+    Rename(RenameRequest),
+    SetComment(SetCommentRequest),
+    SetType(SetTypeRequest),
+    Close { save: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,9 +398,6 @@ struct WorkerOutput {
     result: Option<Value>,
     error: Option<String>,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EmptyResult {}
 
 pub fn run_reverse_ida_worker_stdio(
     input: impl BufRead,
@@ -345,9 +419,7 @@ pub fn run_reverse_ida_worker_stdio(
         serde_json::to_writer(&mut output, &response)?;
         writeln!(&mut output)?;
         output.flush()?;
-        if matches!(response.result, Some(Value::Object(ref object)) if object.is_empty())
-            && runtime.should_exit
-        {
+        if runtime.should_exit {
             break;
         }
     }
@@ -357,6 +429,7 @@ pub fn run_reverse_ida_worker_stdio(
 #[derive(Default)]
 struct WorkerRuntime {
     api: Option<DynamicIdaApi>,
+    target: Option<IdaTarget>,
     database_open: bool,
     should_exit: bool,
 }
@@ -382,6 +455,12 @@ impl WorkerRuntime {
     fn handle_request(&mut self, request: WorkerRequest) -> Result<Value> {
         match request {
             WorkerRequest::OpenDatabase(request) => self.open_database(request),
+            WorkerRequest::GetMetadata => {
+                let api = self.require_api()?;
+                let target = self.require_target()?;
+                serde_json::to_value(api.metadata(target)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
             WorkerRequest::ListSegments => {
                 let api = self.require_api()?;
                 serde_json::to_value(api.list_segments()?)
@@ -392,15 +471,75 @@ impl WorkerRuntime {
                 serde_json::to_value(api.list_functions()?)
                     .map_err(|error| DbgFlowError::Backend(error.to_string()))
             }
-            WorkerRequest::Close => {
-                if let Some(api) = &self.api {
+            WorkerRequest::ListStrings(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.list_strings(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::ListImports(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.list_imports(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::ListExports(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.list_exports(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::LookupFunctions(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.lookup_functions(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::Disassemble(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.disassemble(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::Decompile(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.decompile(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::ListXrefs(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.list_xrefs(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::ListBasicBlocks(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.list_basic_blocks(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::Rename(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.rename(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::SetComment(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.set_comment(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::SetType(request) => {
+                let api = self.require_api()?;
+                serde_json::to_value(api.set_type(request)?)
+                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
+            }
+            WorkerRequest::Close { save } => {
+                let close_result = if let Some(api) = &self.api {
                     if self.database_open {
-                        api.close_database(false);
+                        let result = api.close_database(save);
                         self.database_open = false;
+                        result
+                    } else {
+                        CloseDatabaseResult::no_worker(save)
                     }
-                }
+                } else {
+                    CloseDatabaseResult::no_worker(save)
+                };
                 self.should_exit = true;
-                serde_json::to_value(EmptyResult {})
+                serde_json::to_value(close_result)
                     .map_err(|error| DbgFlowError::Backend(error.to_string()))
             }
         }
@@ -420,8 +559,9 @@ impl WorkerRuntime {
         )?;
         let result = OpenIdaDatabaseResult {
             ida: api.info(),
-            warnings: Vec::new(),
+            warnings: rich_api_warnings(&api),
         };
+        self.target = Some(request.target);
         self.database_open = true;
         self.api = Some(api);
         serde_json::to_value(result).map_err(|error| DbgFlowError::Backend(error.to_string()))
@@ -431,6 +571,26 @@ impl WorkerRuntime {
         self.api.as_ref().ok_or_else(|| {
             DbgFlowError::Backend("IDA worker does not have an open database".to_string())
         })
+    }
+
+    fn require_target(&self) -> Result<&IdaTarget> {
+        self.target.as_ref().ok_or_else(|| {
+            DbgFlowError::Backend("IDA worker does not have an open target".to_string())
+        })
+    }
+}
+
+fn rich_api_warnings(api: &DynamicIdaApi) -> Vec<String> {
+    let status = api.rich_api_status();
+    if status.available {
+        status.warnings
+    } else {
+        let detail = if status.missing_symbols.is_empty() {
+            "no direct rich API symbols were available".to_string()
+        } else {
+            format!("missing symbols: {}", status.missing_symbols.join(", "))
+        };
+        vec![format!("IDA direct rich API unavailable: {detail}")]
     }
 }
 

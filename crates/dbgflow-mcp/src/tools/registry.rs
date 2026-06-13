@@ -4,8 +4,13 @@ use dbgflow_common::{DbgFlowError, Result};
 use dbgflow_debug::backend::DebugTarget;
 use dbgflow_debug::session::{EvalSessionResult, Session, SessionId, SessionManager};
 use dbgflow_reverse::ida::{
-    CreateIdaSession, IdaRuntimeConfig, IdaSessionManager, ListFunctionsResult, ListSegmentsResult,
-    ReverseSession,
+    BasicBlocksRequest, CommentItem, CommentView, CreateIdaSession, DecompileRequest,
+    DecompileSessionResult, DisassembleRequest, DisassembleResult, IdaRuntimeConfig,
+    IdaSessionManager, ListBasicBlocksResult, ListExportsResult, ListFunctionsResult,
+    ListImportsResult, ListSegmentsResult, ListStringsResult, ListXrefsRequest, ListXrefsResult,
+    LookupFunctionsRequest, LookupFunctionsResult, MetadataResult, MutationResult, PageRequest,
+    RenameItem, RenameRequest, ReverseSession, SetCommentRequest, SetTypeRequest, TypeItem,
+    XrefDirection, XrefKind,
 };
 use dbgflow_trace::profile::{ProfileCollectorConfig, ProfileManager, ProfileResult, RunProfile};
 use dbgflow_trace::ttd::{RecordTtd, TtdRecordingManager, TtdRecordingResult};
@@ -27,8 +32,20 @@ pub const IDA_CREATE_SESSION: &str = "ida.create_session";
 pub const IDA_GET_SESSION: &str = "ida.get_session";
 pub const IDA_LIST_SESSIONS: &str = "ida.list_sessions";
 pub const IDA_CLOSE_SESSION: &str = "ida.close_session";
+pub const IDA_GET_METADATA: &str = "ida.get_metadata";
 pub const IDA_LIST_SEGMENTS: &str = "ida.list_segments";
 pub const IDA_LIST_FUNCTIONS: &str = "ida.list_functions";
+pub const IDA_LIST_STRINGS: &str = "ida.list_strings";
+pub const IDA_LIST_IMPORTS: &str = "ida.list_imports";
+pub const IDA_LIST_EXPORTS: &str = "ida.list_exports";
+pub const IDA_LOOKUP_FUNCTIONS: &str = "ida.lookup_functions";
+pub const IDA_DISASSEMBLE: &str = "ida.disassemble";
+pub const IDA_DECOMPILE: &str = "ida.decompile";
+pub const IDA_LIST_XREFS: &str = "ida.list_xrefs";
+pub const IDA_LIST_BASIC_BLOCKS: &str = "ida.list_basic_blocks";
+pub const IDA_RENAME: &str = "ida.rename";
+pub const IDA_SET_COMMENT: &str = "ida.set_comment";
+pub const IDA_SET_TYPE: &str = "ida.set_type";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -186,16 +203,116 @@ impl ToolService {
         self.ida_sessions.list_sessions()
     }
 
-    pub fn close_ida_session(&self, session_id: SessionId) -> Result<ReverseSession> {
-        self.ida_sessions.close_session(session_id)
+    pub fn close_ida_session(&self, session_id: SessionId, save: bool) -> Result<ReverseSession> {
+        self.ida_sessions.close_session_with_save(session_id, save)
     }
 
-    pub fn list_ida_segments(&self, session_id: SessionId) -> Result<ListSegmentsResult> {
-        self.ida_sessions.list_segments(session_id)
+    pub fn get_ida_metadata(&self, session_id: SessionId) -> Result<MetadataResult> {
+        self.ida_sessions.get_metadata(session_id)
     }
 
-    pub fn list_ida_functions(&self, session_id: SessionId) -> Result<ListFunctionsResult> {
-        self.ida_sessions.list_functions(session_id)
+    pub fn list_ida_segments(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<ListSegmentsResult> {
+        self.ida_sessions.list_segments_page(session_id, page)
+    }
+
+    pub fn list_ida_functions(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<ListFunctionsResult> {
+        self.ida_sessions.list_functions_page(session_id, page)
+    }
+
+    pub fn list_ida_strings(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<ListStringsResult> {
+        self.ida_sessions.list_strings(session_id, page)
+    }
+
+    pub fn list_ida_imports(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<ListImportsResult> {
+        self.ida_sessions.list_imports(session_id, page)
+    }
+
+    pub fn list_ida_exports(
+        &self,
+        session_id: SessionId,
+        page: PageRequest,
+    ) -> Result<ListExportsResult> {
+        self.ida_sessions.list_exports(session_id, page)
+    }
+
+    pub fn lookup_ida_functions(
+        &self,
+        session_id: SessionId,
+        request: LookupFunctionsRequest,
+    ) -> Result<LookupFunctionsResult> {
+        self.ida_sessions.lookup_functions(session_id, request)
+    }
+
+    pub fn disassemble_ida(
+        &self,
+        session_id: SessionId,
+        request: DisassembleRequest,
+    ) -> Result<DisassembleResult> {
+        self.ida_sessions.disassemble(session_id, request)
+    }
+
+    pub fn decompile_ida(
+        &self,
+        session_id: SessionId,
+        request: DecompileRequest,
+    ) -> Result<DecompileSessionResult> {
+        self.ida_sessions.decompile(session_id, request)
+    }
+
+    pub fn list_ida_xrefs(
+        &self,
+        session_id: SessionId,
+        request: ListXrefsRequest,
+    ) -> Result<ListXrefsResult> {
+        self.ida_sessions.list_xrefs(session_id, request)
+    }
+
+    pub fn list_ida_basic_blocks(
+        &self,
+        session_id: SessionId,
+        request: BasicBlocksRequest,
+    ) -> Result<ListBasicBlocksResult> {
+        self.ida_sessions.list_basic_blocks(session_id, request)
+    }
+
+    pub fn rename_ida(
+        &self,
+        session_id: SessionId,
+        request: RenameRequest,
+    ) -> Result<MutationResult> {
+        self.ida_sessions.rename(session_id, request)
+    }
+
+    pub fn set_ida_comment(
+        &self,
+        session_id: SessionId,
+        request: SetCommentRequest,
+    ) -> Result<MutationResult> {
+        self.ida_sessions.set_comment(session_id, request)
+    }
+
+    pub fn set_ida_type(
+        &self,
+        session_id: SessionId,
+        request: SetTypeRequest,
+    ) -> Result<MutationResult> {
+        self.ida_sessions.set_type(session_id, request)
     }
 
     pub fn subscribe_session_updates(&self) -> mpsc::Receiver<SessionId> {
@@ -269,19 +386,91 @@ impl ToolService {
                 .and_then(to_value),
             IDA_CLOSE_SESSION => {
                 let request: CloseIdaSessionRequest = decode_arguments(arguments)?;
-                self.close_ida_session(request.session_id)
+                self.close_ida_session(request.session_id, request.save)
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_GET_METADATA => {
+                let request: GetIdaSessionRequest = decode_arguments(arguments)?;
+                self.get_ida_metadata(request.session_id)
                     .map_err(ToolCallError::execution)
                     .and_then(to_value)
             }
             IDA_LIST_SEGMENTS => {
-                let request: ListIdaSegmentsRequest = decode_arguments(arguments)?;
-                self.list_ida_segments(request.session_id)
+                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
+                self.list_ida_segments(request.session_id, request.page())
                     .map_err(ToolCallError::execution)
                     .and_then(to_value)
             }
             IDA_LIST_FUNCTIONS => {
-                let request: ListIdaFunctionsRequest = decode_arguments(arguments)?;
-                self.list_ida_functions(request.session_id)
+                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
+                self.list_ida_functions(request.session_id, request.page())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_STRINGS => {
+                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
+                self.list_ida_strings(request.session_id, request.page())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_IMPORTS => {
+                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
+                self.list_ida_imports(request.session_id, request.page())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_EXPORTS => {
+                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
+                self.list_ida_exports(request.session_id, request.page())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LOOKUP_FUNCTIONS => {
+                let request: IdaLookupFunctionsToolRequest = decode_arguments(arguments)?;
+                self.lookup_ida_functions(request.session_id, request.into_inner())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_DISASSEMBLE => {
+                let request: IdaDisassembleToolRequest = decode_arguments(arguments)?;
+                self.disassemble_ida(request.session_id, request.into_inner())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_DECOMPILE => {
+                let request: IdaDecompileToolRequest = decode_arguments(arguments)?;
+                self.decompile_ida(request.session_id, request.into_inner())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_XREFS => {
+                let request: IdaListXrefsToolRequest = decode_arguments(arguments)?;
+                self.list_ida_xrefs(request.session_id, request.into_inner())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_LIST_BASIC_BLOCKS => {
+                let request: IdaBasicBlocksToolRequest = decode_arguments(arguments)?;
+                self.list_ida_basic_blocks(request.session_id, request.into_inner())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_RENAME => {
+                let request: IdaRenameToolRequest = decode_arguments(arguments)?;
+                self.rename_ida(request.session_id, request.into_inner())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_SET_COMMENT => {
+                let request: IdaSetCommentToolRequest = decode_arguments(arguments)?;
+                self.set_ida_comment(request.session_id, request.into_inner())
+                    .map_err(ToolCallError::execution)
+                    .and_then(to_value)
+            }
+            IDA_SET_TYPE => {
+                let request: IdaSetTypeToolRequest = decode_arguments(arguments)?;
+                self.set_ida_type(request.session_id, request.into_inner())
                     .map_err(ToolCallError::execution)
                     .and_then(to_value)
             }
@@ -351,18 +540,182 @@ pub struct GetIdaSessionRequest {
 #[serde(deny_unknown_fields)]
 pub struct CloseIdaSessionRequest {
     pub session_id: SessionId,
+    #[serde(default = "default_close_ida_save")]
+    pub save: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ListIdaSegmentsRequest {
+pub struct ListIdaPagedRequest {
     pub session_id: SessionId,
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: Option<usize>,
+    pub filter: Option<String>,
+}
+
+impl ListIdaPagedRequest {
+    fn page(self) -> PageRequest {
+        PageRequest {
+            offset: self.offset,
+            limit: self.limit,
+            filter: self.filter,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ListIdaFunctionsRequest {
+pub struct IdaLookupFunctionsToolRequest {
     pub session_id: SessionId,
+    pub queries: Vec<String>,
+}
+
+impl IdaLookupFunctionsToolRequest {
+    fn into_inner(self) -> LookupFunctionsRequest {
+        LookupFunctionsRequest {
+            queries: self.queries,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdaDisassembleToolRequest {
+    pub session_id: SessionId,
+    pub target: String,
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+impl IdaDisassembleToolRequest {
+    fn into_inner(self) -> DisassembleRequest {
+        DisassembleRequest {
+            target: self.target,
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdaDecompileToolRequest {
+    pub session_id: SessionId,
+    pub target: String,
+    #[serde(default = "default_include_addresses")]
+    pub include_addresses: bool,
+}
+
+impl IdaDecompileToolRequest {
+    fn into_inner(self) -> DecompileRequest {
+        DecompileRequest {
+            target: self.target,
+            include_addresses: self.include_addresses,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdaListXrefsToolRequest {
+    pub session_id: SessionId,
+    pub target: String,
+    #[serde(default = "default_xref_direction")]
+    pub direction: XrefDirection,
+    #[serde(default = "default_xref_kind")]
+    pub kind: XrefKind,
+    #[serde(default)]
+    pub offset: usize,
+    pub limit: Option<usize>,
+}
+
+impl IdaListXrefsToolRequest {
+    fn into_inner(self) -> ListXrefsRequest {
+        ListXrefsRequest {
+            target: self.target,
+            direction: self.direction,
+            kind: self.kind,
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdaBasicBlocksToolRequest {
+    pub session_id: SessionId,
+    pub target: String,
+}
+
+impl IdaBasicBlocksToolRequest {
+    fn into_inner(self) -> BasicBlocksRequest {
+        BasicBlocksRequest {
+            target: self.target,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdaRenameToolRequest {
+    pub session_id: SessionId,
+    pub items: Vec<RenameItem>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub allow_overwrite: bool,
+}
+
+impl IdaRenameToolRequest {
+    fn into_inner(self) -> RenameRequest {
+        RenameRequest {
+            items: self.items,
+            dry_run: self.dry_run,
+            allow_overwrite: self.allow_overwrite,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdaSetCommentToolRequest {
+    pub session_id: SessionId,
+    pub items: Vec<CommentItem>,
+    #[serde(default)]
+    pub repeatable: bool,
+    #[serde(default = "default_comment_view")]
+    pub view: CommentView,
+}
+
+impl IdaSetCommentToolRequest {
+    fn into_inner(self) -> SetCommentRequest {
+        SetCommentRequest {
+            items: self.items,
+            repeatable: self.repeatable,
+            view: self.view,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdaSetTypeToolRequest {
+    pub session_id: SessionId,
+    pub items: Vec<TypeItem>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl IdaSetTypeToolRequest {
+    fn into_inner(self) -> SetTypeRequest {
+        SetTypeRequest {
+            items: self.items,
+            dry_run: self.dry_run,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +826,26 @@ impl<'de> Deserialize<'de> for RunProfileRequest {
     }
 }
 
+fn default_close_ida_save() -> bool {
+    true
+}
+
+fn default_include_addresses() -> bool {
+    true
+}
+
+fn default_xref_direction() -> XrefDirection {
+    XrefDirection::Both
+}
+
+fn default_xref_kind() -> XrefKind {
+    XrefKind::Any
+}
+
+fn default_comment_view() -> CommentView {
+    CommentView::Both
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +916,30 @@ mod tests {
         assert!(descriptors
             .iter()
             .any(|descriptor| descriptor.name == IDA_LIST_FUNCTIONS));
+        for name in [
+            IDA_GET_METADATA,
+            IDA_LIST_STRINGS,
+            IDA_LIST_IMPORTS,
+            IDA_LIST_EXPORTS,
+            IDA_LOOKUP_FUNCTIONS,
+            IDA_DISASSEMBLE,
+            IDA_DECOMPILE,
+            IDA_LIST_XREFS,
+            IDA_LIST_BASIC_BLOCKS,
+            IDA_RENAME,
+            IDA_SET_COMMENT,
+            IDA_SET_TYPE,
+        ] {
+            assert!(
+                descriptors.iter().any(|descriptor| descriptor.name == name),
+                "missing descriptor {name}"
+            );
+        }
+        let close = descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == IDA_CLOSE_SESSION)
+            .expect("ida.close_session descriptor");
+        assert!(close.input_schema["properties"].get("save").is_some());
     }
 
     #[test]
@@ -579,6 +976,47 @@ mod tests {
             decode_arguments::<CreateIdaSession>(value).expect_err("reject unknown ida target");
 
         assert!(error.to_string().contains("probe"));
+    }
+
+    #[test]
+    fn ida_close_session_defaults_to_save() {
+        let value = json!({
+            "session_id": "00000000-0000-0000-0000-000000000000"
+        });
+
+        let request: CloseIdaSessionRequest = decode_arguments(value).expect("decode close");
+
+        assert!(request.save);
+    }
+
+    #[test]
+    fn ida_tool_arguments_decode_rich_requests() {
+        let xrefs = json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "target": "main",
+            "direction": "to",
+            "kind": "code",
+            "offset": 10,
+            "limit": 20
+        });
+        let comments = json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "items": [
+                { "target": "0x401000", "comment": "entry point" }
+            ],
+            "repeatable": true,
+            "view": "both"
+        });
+
+        let xrefs: IdaListXrefsToolRequest = decode_arguments(xrefs).expect("decode xrefs");
+        let comments: IdaSetCommentToolRequest =
+            decode_arguments(comments).expect("decode comments");
+
+        assert_eq!(xrefs.direction, XrefDirection::To);
+        assert_eq!(xrefs.kind, XrefKind::Code);
+        assert_eq!(xrefs.offset, 10);
+        assert_eq!(comments.view, CommentView::Both);
+        assert!(comments.repeatable);
     }
 
     #[test]
