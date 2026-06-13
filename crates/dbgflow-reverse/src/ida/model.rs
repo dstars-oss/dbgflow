@@ -130,7 +130,6 @@ pub struct DirectIdaCapabilities {
     pub imports: bool,
     pub exports: bool,
     pub xrefs: bool,
-    pub basic_blocks: bool,
     pub comments: bool,
     pub types: bool,
     pub decompiler: bool,
@@ -271,23 +270,6 @@ pub struct XrefsResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BasicBlockInfo {
-    pub id: usize,
-    pub start_ea: String,
-    pub end_ea: String,
-    pub successors: Vec<String>,
-    pub predecessors: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BasicBlocksResult {
-    pub target: String,
-    pub function: Option<FunctionInfo>,
-    pub blocks: Vec<BasicBlockInfo>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LookupFunctionsRequest {
     pub queries: Vec<String>,
@@ -337,12 +319,6 @@ pub struct ListXrefsRequest {
     #[serde(default)]
     pub offset: usize,
     pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BasicBlocksRequest {
-    pub target: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,5 +403,5 @@ fn default_xref_kind() -> XrefKind {
 }
 
 fn default_comment_view() -> CommentView {
-    CommentView::Both
+    CommentView::Disassembly
 }

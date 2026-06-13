@@ -1,9 +1,9 @@
 use super::registry::{
     ToolDescriptor, ADD_SYMBOLS, CLOSE_SESSION, CREATE_SESSION, EVAL, GET_SESSION,
     IDA_CLOSE_SESSION, IDA_CREATE_SESSION, IDA_DECOMPILE, IDA_DISASSEMBLE, IDA_GET_METADATA,
-    IDA_GET_SESSION, IDA_LIST_BASIC_BLOCKS, IDA_LIST_EXPORTS, IDA_LIST_FUNCTIONS, IDA_LIST_IMPORTS,
-    IDA_LIST_SEGMENTS, IDA_LIST_SESSIONS, IDA_LIST_STRINGS, IDA_LIST_XREFS, IDA_LOOKUP_FUNCTIONS,
-    IDA_RENAME, IDA_SET_COMMENT, IDA_SET_TYPE, LIST_SESSIONS, RECORD_PROFILE, RECORD_TTD,
+    IDA_GET_SESSION, IDA_LIST_EXPORTS, IDA_LIST_FUNCTIONS, IDA_LIST_IMPORTS, IDA_LIST_SEGMENTS,
+    IDA_LIST_SESSIONS, IDA_LIST_STRINGS, IDA_LIST_XREFS, IDA_LOOKUP_FUNCTIONS, IDA_RENAME,
+    IDA_SET_COMMENT, IDA_SET_TYPE, LIST_SESSIONS, RECORD_PROFILE, RECORD_TTD,
 };
 use serde_json::json;
 
@@ -538,11 +538,6 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
                 }),
             },
             ToolDescriptor {
-                name: IDA_LIST_BASIC_BLOCKS,
-                description: "List basic blocks for a function in an open IDA session.",
-                input_schema: target_session_schema(),
-            },
-            ToolDescriptor {
                 name: IDA_RENAME,
                 description: "Rename functions or data symbols in an open IDA session.",
                 input_schema: json!({
@@ -612,7 +607,7 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
                         "view": {
                             "type": "string",
                             "enum": ["disassembly", "decompiler", "both"],
-                            "description": "Comment view to update. Defaults to both."
+                            "description": "Comment view to update. Defaults to disassembly."
                         }
                     },
                     "required": ["session_id", "items"],
@@ -679,18 +674,6 @@ fn session_only_schema() -> serde_json::Value {
             "session_id": session_id_property()
         },
         "required": ["session_id"],
-        "additionalProperties": false
-    })
-}
-
-fn target_session_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "session_id": session_id_property(),
-            "target": target_property()
-        },
-        "required": ["session_id", "target"],
         "additionalProperties": false
     })
 }

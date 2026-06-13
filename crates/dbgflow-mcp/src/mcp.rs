@@ -868,6 +868,9 @@ mod tests {
             .any(|tool| tool["name"] == "ida.list_functions"));
         assert!(tools.iter().any(|tool| tool["name"] == "ida.decompile"));
         assert!(tools.iter().any(|tool| tool["name"] == "ida.rename"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "ida.list_basic_blocks"));
         let ida_close = tools
             .iter()
             .find(|tool| tool["name"] == "ida.close_session")

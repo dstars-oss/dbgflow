@@ -1,10 +1,10 @@
 use super::install::{resolve_ida_install, IdaRuntimeConfig};
 use super::model::{
-    BasicBlocksRequest, BasicBlocksResult, CloseDatabaseResult, DecompileRequest, DecompileResult,
-    DisassembleRequest, Disassembly, ExportInfo, FunctionInfo, FunctionLookup, IdaMetadata,
-    ImportInfo, ListXrefsRequest, LookupFunctionsRequest, MutationItemResult, PageInfo,
-    PageRequest, RenameRequest, ReverseSession, ReverseSessionState, SegmentInfo,
-    SetCommentRequest, SetTypeRequest, StringInfo, XrefsResult,
+    CloseDatabaseResult, DecompileRequest, DecompileResult, DisassembleRequest, Disassembly,
+    ExportInfo, FunctionInfo, FunctionLookup, IdaMetadata, ImportInfo, ListXrefsRequest,
+    LookupFunctionsRequest, MutationItemResult, PageInfo, PageRequest, RenameRequest,
+    ReverseSession, ReverseSessionState, SegmentInfo, SetCommentRequest, SetTypeRequest,
+    StringInfo, XrefsResult,
 };
 use super::target::{validate_ida_target, IdaTarget};
 use super::worker::{
@@ -108,13 +108,6 @@ pub struct DecompileSessionResult {
 pub struct ListXrefsResult {
     pub session_id: SessionId,
     pub xrefs: XrefsResult,
-    pub artifact: ArtifactRef,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListBasicBlocksResult {
-    pub session_id: SessionId,
-    pub basic_blocks: BasicBlocksResult,
     pub artifact: ArtifactRef,
 }
 
@@ -679,27 +672,6 @@ impl IdaSessionManager {
         Ok(ListXrefsResult {
             session_id,
             xrefs,
-            artifact,
-        })
-    }
-
-    pub fn list_basic_blocks(
-        &self,
-        session_id: SessionId,
-        request: BasicBlocksRequest,
-    ) -> Result<ListBasicBlocksResult> {
-        let basic_blocks = self.worker_query(session_id, "ida.list_basic_blocks", |worker| {
-            worker.list_basic_blocks(request)
-        })?;
-        let artifact = self.write_output(
-            session_id,
-            "basic_blocks.json",
-            "ida.list_basic_blocks",
-            &basic_blocks,
-        )?;
-        Ok(ListBasicBlocksResult {
-            session_id,
-            basic_blocks,
             artifact,
         })
     }
@@ -1491,7 +1463,7 @@ mod tests {
     use super::super::model::{IdaInfo, IdaVersion};
     use super::super::worker::OpenIdaDatabaseResult;
     use super::*;
-    use crate::ida::{BasicBlockInfo, DisassemblyLine, RenameItem};
+    use crate::ida::{CommentItem, CommentView, DisassemblyLine, RenameItem, TypeItem};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     #[test]
@@ -1915,6 +1887,105 @@ mod tests {
     }
 
     #[test]
+    fn mutation_edge_cases_are_audited_without_partial_comment_write() {
+        let root = test_root("mutation-edge");
+        let install = fake_ida_install(&root);
+        let target = fake_binary(&root);
+        let manager = manager_with_mock(&root, install);
+        let session = manager
+            .create_session(CreateIdaSession {
+                target: IdaTarget::Binary { path: target },
+                run_auto_analysis: true,
+                startup_timeout_ms: Some(1000),
+            })
+            .expect("create");
+
+        let rename = manager
+            .rename(
+                session.id,
+                RenameRequest {
+                    items: vec![
+                        RenameItem {
+                            target: "0x1100".to_string(),
+                            name: " ".to_string(),
+                            kind: Some("function".to_string()),
+                        },
+                        RenameItem {
+                            target: "0x1100".to_string(),
+                            name: "bad\0name".to_string(),
+                            kind: Some("function".to_string()),
+                        },
+                    ],
+                    dry_run: true,
+                    allow_overwrite: false,
+                },
+            )
+            .expect("rename");
+        assert!(!rename.results[0].success);
+        assert!(rename.results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("must not be empty")));
+        assert!(!rename.results[1].success);
+        assert!(rename.results[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("contains NUL")));
+
+        let set_type = manager
+            .set_type(
+                session.id,
+                SetTypeRequest {
+                    items: vec![TypeItem {
+                        target: "0x1100".to_string(),
+                        type_text: "int __cdecl sample(void);".to_string(),
+                        kind: Some("function".to_string()),
+                    }],
+                    dry_run: true,
+                },
+            )
+            .expect("set type");
+        assert!(!set_type.results[0].success);
+        assert!(set_type.results[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("dry_run validation is unavailable")));
+
+        let comment_error = manager
+            .set_comment(
+                session.id,
+                SetCommentRequest {
+                    items: vec![CommentItem {
+                        target: "0x1100".to_string(),
+                        comment: "entry point".to_string(),
+                    }],
+                    repeatable: false,
+                    view: CommentView::Both,
+                },
+            )
+            .expect_err("decompiler comment view fails before writing");
+        assert!(comment_error
+            .to_string()
+            .contains("decompiler comment view"));
+
+        let outputs = root
+            .join("artifacts")
+            .join("reverse_sessions")
+            .join(session.id.to_string())
+            .join("outputs");
+        let has_comment_artifact = std::fs::read_dir(outputs)
+            .expect("outputs")
+            .filter_map(std::result::Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("comments-"))
+            });
+        assert!(!has_comment_artifact);
+    }
+
+    #[test]
     #[ignore = "requires a licensed local IDA Professional runtime"]
     fn real_ida_create_binary_session() {
         if std::env::var("DBGFLOW_REAL_IDA_TEST").as_deref() != Ok("1") {
@@ -1924,13 +1995,8 @@ mod tests {
             .map(PathBuf::from)
             .expect("DBGFLOW_IDA_DIR must be set");
         let root = test_root("real-create");
-        let manager = IdaSessionManager::new(
-            root.join("artifacts"),
-            IdaRuntimeConfig {
-                install_dir: Some(ida_dir),
-            },
-        );
-        let target = std::env::current_exe().expect("current test exe");
+        let manager = real_ida_manager(&root, ida_dir);
+        let target = real_ida_sample(&root);
 
         let session = manager
             .create_session(CreateIdaSession {
@@ -1954,13 +2020,8 @@ mod tests {
             .map(PathBuf::from)
             .expect("DBGFLOW_IDA_DIR must be set");
         let root = test_root("real-list");
-        let manager = IdaSessionManager::new(
-            root.join("artifacts"),
-            IdaRuntimeConfig {
-                install_dir: Some(ida_dir),
-            },
-        );
-        let target = std::env::current_exe().expect("current test exe");
+        let manager = real_ida_manager(&root, ida_dir);
+        let target = real_ida_sample(&root);
         let session = manager
             .create_session(CreateIdaSession {
                 target: IdaTarget::Binary { path: target },
@@ -1987,13 +2048,8 @@ mod tests {
             .map(PathBuf::from)
             .expect("DBGFLOW_IDA_DIR must be set");
         let root = test_root("real-rich");
-        let manager = IdaSessionManager::new(
-            root.join("artifacts"),
-            IdaRuntimeConfig {
-                install_dir: Some(ida_dir),
-            },
-        );
-        let target = std::env::current_exe().expect("current test exe");
+        let manager = real_ida_manager(&root, ida_dir);
+        let target = real_ida_sample(&root);
         let session = manager
             .create_session(CreateIdaSession {
                 target: IdaTarget::Binary { path: target },
@@ -2004,6 +2060,13 @@ mod tests {
 
         let metadata = manager.get_metadata(session.id).expect("metadata");
         assert!(metadata.metadata.rich_api.available);
+        let warnings = metadata.metadata.rich_api.warnings.join("\n");
+        if !metadata.metadata.rich_api.capabilities.strings {
+            assert!(warnings.contains("qstring"));
+        }
+        if !metadata.metadata.rich_api.capabilities.xrefs {
+            assert!(warnings.contains("xrefblk_t"));
+        }
         let functions = manager.list_functions(session.id).expect("functions");
         let first = functions
             .functions
@@ -2011,17 +2074,17 @@ mod tests {
             .expect("at least one function")
             .start_ea
             .clone();
-        let disassembly = manager
-            .disassemble(
-                session.id,
-                DisassembleRequest {
-                    target: first.clone(),
-                    offset: 0,
-                    limit: Some(10),
-                },
-            )
-            .expect("disassemble");
-        assert!(disassembly.disassembly.error.is_none());
+        match manager.disassemble(
+            session.id,
+            DisassembleRequest {
+                target: first.clone(),
+                offset: 0,
+                limit: Some(10),
+            },
+        ) {
+            Ok(disassembly) => assert!(disassembly.disassembly.error.is_none()),
+            Err(error) => assert!(error.to_string().contains("qstring")),
+        }
         let _ = manager.decompile(
             session.id,
             DecompileRequest {
@@ -2030,6 +2093,79 @@ mod tests {
             },
         );
         let _ = manager.close_session_with_save(session.id, false);
+    }
+
+    fn real_ida_manager(root: &std::path::Path, ida_dir: PathBuf) -> IdaSessionManager {
+        IdaSessionManager::with_worker_launcher_runtime_and_logger(
+            Arc::new(ProcessReverseWorkerLauncher::with_executable(
+                real_dbgflow_mcp_exe(),
+            )),
+            root.join("artifacts"),
+            IdaRuntimeConfig {
+                install_dir: Some(ida_dir),
+            },
+            noop_logger(),
+        )
+    }
+
+    fn real_ida_sample(root: &std::path::Path) -> PathBuf {
+        let source = std::env::var_os("DBGFLOW_IDA_SAMPLE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_exe().expect("current test exe"));
+        let file_name = source
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("sample.exe"));
+        let target = root.join(file_name);
+        std::fs::copy(&source, &target).unwrap_or_else(|error| {
+            panic!(
+                "copy real IDA sample {} to {}: {error}",
+                source.display(),
+                target.display()
+            )
+        });
+        target
+    }
+
+    fn real_dbgflow_mcp_exe() -> PathBuf {
+        if let Some(path) = std::env::var_os("DBGFLOW_MCP_EXE").map(PathBuf::from) {
+            return path;
+        }
+
+        let current = std::env::current_exe().expect("current test exe");
+        let mut candidates = Vec::new();
+        if let Some(profile_dir) = current.parent().and_then(|parent| {
+            (parent.file_name()? == "deps")
+                .then(|| parent.parent())
+                .flatten()
+        }) {
+            candidates.push(profile_dir.join("dbgflow-mcp.exe"));
+        }
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|parent| parent.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        candidates.push(
+            workspace
+                .join("target")
+                .join("debug")
+                .join("dbgflow-mcp.exe"),
+        );
+        candidates.push(
+            workspace
+                .join("target")
+                .join("release")
+                .join("dbgflow-mcp.exe"),
+        );
+
+        candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "DBGFLOW_MCP_EXE must point to dbgflow-mcp.exe; run `cargo build -p dbgflow-mcp` first"
+                )
+            })
     }
 
     fn manager_with_mock(root: &std::path::Path, install: IdaInstall) -> IdaSessionManager {
@@ -2241,7 +2377,6 @@ mod tests {
                         imports: true,
                         exports: true,
                         xrefs: true,
-                        basic_blocks: true,
                         comments: true,
                         types: true,
                         decompiler: true,
@@ -2357,40 +2492,42 @@ mod tests {
             })
         }
 
-        fn list_basic_blocks(&self, request: BasicBlocksRequest) -> Result<BasicBlocksResult> {
-            self.check_rich()?;
-            Ok(BasicBlocksResult {
-                target: request.target,
-                function: None,
-                blocks: vec![BasicBlockInfo {
-                    id: 0,
-                    start_ea: "0x1100".to_string(),
-                    end_ea: "0x1101".to_string(),
-                    successors: Vec::new(),
-                    predecessors: Vec::new(),
-                }],
-                error: None,
-            })
-        }
-
         fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>> {
             self.check_rich()?;
             Ok(request
                 .items
                 .into_iter()
-                .map(|item| MutationItemResult {
-                    target: item.target,
-                    old: Some("old_name".to_string()),
-                    new: Some(item.name),
-                    success: true,
-                    dry_run: request.dry_run,
-                    error: None,
+                .map(|item| {
+                    let error = if item.name.trim().is_empty() {
+                        Some("IDA name must not be empty".to_string())
+                    } else if item.name.as_bytes().contains(&0) {
+                        Some("IDA name contains NUL".to_string())
+                    } else {
+                        None
+                    };
+                    MutationItemResult {
+                        target: item.target,
+                        old: Some("old_name".to_string()),
+                        new: Some(item.name.clone()),
+                        success: error.is_none(),
+                        dry_run: request.dry_run,
+                        error,
+                    }
                 })
                 .collect())
         }
 
         fn set_comment(&self, request: SetCommentRequest) -> Result<Vec<MutationItemResult>> {
             self.check_rich()?;
+            if matches!(
+                request.view,
+                super::super::model::CommentView::Decompiler
+                    | super::super::model::CommentView::Both
+            ) {
+                return Err(DbgFlowError::Backend(
+                    "ida.set_comment decompiler comment view is unsupported because Hex-Rays direct decompiler dispatcher is unavailable in this build".to_string(),
+                ));
+            }
             Ok(request
                 .items
                 .into_iter()
@@ -2414,9 +2551,11 @@ mod tests {
                     target: item.target,
                     old: None,
                     new: Some(item.type_text),
-                    success: true,
+                    success: !request.dry_run,
                     dry_run: request.dry_run,
-                    error: None,
+                    error: request.dry_run.then(|| {
+                        "set_type dry_run validation is unavailable without a validated parse_decl/tinfo direct binding".to_string()
+                    }),
                 })
                 .collect())
         }

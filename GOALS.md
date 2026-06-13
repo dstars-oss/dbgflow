@@ -105,7 +105,7 @@ TTD trace 必须作为敏感 artifact 管理。
 目标能力：
 
 * 支持 binary / IDB analysis session。
-* 支持函数、基本块、反汇编、字符串、imports / exports、xrefs、类型和伪代码查询。
+* 支持函数、反汇编、字符串、imports / exports、xrefs、类型和伪代码查询。
 * 支持受控 IDB 标注修改能力，例如 rename、comment 和 type，并完整记录审计。
 * 公开 tool 使用 `ida.*` namespace，首版面向 IDA / idalib 语义。
 * binary、IDB / i64、伪代码、反汇编和分析输出均按敏感 artifact 管理。
@@ -259,7 +259,7 @@ dbgflow-mcp
 * 支持 runtime 配置探测或指定 IDA install 与 SDK / idalib 运行环境。
 * 支持每个 reverse analysis session 使用独立 worker 子进程。
 * 支持 `ida.*` tool descriptor 与 reverse session lifecycle MVP。
-* 支持只读查询能力：函数、基本块、反汇编、字符串、imports / exports、xrefs、类型和伪代码。
+* 支持只读查询能力：函数、反汇编、字符串、imports / exports、xrefs、类型和伪代码。
 * 支持受控标注修改能力：rename、comment 和 type。
 * 支持 reverse artifacts、审计日志和错误记录。
 
@@ -279,7 +279,6 @@ ida.lookup_functions
 ida.disassemble
 ida.decompile
 ida.list_xrefs
-ida.list_basic_blocks
 ida.rename
 ida.set_comment
 ida.set_type
@@ -290,7 +289,10 @@ ida.set_type
 记录为 `unknown`。rich reverse tools 通过 Rust direct binding 直接加载官方
 `ida.dll` / `idalib.dll` runtime symbols；缺少 symbol、license 或 processor 支持时
 返回明确 unsupported error，基础 session / metadata / segment / function 查询仍可用。
-分页 rich tools 在 Rust 层统一应用默认 limit 100、最大 limit 10000。
+qstring 和 xrefblk_t 依赖能力会在 database 打开后用当前 IDB 中的安全样本做 runtime
+validation；未通过时 metadata warning 和 unsupported error 会记录具体原因。分页 rich
+tools 在 Rust 层统一应用默认 limit 100、最大 limit 10000。`ida.decompile` 保持明确
+unsupported，直到 Hex-Rays dispatcher 完成验证。
 
 ## 7. 关键设计决策
 
@@ -737,11 +739,11 @@ linked elevated token 且配置允许，则优先使用 elevated token。
 * [x] 设计 `ida.*` MCP tool schema 和 session lifecycle。
 * [x] 支持 headless binary / IDB analysis session MVP。
 * [x] 支持只读 segment / function 列表 MVP；direct rich binding 可返回 name / segment 等增强字段。
-* [x] 暴露函数、基本块、反汇编、字符串、imports / exports、xrefs、类型和伪代码 typed tool surface，并通过 Rust direct binding dispatch。
+* [x] 暴露函数、反汇编、字符串、imports / exports、xrefs、类型和伪代码 typed tool surface，并通过 Rust direct binding dispatch；移除未验证的一函数一块控制流占位工具。
 * [x] 暴露受控 IDB 标注修改 tool surface：rename、comment 和 type，默认 close 时保存。
 * [x] 支持 reverse query / mutation artifacts、审计日志和敏感输出记录。
 * [x] reverse outputs 使用唯一 artifact 文件名，避免重复查询或修改覆盖旧审计结果。
-* [ ] 强化 Rust direct IDA binding 的 real-runtime layout / call validation、Hex-Rays dispatcher 和版本升级流程。
+* [ ] 继续强化 Rust direct IDA binding 的版本升级流程，并在未来补齐 Hex-Rays dispatcher；qstring / xrefblk runtime validation 已完成 MVP。
 * [ ] 增强 close/save 结果来源；基础 idalib ABI 只能记录保存请求和 unknown 结果。
 * [ ] 支持后续 redaction 策略。
 

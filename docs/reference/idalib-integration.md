@@ -23,7 +23,6 @@ dbgflow uses an IDA session model:
 - `ida.disassemble`
 - `ida.decompile`
 - `ida.list_xrefs`
-- `ida.list_basic_blocks`
 - `ida.rename`
 - `ida.set_comment`
 - `ida.set_type`
@@ -89,11 +88,11 @@ arbitrary IDA eval, IDAPython, or runtime script execution is exposed.
 
 Direct rich binding currently targets IDA Professional 9.3 x64. At runtime the
 worker probes symbols such as `get_ea_name`, `get_name_ea`,
-`generate_disasm_line`, `tag_remove`, `next_head`, `get_strlit_contents`,
-`enum_import_names`, `get_entry_name`, `xrefblk_t_first_from`,
-`xrefblk_t_first_to`, `set_name`, `set_cmt`, and `apply_cdecl`. The qstring and
-xref wrappers are private, non-`Send`/`Sync` values used only inside the worker
-operation lock.
+`generate_disasm_line`, `tag_remove`, `next_head`, `get_flags_ex`,
+`get_strlit_contents`, `enum_import_names`, `get_entry_name`,
+`xrefblk_t_first_from`, `xrefblk_t_first_to`, `set_name`, `set_cmt`,
+`apply_cdecl`, and `print_type`. The qstring and xref wrappers are private,
+non-`Send`/`Sync` values used only inside the worker operation lock.
 
 `ida.get_metadata` exposes a `rich_api` status object:
 
@@ -109,7 +108,6 @@ operation lock.
     "imports": false,
     "exports": false,
     "xrefs": false,
-    "basic_blocks": true,
     "comments": true,
     "types": true,
     "decompiler": false
@@ -117,7 +115,8 @@ operation lock.
   "missing_symbols": [],
   "hexrays": "not_loaded",
   "warnings": [
-    "IDA direct qstring layout validation has not passed; qstring-dependent tools are disabled",
+    "IDA direct qstring layout validation has not passed; qstring-dependent tools are disabled: no non-empty segment or function name sample was available",
+    "IDA direct xrefblk_t layout validation has not passed; xref tools are disabled: no xref sample was available in the first 128 functions",
     "Hex-Rays direct decompiler dispatcher is unavailable in this build"
   ]
 }
@@ -211,9 +210,14 @@ Layout assumptions checked against IDA 9.3 SDK:
   `uchar align`, `uchar comb`, `uchar perm`, `uchar bitness`
 - `func_t : range_t` then `uint64 flags`
 
-The direct binding layer contains private qstring/name/xref wrappers, but
-qstring-dependent and xrefblk-dependent capabilities remain disabled until
-real-runtime layout validation passes for the installed IDA 9.3 x64 runtime.
+The direct binding layer contains private qstring/name/xref wrappers. After a
+database opens, the worker validates qstring handling with segment or function
+name samples from the loaded database, and validates xrefblk_t traversal with
+sampled xrefs whose endpoints must fall inside loaded segments. qstring- and
+xrefblk-dependent capabilities remain disabled when validation cannot run, no
+safe sample is available, or a runtime layout check fails; the concrete reason is
+reported through `ida.get_metadata().rich_api.warnings` and unsupported tool
+errors.
 
 ## ida-pro-mcp Research Summary
 
@@ -261,7 +265,6 @@ ida.lookup_functions
 ida.disassemble
 ida.decompile
 ida.list_xrefs
-ida.list_basic_blocks
 ida.rename
 ida.set_comment
 ida.set_type
@@ -385,7 +388,6 @@ artifacts/
         disassembly-<timestamp>-<seq>.json
         decompile-<timestamp>-<seq>.json
         xrefs-<timestamp>-<seq>.json
-        basic_blocks-<timestamp>-<seq>.json
         rename-<timestamp>-<seq>.json
         comments-<timestamp>-<seq>.json
         types-<timestamp>-<seq>.json
@@ -413,20 +415,35 @@ scoping, artifact audit, output limits, and clear threat-model boundaries.
 Default unit tests do not require IDA. Real IDA tests are ignored and gated:
 
 ```powershell
+cargo build -p dbgflow-mcp
 $env:DBGFLOW_REAL_IDA_TEST=1
 $env:DBGFLOW_IDA_DIR="C:\Program Files\IDA Professional 9.3"
+$env:DBGFLOW_MCP_EXE="D:\Repos\Project\dbgflow\target\debug\dbgflow-mcp.exe"
+$env:DBGFLOW_IDA_SAMPLE="C:\path\to\small.exe"
 cargo test -p dbgflow-reverse real_ida_create_binary_session -- --ignored
 cargo test -p dbgflow-reverse real_ida_list_segments_functions -- --ignored
 ```
+
+`DBGFLOW_MCP_EXE` is optional when the test can auto-detect
+`target\<profile>\dbgflow-mcp.exe`; otherwise it must point to the built worker
+binary. `DBGFLOW_IDA_SAMPLE` is optional and should point to a small PE or IDB
+for faster smoke runs; when omitted, the current test executable is used.
 
 Direct rich-tool real smoke is gated separately so base IDA validation remains
 independent from qstring/xref/type wrapper validation:
 
 ```powershell
+cargo build -p dbgflow-mcp
 $env:DBGFLOW_REAL_IDA_DIRECT_TEST=1
 $env:DBGFLOW_IDA_DIR="C:\Program Files\IDA Professional 9.3"
+$env:DBGFLOW_MCP_EXE="D:\Repos\Project\dbgflow\target\debug\dbgflow-mcp.exe"
+$env:DBGFLOW_IDA_SAMPLE="C:\path\to\small.exe"
 cargo test -p dbgflow-reverse real_ida_rich_tools_direct_bindings -- --ignored
 ```
+
+The rich smoke verifies qstring/xref capabilities when validation succeeds, or
+otherwise requires clear qstring/xref validation warnings. Decompiler support
+remains explicitly unsupported until a Hex-Rays dispatcher is validated.
 
 Hex-Rays decompiler smoke should use a separate gate once the direct dispatcher
 is validated for the installed runtime and license.

@@ -1,10 +1,10 @@
 use super::dynamic::DynamicIdaApi;
 use super::install::{validate_ida_install_dir, IdaInstall, IDA_INSTALL_ENV};
 use super::model::{
-    BasicBlocksRequest, BasicBlocksResult, CloseDatabaseResult, DecompileRequest, DecompileResult,
-    DisassembleRequest, Disassembly, ExportInfo, FunctionInfo, FunctionLookup, IdaInfo,
-    IdaMetadata, ImportInfo, ListXrefsRequest, LookupFunctionsRequest, MutationItemResult,
-    PageRequest, RenameRequest, SegmentInfo, SetCommentRequest, SetTypeRequest, StringInfo,
+    CloseDatabaseResult, DecompileRequest, DecompileResult, DisassembleRequest, Disassembly,
+    ExportInfo, FunctionInfo, FunctionLookup, IdaInfo, IdaMetadata, ImportInfo, ListXrefsRequest,
+    LookupFunctionsRequest, MutationItemResult, PageRequest, RenameRequest, SegmentInfo,
+    SetCommentRequest, SetTypeRequest, StringInfo,
 };
 use super::target::IdaTarget;
 use dbgflow_common::logging::LogSink;
@@ -64,7 +64,6 @@ pub trait ReverseWorker: Send + Sync {
     fn disassemble(&self, request: DisassembleRequest) -> Result<Disassembly>;
     fn decompile(&self, request: DecompileRequest) -> Result<DecompileResult>;
     fn list_xrefs(&self, request: ListXrefsRequest) -> Result<super::model::XrefsResult>;
-    fn list_basic_blocks(&self, request: BasicBlocksRequest) -> Result<BasicBlocksResult>;
     fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>>;
     fn set_comment(&self, request: SetCommentRequest) -> Result<Vec<MutationItemResult>>;
     fn set_type(&self, request: SetTypeRequest) -> Result<Vec<MutationItemResult>>;
@@ -253,10 +252,9 @@ impl ProcessReverseWorker {
                 continue;
             }
             if !output.ok {
-                return Err(DbgFlowError::Backend(
-                    output
-                        .error
-                        .unwrap_or_else(|| "reverse worker request failed".to_string()),
+                return Err(output.error.map_or_else(
+                    || DbgFlowError::Backend("reverse worker request failed".to_string()),
+                    worker_error_to_dbgflow,
                 ));
             }
             let result = output.result.unwrap_or(Value::Null);
@@ -310,10 +308,6 @@ impl ReverseWorker for ProcessReverseWorker {
 
     fn list_xrefs(&self, request: ListXrefsRequest) -> Result<super::model::XrefsResult> {
         self.request(WorkerRequest::ListXrefs(request))
-    }
-
-    fn list_basic_blocks(&self, request: BasicBlocksRequest) -> Result<BasicBlocksResult> {
-        self.request(WorkerRequest::ListBasicBlocks(request))
     }
 
     fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>> {
@@ -384,7 +378,6 @@ enum WorkerRequest {
     Disassemble(DisassembleRequest),
     Decompile(DecompileRequest),
     ListXrefs(ListXrefsRequest),
-    ListBasicBlocks(BasicBlocksRequest),
     Rename(RenameRequest),
     SetComment(SetCommentRequest),
     SetType(SetTypeRequest),
@@ -396,7 +389,26 @@ struct WorkerOutput {
     request_id: u64,
     ok: bool,
     result: Option<Value>,
-    error: Option<String>,
+    error: Option<WorkerErrorInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkerErrorInfo {
+    kind: String,
+    message: String,
+}
+
+impl WorkerErrorInfo {
+    fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            message: message.into(),
+        }
+    }
+
+    fn backend(message: impl Into<String>) -> Self {
+        Self::new("backend", message)
+    }
 }
 
 pub fn run_reverse_ida_worker_stdio(
@@ -413,7 +425,9 @@ pub fn run_reverse_ida_worker_stdio(
                 request_id: 0,
                 ok: false,
                 result: None,
-                error: Some(format!("parse worker request: {error}")),
+                error: Some(WorkerErrorInfo::backend(format!(
+                    "parse worker request: {error}"
+                ))),
             },
         };
         serde_json::to_writer(&mut output, &response)?;
@@ -447,7 +461,7 @@ impl WorkerRuntime {
                 request_id: input.request_id,
                 ok: false,
                 result: None,
-                error: Some(error.to_string()),
+                error: Some(worker_error_from_dbgflow(error)),
             },
         }
     }
@@ -506,11 +520,6 @@ impl WorkerRuntime {
                 serde_json::to_value(api.list_xrefs(request)?)
                     .map_err(|error| DbgFlowError::Backend(error.to_string()))
             }
-            WorkerRequest::ListBasicBlocks(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.list_basic_blocks(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
             WorkerRequest::Rename(request) => {
                 let api = self.require_api()?;
                 serde_json::to_value(api.rename(request)?)
@@ -552,7 +561,7 @@ impl WorkerRuntime {
             ));
         }
         let install = validate_ida_install_dir(&request.install_dir)?;
-        let api = DynamicIdaApi::load_and_initialize(&install)?;
+        let mut api = DynamicIdaApi::load_and_initialize(&install)?;
         api.open_database(
             &request.target.path().to_string_lossy(),
             request.run_auto_analysis,
@@ -594,6 +603,41 @@ fn rich_api_warnings(api: &DynamicIdaApi) -> Vec<String> {
     }
 }
 
+fn worker_error_from_dbgflow(error: DbgFlowError) -> WorkerErrorInfo {
+    match error {
+        DbgFlowError::BackendNotFound(message) => {
+            WorkerErrorInfo::new("backend_not_found", message)
+        }
+        DbgFlowError::Backend(message) => WorkerErrorInfo::new("backend", message),
+        DbgFlowError::SessionNotFound(session_id) => {
+            WorkerErrorInfo::new("session_not_found", session_id.to_string())
+        }
+        DbgFlowError::SessionClosed(session_id) => {
+            WorkerErrorInfo::new("session_closed", session_id.to_string())
+        }
+        DbgFlowError::Artifact(message) => WorkerErrorInfo::new("artifact", message),
+    }
+}
+
+fn worker_error_to_dbgflow(error: WorkerErrorInfo) -> DbgFlowError {
+    match error.kind.as_str() {
+        "backend_not_found" => DbgFlowError::BackendNotFound(error.message),
+        "backend" => DbgFlowError::Backend(error.message),
+        "artifact" => DbgFlowError::Artifact(error.message),
+        "session_not_found" => serde_json::from_value(Value::String(error.message.clone()))
+            .map(DbgFlowError::SessionNotFound)
+            .unwrap_or_else(|_| {
+                DbgFlowError::Backend(format!("session_not_found: {}", error.message))
+            }),
+        "session_closed" => serde_json::from_value(Value::String(error.message.clone()))
+            .map(DbgFlowError::SessionClosed)
+            .unwrap_or_else(|_| {
+                DbgFlowError::Backend(format!("session_closed: {}", error.message))
+            }),
+        _ => DbgFlowError::Backend(error.message),
+    }
+}
+
 fn ida_env_changes(install_dir: &Path) -> Result<Vec<EnvChange>> {
     let mut path_entries = vec![install_dir.to_path_buf()];
     if let Some(existing) = std::env::var_os("PATH") {
@@ -618,9 +662,67 @@ mod tests {
         let mut out = Vec::new();
         run_reverse_ida_worker_stdio(Cursor::new("{not-json}\n"), &mut out)
             .expect("worker returns parse error");
-        let text = String::from_utf8(out).expect("utf8");
+        let response: WorkerOutput = serde_json::from_slice(&out).expect("worker response");
 
-        assert!(text.contains("parse worker request"));
+        let error = response.error.expect("error");
+        assert_eq!(error.kind, "backend");
+        assert!(error.message.contains("parse worker request"));
+        assert!(!error.message.contains("backend error:"));
+    }
+
+    #[test]
+    fn worker_error_round_trip_does_not_duplicate_backend_prefix() {
+        let info = worker_error_from_dbgflow(DbgFlowError::Backend(
+            "ida.decompile is unsupported".to_string(),
+        ));
+        assert_eq!(info.kind, "backend");
+        assert_eq!(info.message, "ida.decompile is unsupported");
+
+        let error = worker_error_to_dbgflow(info);
+        assert_eq!(
+            error.to_string(),
+            "backend error: ida.decompile is unsupported"
+        );
+        assert!(!error.to_string().contains("backend error: backend error:"));
+    }
+
+    #[test]
+    fn worker_error_round_trip_preserves_session_error_kind() {
+        let session_id = SessionId::new();
+
+        let not_found = worker_error_to_dbgflow(worker_error_from_dbgflow(
+            DbgFlowError::SessionNotFound(session_id),
+        ));
+        assert!(matches!(
+            not_found,
+            DbgFlowError::SessionNotFound(id) if id == session_id
+        ));
+
+        let closed = worker_error_to_dbgflow(worker_error_from_dbgflow(
+            DbgFlowError::SessionClosed(session_id),
+        ));
+        assert!(matches!(
+            closed,
+            DbgFlowError::SessionClosed(id) if id == session_id
+        ));
+    }
+
+    #[test]
+    fn worker_runtime_serializes_errors_without_display_prefix() {
+        let mut runtime = WorkerRuntime::default();
+        let output = runtime.handle(WorkerInput {
+            request_id: 11,
+            request: WorkerRequest::Decompile(DecompileRequest {
+                target: "0x401000".to_string(),
+                include_addresses: true,
+            }),
+        });
+
+        assert!(!output.ok);
+        let error = output.error.expect("error");
+        assert_eq!(error.kind, "backend");
+        assert!(error.message.contains("open database"));
+        assert!(!error.message.contains("backend error:"));
     }
 
     #[test]

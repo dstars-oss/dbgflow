@@ -4,13 +4,12 @@ use dbgflow_common::{DbgFlowError, Result};
 use dbgflow_debug::backend::DebugTarget;
 use dbgflow_debug::session::{EvalSessionResult, Session, SessionId, SessionManager};
 use dbgflow_reverse::ida::{
-    BasicBlocksRequest, CommentItem, CommentView, CreateIdaSession, DecompileRequest,
-    DecompileSessionResult, DisassembleRequest, DisassembleResult, IdaRuntimeConfig,
-    IdaSessionManager, ListBasicBlocksResult, ListExportsResult, ListFunctionsResult,
-    ListImportsResult, ListSegmentsResult, ListStringsResult, ListXrefsRequest, ListXrefsResult,
-    LookupFunctionsRequest, LookupFunctionsResult, MetadataResult, MutationResult, PageRequest,
-    RenameItem, RenameRequest, ReverseSession, SetCommentRequest, SetTypeRequest, TypeItem,
-    XrefDirection, XrefKind,
+    CommentItem, CommentView, CreateIdaSession, DecompileRequest, DecompileSessionResult,
+    DisassembleRequest, DisassembleResult, IdaRuntimeConfig, IdaSessionManager, ListExportsResult,
+    ListFunctionsResult, ListImportsResult, ListSegmentsResult, ListStringsResult,
+    ListXrefsRequest, ListXrefsResult, LookupFunctionsRequest, LookupFunctionsResult,
+    MetadataResult, MutationResult, PageRequest, RenameItem, RenameRequest, ReverseSession,
+    SetCommentRequest, SetTypeRequest, TypeItem, XrefDirection, XrefKind,
 };
 use dbgflow_trace::profile::{ProfileCollectorConfig, ProfileManager, ProfileResult, RunProfile};
 use dbgflow_trace::ttd::{RecordTtd, TtdRecordingManager, TtdRecordingResult};
@@ -42,7 +41,6 @@ pub const IDA_LOOKUP_FUNCTIONS: &str = "ida.lookup_functions";
 pub const IDA_DISASSEMBLE: &str = "ida.disassemble";
 pub const IDA_DECOMPILE: &str = "ida.decompile";
 pub const IDA_LIST_XREFS: &str = "ida.list_xrefs";
-pub const IDA_LIST_BASIC_BLOCKS: &str = "ida.list_basic_blocks";
 pub const IDA_RENAME: &str = "ida.rename";
 pub const IDA_SET_COMMENT: &str = "ida.set_comment";
 pub const IDA_SET_TYPE: &str = "ida.set_type";
@@ -283,14 +281,6 @@ impl ToolService {
         self.ida_sessions.list_xrefs(session_id, request)
     }
 
-    pub fn list_ida_basic_blocks(
-        &self,
-        session_id: SessionId,
-        request: BasicBlocksRequest,
-    ) -> Result<ListBasicBlocksResult> {
-        self.ida_sessions.list_basic_blocks(session_id, request)
-    }
-
     pub fn rename_ida(
         &self,
         session_id: SessionId,
@@ -447,12 +437,6 @@ impl ToolService {
             IDA_LIST_XREFS => {
                 let request: IdaListXrefsToolRequest = decode_arguments(arguments)?;
                 self.list_ida_xrefs(request.session_id, request.into_inner())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LIST_BASIC_BLOCKS => {
-                let request: IdaBasicBlocksToolRequest = decode_arguments(arguments)?;
-                self.list_ida_basic_blocks(request.session_id, request.into_inner())
                     .map_err(ToolCallError::execution)
                     .and_then(to_value)
             }
@@ -645,21 +629,6 @@ impl IdaListXrefsToolRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct IdaBasicBlocksToolRequest {
-    pub session_id: SessionId,
-    pub target: String,
-}
-
-impl IdaBasicBlocksToolRequest {
-    fn into_inner(self) -> BasicBlocksRequest {
-        BasicBlocksRequest {
-            target: self.target,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IdaRenameToolRequest {
     pub session_id: SessionId,
     pub items: Vec<RenameItem>,
@@ -843,7 +812,7 @@ fn default_xref_kind() -> XrefKind {
 }
 
 fn default_comment_view() -> CommentView {
-    CommentView::Both
+    CommentView::Disassembly
 }
 
 #[cfg(test)]
@@ -925,7 +894,6 @@ mod tests {
             IDA_DISASSEMBLE,
             IDA_DECOMPILE,
             IDA_LIST_XREFS,
-            IDA_LIST_BASIC_BLOCKS,
             IDA_RENAME,
             IDA_SET_COMMENT,
             IDA_SET_TYPE,
@@ -940,6 +908,9 @@ mod tests {
             .find(|descriptor| descriptor.name == IDA_CLOSE_SESSION)
             .expect("ida.close_session descriptor");
         assert!(close.input_schema["properties"].get("save").is_some());
+        assert!(!descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == "ida.list_basic_blocks"));
     }
 
     #[test]
@@ -1020,6 +991,21 @@ mod tests {
     }
 
     #[test]
+    fn ida_set_comment_defaults_to_disassembly_view() {
+        let comments = json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "items": [
+                { "target": "0x401000", "comment": "entry point" }
+            ]
+        });
+
+        let comments: IdaSetCommentToolRequest =
+            decode_arguments(comments).expect("decode comments");
+
+        assert_eq!(comments.view, CommentView::Disassembly);
+    }
+
+    #[test]
     fn tools_call_lists_ida_sessions_without_ida_runtime() {
         let service = ToolService::new_for_tests();
 
@@ -1028,6 +1014,20 @@ mod tests {
             .expect("list ida sessions");
 
         assert_eq!(value.as_array().expect("sessions array").len(), 0);
+    }
+
+    #[test]
+    fn tools_call_rejects_removed_ida_basic_blocks_tool() {
+        let service = ToolService::new_for_tests();
+
+        let error = service
+            .call_tool(
+                "ida.list_basic_blocks",
+                json!({ "session_id": SessionId::new(), "target": "0x1000" }),
+            )
+            .expect_err("removed tool is rejected");
+
+        assert!(error.to_string().contains("unknown tool"));
     }
 
     #[test]

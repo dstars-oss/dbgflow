@@ -66,9 +66,24 @@ fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()>
     let peer = peer_addr
         .map(|peer| peer.to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT))?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
+        Err(error) if is_incomplete_request_error(&error) => {
+            server.log(
+                LogEvent::new(LogLevel::Warn, "http", "http_request_incomplete")
+                    .field("http_request_id", request_id)
+                    .field("peer", peer)
+                    .field("status", 408)
+                    .error(error.to_string()),
+            );
+            let _ = write_response(
+                &mut stream,
+                HttpResponse::json(408, json!({ "error": error.to_string() })),
+            );
+            return Ok(());
+        }
         Err(error) => {
             server.log(
                 LogEvent::new(LogLevel::Error, "http", "http_request_rejected")
@@ -384,7 +399,9 @@ struct HttpRequest {
 fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    if reader.read_line(&mut request_line)? == 0 {
+        return Err(incomplete_request("HTTP request line was not received"));
+    }
     if request_line.trim().is_empty() {
         return Err(invalid_input("empty request"));
     }
@@ -408,7 +425,9 @@ fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     let mut headers = HashMap::new();
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        if reader.read_line(&mut line)? == 0 {
+            return Err(incomplete_request("HTTP headers were not fully received"));
+        }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             break;
@@ -495,28 +514,45 @@ fn reason_phrase(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         _ => "Internal Server Error",
     }
 }
 
+fn is_incomplete_request_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn incomplete_request(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        content_type_is_json, origin_is_allowed, route_request, HttpRequest, HttpResponse,
+        content_type_is_json, handle_connection, is_incomplete_request_error, origin_is_allowed,
+        route_request, HttpRequest, HttpResponse,
     };
     use crate::mcp::McpServer;
     use crate::tools::ToolService;
-    use dbgflow_common::logging::{LogEvent, LogSink};
+    use dbgflow_common::logging::{LogEvent, LogLevel, LogSink};
     use dbgflow_debug::session::SessionManager;
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn validates_json_content_type() {
@@ -714,6 +750,81 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn incomplete_request_errors_are_not_service_errors() {
+        assert!(is_incomplete_request_error(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "would block"
+        )));
+        assert!(is_incomplete_request_error(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out"
+        )));
+        assert!(is_incomplete_request_error(&io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "eof"
+        )));
+        assert!(!is_incomplete_request_error(&io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bad request"
+        )));
+    }
+
+    #[test]
+    fn concurrent_tool_calls_over_short_connections_do_not_log_read_errors() {
+        const CLIENTS: usize = 8;
+
+        let logger = Arc::new(RecordingLogSink::default());
+        let server = test_server_with_logger(logger.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let acceptor = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..CLIENTS {
+                let stream = accept_with_timeout(&listener).expect("accept connection");
+                let server = server.clone();
+                handlers.push(thread::spawn(move || {
+                    handle_connection(server, stream).expect("handle connection");
+                }));
+            }
+            for handler in handlers {
+                handler.join().expect("connection handler");
+            }
+        });
+
+        let mut clients = Vec::new();
+        for index in 0..CLIENTS {
+            clients.push(thread::spawn(move || {
+                let mut stream = TcpStream::connect(addr).expect("connect");
+                stream
+                    .write_all(&mcp_tool_call_request(index))
+                    .expect("write request");
+                let mut response = String::new();
+                stream.read_to_string(&mut response).expect("read response");
+                assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            }));
+        }
+
+        for client in clients {
+            client.join().expect("client");
+        }
+        acceptor.join().expect("acceptor");
+
+        let events = logger.events();
+        assert!(!events.iter().any(|event| {
+            event.component == "http"
+                && event.level == LogLevel::Error
+                && (event.event == "http_request_rejected"
+                    || event.error.as_deref().is_some_and(|error| {
+                        error.contains("WouldBlock") || error.contains("10035")
+                    }))
+        }));
+    }
+
     fn test_server() -> McpServer {
         McpServer::new(ToolService::new(SessionManager::with_artifact_root(
             std::env::temp_dir().join(format!("dbgflow-http-test-{}", std::process::id())),
@@ -745,6 +856,41 @@ mod tests {
 
     fn json_body(response: HttpResponse) -> Value {
         serde_json::from_slice(&response.body).expect("json response")
+    }
+
+    fn accept_with_timeout(listener: &TcpListener) -> io::Result<TcpStream> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _peer)) => return Ok(stream),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "accept timed out"));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn mcp_tool_call_request(index: usize) -> Vec<u8> {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": format!("list-{index}"),
+            "method": "tools/call",
+            "params": {
+                "name": "ida.list_sessions",
+                "arguments": {}
+            }
+        }))
+        .expect("serialize body");
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).expect("body utf8")
+        )
+        .into_bytes()
     }
 
     #[derive(Default)]

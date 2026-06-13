@@ -1,11 +1,10 @@
 use super::install::IdaInstall;
 use super::model::{
-    BasicBlockInfo, BasicBlocksRequest, BasicBlocksResult, CloseDatabaseResult, CommentView,
-    DecompileRequest, DecompileResult, DirectIdaCapabilities, DisassembleRequest, Disassembly,
-    DisassemblyLine, ExportInfo, FunctionInfo, FunctionLookup, IdaInfo, IdaMetadata,
-    IdaRichApiStatus, IdaVersion, ImportInfo, ListXrefsRequest, LookupFunctionsRequest,
-    MutationItemResult, PageInfo, PageRequest, RenameRequest, SegmentInfo, SetCommentRequest,
-    SetTypeRequest, StringInfo, XrefDirection, XrefInfo, XrefKind, XrefsResult,
+    CloseDatabaseResult, CommentView, DecompileRequest, DecompileResult, DirectIdaCapabilities,
+    DisassembleRequest, Disassembly, DisassemblyLine, ExportInfo, FunctionInfo, FunctionLookup,
+    IdaInfo, IdaMetadata, IdaRichApiStatus, IdaVersion, ImportInfo, ListXrefsRequest,
+    LookupFunctionsRequest, MutationItemResult, PageInfo, PageRequest, RenameRequest, SegmentInfo,
+    SetCommentRequest, SetTypeRequest, StringInfo, XrefDirection, XrefInfo, XrefKind, XrefsResult,
 };
 use super::target::IdaTarget;
 use dbgflow_common::{DbgFlowError, Result};
@@ -20,6 +19,14 @@ const MAX_SEGMENTS: i32 = 10_000;
 const MAX_FUNCTIONS: usize = 1_000_000;
 const DIRECT_VERSION_GATE: &str = "IDA Professional 9.3 x64";
 const QSTRING_MAX_READ: usize = 16 * 1024 * 1024;
+const XREF_TYPE_MASK: u8 = 0x1f;
+const MAX_DATA_XREF_TYPE: u8 = 6;
+const MIN_CODE_XREF_TYPE: u8 = 16;
+const MAX_CODE_XREF_TYPE: u8 = 21;
+const IDA_MS_CLS: u64 = 0x0000_0600;
+const IDA_FF_DATA: u64 = 0x0000_0400;
+const IDA_DT_TYPE: u64 = 0xF000_0000;
+const IDA_FF_STRLIT: u64 = 0x5000_0000;
 
 mod types {
     use super::*;
@@ -184,12 +191,15 @@ mod abi {
     pub type SetCmt = unsafe extern "C" fn(u64, *const c_char, bool) -> bool;
     pub type GetCmt = unsafe extern "C" fn(*mut RawQstring, u64, bool) -> isize;
     pub type ApplyCdecl = unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> bool;
+    pub type PrintType = unsafe extern "C" fn(*mut RawQstring, u64, c_int) -> bool;
 
     #[derive(Clone)]
     pub struct RichSymbols {
         pub qfree: Option<QFree>,
         pub qstring_layout_validated: bool,
         pub xrefblk_layout_validated: bool,
+        pub qstring_validation_error: Option<String>,
+        pub xrefblk_validation_error: Option<String>,
         pub get_ea_name: Option<GetEaName>,
         pub get_name_ea: Option<GetNameEa>,
         pub get_func_name: Option<GetFuncName>,
@@ -216,6 +226,7 @@ mod abi {
         pub set_cmt: Option<SetCmt>,
         pub get_cmt: Option<GetCmt>,
         pub apply_cdecl: Option<ApplyCdecl>,
+        pub print_type: Option<PrintType>,
         pub missing_symbols: Vec<String>,
     }
 
@@ -226,6 +237,12 @@ mod abi {
                 qfree: optional_any(ida, idalib, b"qfree\0", "qfree", &mut missing_symbols),
                 qstring_layout_validated: false,
                 xrefblk_layout_validated: false,
+                qstring_validation_error: Some(
+                    "qstring layout validation has not run yet".to_string(),
+                ),
+                xrefblk_validation_error: Some(
+                    "xrefblk_t layout validation has not run yet".to_string(),
+                ),
                 get_ea_name: optional_any(
                     ida,
                     idalib,
@@ -396,6 +413,13 @@ mod abi {
                     "apply_cdecl",
                     &mut missing_symbols,
                 ),
+                print_type: optional_any(
+                    ida,
+                    idalib,
+                    b"print_type\0",
+                    "print_type",
+                    &mut missing_symbols,
+                ),
                 missing_symbols,
             }
         }
@@ -417,6 +441,7 @@ mod abi {
                     && self.get_flags_ex.is_some(),
                 strings: qstring
                     && self.next_head.is_some()
+                    && self.get_flags_ex.is_some()
                     && self.get_item_end.is_some()
                     && self.get_strlit_contents.is_some(),
                 imports: qstring
@@ -432,7 +457,6 @@ mod abi {
                     && self.xrefblk_next_from.is_some()
                     && self.xrefblk_first_to.is_some()
                     && self.xrefblk_next_to.is_some(),
-                basic_blocks: self.next_head.is_some(),
                 comments: self.set_cmt.is_some(),
                 types: self.apply_cdecl.is_some(),
                 decompiler: false,
@@ -586,7 +610,7 @@ impl DynamicIdaApi {
         self.info.clone()
     }
 
-    pub fn open_database(&self, path: &str, run_auto_analysis: bool) -> Result<()> {
+    pub fn open_database(&mut self, path: &str, run_auto_analysis: bool) -> Result<()> {
         let ida_path = path_for_ida_open_database(path);
         let path = CString::new(ida_path.as_ref())
             .map_err(|_| DbgFlowError::Backend("IDA target path contains NUL".to_string()))?;
@@ -597,6 +621,7 @@ impl DynamicIdaApi {
                 "IDA open_database failed with code {result}"
             )));
         }
+        self.validate_direct_bindings();
         Ok(())
     }
 
@@ -621,26 +646,32 @@ impl DynamicIdaApi {
         let capabilities = self.rich.capabilities();
         let available = any_capability(&capabilities);
         let mut warnings = Vec::new();
-        if self.rich.qfree.is_some() && !self.rich.qstring_layout_validated {
-            warnings.push(
-                "IDA direct qstring layout validation has not passed; qstring-dependent tools are disabled"
-                    .to_string(),
-            );
-        } else if !self.rich.qstring_available() {
-            warnings.push(
-                "IDA direct rich API qstring support is unavailable because qfree was not exported"
-                    .to_string(),
-            );
+        if !self.rich.qstring_available() {
+            warnings.push(format!(
+                "IDA direct qstring layout validation has not passed; qstring-dependent tools are disabled: {}",
+                self.rich
+                    .qstring_validation_error
+                    .as_deref()
+                    .unwrap_or("unknown validation failure")
+            ));
         }
-        if self.rich.xrefblk_first_from.is_some() && !self.rich.xrefblk_layout_validated {
-            warnings.push(
-                "IDA direct xrefblk_t layout validation has not passed; xref tools are disabled"
-                    .to_string(),
-            );
+        if !self.rich.xrefblk_layout_validated {
+            warnings.push(format!(
+                "IDA direct xrefblk_t layout validation has not passed; xref tools are disabled: {}",
+                self.rich
+                    .xrefblk_validation_error
+                    .as_deref()
+                    .unwrap_or("unknown validation failure")
+            ));
         }
         if !capabilities.decompiler {
             warnings.push(
                 "Hex-Rays direct decompiler dispatcher is unavailable in this build".to_string(),
+            );
+        }
+        if capabilities.types && self.rich.print_type.is_none() {
+            warnings.push(
+                "IDA direct type mutation is available, but prototype readback is unavailable because print_type was not exported".to_string(),
             );
         }
         IdaRichApiStatus {
@@ -652,6 +683,150 @@ impl DynamicIdaApi {
             hexrays: Some("not_loaded".to_string()),
             warnings,
         }
+    }
+
+    fn validate_direct_bindings(&mut self) {
+        match self.validate_qstring_layout() {
+            Ok(()) => {
+                self.rich.qstring_layout_validated = true;
+                self.rich.qstring_validation_error = None;
+            }
+            Err(error) => {
+                self.rich.qstring_layout_validated = false;
+                self.rich.qstring_validation_error = Some(error);
+            }
+        }
+
+        match self.validate_xrefblk_layout() {
+            Ok(()) => {
+                self.rich.xrefblk_layout_validated = true;
+                self.rich.xrefblk_validation_error = None;
+            }
+            Err(error) => {
+                self.rich.xrefblk_layout_validated = false;
+                self.rich.xrefblk_validation_error = Some(error);
+            }
+        }
+    }
+
+    fn validate_qstring_layout(&self) -> std::result::Result<(), String> {
+        let qfree = self
+            .rich
+            .qfree
+            .ok_or_else(|| "qfree was not exported".to_string())?;
+        if self.rich.get_segm_name.is_none() && self.rich.get_func_name.is_none() {
+            return Err(
+                "no qstring-producing segment or function name symbol was available".to_string(),
+            );
+        }
+
+        if let Some(get_segm_name) = self.rich.get_segm_name {
+            let count = self.segment_count().map_err(|error| error.to_string())?;
+            for index in 0..count.min(16) {
+                let ptr = unsafe { (self.getnseg)(index as c_int) };
+                if ptr.is_null() {
+                    return Err(format!(
+                        "IDA returned null segment pointer at index {index}"
+                    ));
+                }
+                let mut out = IdaQString::new(qfree);
+                let len = unsafe { get_segm_name(out.as_mut_ptr(), ptr.cast(), 0) };
+                if validate_qstring_sample(&out, len, "segment name")? {
+                    return Ok(());
+                }
+            }
+        }
+
+        if let Some(get_func_name) = self.rich.get_func_name {
+            let count = self.function_count().map_err(|error| error.to_string())?;
+            for index in 0..count.min(32) {
+                let ptr = unsafe { (self.getn_func)(index) };
+                if ptr.is_null() {
+                    return Err(format!(
+                        "IDA returned null function pointer at index {index}"
+                    ));
+                }
+                let function = unsafe { *ptr };
+                let mut out = IdaQString::new(qfree);
+                let len = unsafe { get_func_name(out.as_mut_ptr(), function.start_ea) };
+                if validate_qstring_sample(&out, len, "function name")? {
+                    return Ok(());
+                }
+            }
+        }
+
+        Err("no non-empty segment or function name sample was available".to_string())
+    }
+
+    fn validate_xrefblk_layout(&self) -> std::result::Result<(), String> {
+        if self.rich.xrefblk_first_from.is_none()
+            || self.rich.xrefblk_next_from.is_none()
+            || self.rich.xrefblk_first_to.is_none()
+            || self.rich.xrefblk_next_to.is_none()
+        {
+            return Err("one or more xrefblk_t traversal symbols are unavailable".to_string());
+        }
+
+        let segments = self.raw_segments().map_err(|error| error.to_string())?;
+        if segments.is_empty() {
+            return Err("no segment range was available to validate xrefblk_t".to_string());
+        }
+        let count = self.function_count().map_err(|error| error.to_string())?;
+        for index in 0..count.min(128) {
+            let ptr = unsafe { (self.getn_func)(index) };
+            if ptr.is_null() {
+                return Err(format!(
+                    "IDA returned null function pointer at index {index}"
+                ));
+            }
+            let function = unsafe { *ptr };
+            validate_range("function", index, function.start_ea, function.end_ea)
+                .map_err(|error| error.to_string())?;
+            if self
+                .validate_xref_probe(function.start_ea, "from", &segments)
+                .map_err(|error| format!("xref from validation failed: {error}"))?
+            {
+                return Ok(());
+            }
+            if self
+                .validate_xref_probe(function.start_ea, "to", &segments)
+                .map_err(|error| format!("xref to validation failed: {error}"))?
+            {
+                return Ok(());
+            }
+        }
+
+        Err("no xref sample was available in the first 128 functions".to_string())
+    }
+
+    fn validate_xref_probe(
+        &self,
+        ea: u64,
+        direction: &str,
+        segments: &[SegmentPrefix],
+    ) -> std::result::Result<bool, String> {
+        let (first, next) = if direction == "from" {
+            (
+                self.rich.xrefblk_first_from.expect("checked"),
+                self.rich.xrefblk_next_from.expect("checked"),
+            )
+        } else {
+            (
+                self.rich.xrefblk_first_to.expect("checked"),
+                self.rich.xrefblk_next_to.expect("checked"),
+            )
+        };
+        let mut block = XrefBlock::new();
+        let mut ok = unsafe { first(block.as_mut_ptr(), ea, 0) };
+        while ok {
+            let raw = block.raw();
+            if xref_sample_has_loaded_endpoints(raw, segments) {
+                validate_xref_raw(raw, segments)?;
+                return Ok(true);
+            }
+            ok = unsafe { next(block.as_mut_ptr()) };
+        }
+        Ok(false)
     }
 
     pub fn list_segments(&self) -> Result<Vec<SegmentInfo>> {
@@ -710,16 +885,19 @@ impl DynamicIdaApi {
         for segment in self.raw_segments()? {
             let mut ea = segment.start_ea;
             while ea < segment.end_ea {
-                if let Some(value) = self.get_string_literal(ea)? {
-                    let index = strings.len();
-                    if page_filter_matches(request.filter.as_deref(), &[&value, &format_ea(ea)]) {
-                        strings.push(StringInfo {
-                            index,
-                            ea: format_ea(ea),
-                            length: value.len(),
-                            string_type: None,
-                            value,
-                        });
+                if self.is_string_literal(ea) {
+                    if let Some(value) = self.get_string_literal(ea)? {
+                        let index = strings.len();
+                        if page_filter_matches(request.filter.as_deref(), &[&value, &format_ea(ea)])
+                        {
+                            strings.push(StringInfo {
+                                index,
+                                ea: format_ea(ea),
+                                length: value.len(),
+                                string_type: Some("strlit".to_string()),
+                                value,
+                            });
+                        }
                     }
                 }
                 let next = self.next_head(ea, segment.end_ea);
@@ -901,32 +1079,6 @@ impl DynamicIdaApi {
         })
     }
 
-    pub fn list_basic_blocks(&self, request: BasicBlocksRequest) -> Result<BasicBlocksResult> {
-        self.require_capability("ida.list_basic_blocks", |cap| cap.basic_blocks)?;
-        let ea = self.resolve_ea(&request.target)?;
-        let function = find_function_by_ea(&self.list_functions()?, ea);
-        let Some(function) = function else {
-            return Ok(BasicBlocksResult {
-                target: request.target,
-                function: None,
-                blocks: Vec::new(),
-                error: Some("target is not inside a function".to_string()),
-            });
-        };
-        Ok(BasicBlocksResult {
-            target: request.target,
-            blocks: vec![BasicBlockInfo {
-                id: 0,
-                start_ea: function.start_ea.clone(),
-                end_ea: function.end_ea.clone(),
-                successors: Vec::new(),
-                predecessors: Vec::new(),
-            }],
-            function: Some(function),
-            error: None,
-        })
-    }
-
     pub fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>> {
         let mut results = Vec::with_capacity(request.items.len());
         for item in request.items {
@@ -952,6 +1104,11 @@ impl DynamicIdaApi {
     }
 
     pub fn set_comment(&self, request: SetCommentRequest) -> Result<Vec<MutationItemResult>> {
+        if matches!(request.view, CommentView::Decompiler | CommentView::Both) {
+            return Err(DbgFlowError::Backend(
+                "ida.set_comment decompiler comment view is unsupported because Hex-Rays direct decompiler dispatcher is unavailable in this build".to_string(),
+            ));
+        }
         let mut results = Vec::with_capacity(request.items.len());
         for item in request.items {
             let result = match self.set_comment_one(
@@ -1051,7 +1208,7 @@ impl DynamicIdaApi {
             size: format_ea(function.end_ea - function.start_ea),
             name: self.get_func_name(function.start_ea),
             segment,
-            prototype: None,
+            prototype: self.get_function_prototype(function.start_ea),
             flags: format!("0x{:x}", function.flags),
         }
     }
@@ -1065,13 +1222,9 @@ impl DynamicIdaApi {
         if predicate(&capabilities) {
             return Ok(());
         }
-        let missing = if self.rich.missing_symbols.is_empty() {
-            "no missing symbol details were reported".to_string()
-        } else {
-            self.rich.missing_symbols.join(", ")
-        };
+        let missing = self.capability_blockers();
         Err(DbgFlowError::Backend(format!(
-            "{tool} is unsupported by the IDA direct rich API for {}; missing or unavailable symbols: {missing}",
+            "{tool} is unsupported by the IDA direct rich API for {}; {missing}",
             DIRECT_VERSION_GATE
         )))
     }
@@ -1096,18 +1249,56 @@ impl DynamicIdaApi {
     }
 
     fn unsupported_error(&self, capability: &str) -> DbgFlowError {
-        let missing = if self.rich.missing_symbols.is_empty() {
-            "no missing symbol details were reported".to_string()
-        } else {
-            self.rich.missing_symbols.join(", ")
-        };
+        let missing = self.capability_blockers();
         DbgFlowError::Backend(format!(
-            "IDA direct rich API capability {capability} is unavailable; missing or unavailable symbols: {missing}"
+            "IDA direct rich API capability {capability} is unavailable; {missing}"
         ))
     }
 
     fn qstring(&self) -> Option<IdaQString> {
-        self.rich.qfree.map(IdaQString::new)
+        self.rich
+            .qstring_available()
+            .then(|| self.rich.qfree.map(IdaQString::new))
+            .flatten()
+    }
+
+    fn capability_blockers(&self) -> String {
+        let mut blockers = Vec::new();
+        if !self.rich.missing_symbols.is_empty() {
+            blockers.push(format!(
+                "missing symbols: {}",
+                self.rich.missing_symbols.join(", ")
+            ));
+        }
+        if !self.rich.qstring_available() {
+            blockers.push(format!(
+                "qstring validation: {}",
+                self.rich
+                    .qstring_validation_error
+                    .as_deref()
+                    .unwrap_or("qstring support is unavailable")
+            ));
+        }
+        if !self.rich.xrefblk_layout_validated {
+            blockers.push(format!(
+                "xrefblk_t validation: {}",
+                self.rich
+                    .xrefblk_validation_error
+                    .as_deref()
+                    .unwrap_or("xrefblk_t support is unavailable")
+            ));
+        }
+        if !self.rich.capabilities().decompiler {
+            blockers.push(
+                "decompiler: Hex-Rays direct decompiler dispatcher is unavailable in this build"
+                    .to_string(),
+            );
+        }
+        if blockers.is_empty() {
+            "no unavailable capability details were reported".to_string()
+        } else {
+            blockers.join("; ")
+        }
     }
 
     fn get_ea_name(&self, ea: u64) -> Option<String> {
@@ -1122,6 +1313,16 @@ impl DynamicIdaApi {
         let mut out = self.qstring()?;
         let len = unsafe { get_func_name(out.as_mut_ptr(), ea) };
         (len > 0).then(|| out.to_string_lossy()).flatten()
+    }
+
+    fn get_function_prototype(&self, ea: u64) -> Option<String> {
+        let print_type = self.rich.print_type?;
+        let mut out = self.qstring()?;
+        let ok = unsafe { print_type(out.as_mut_ptr(), ea, 0) };
+        ok.then(|| out.to_string_lossy())
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     }
 
     fn get_segment_name(&self, segment: *const c_void) -> Option<String> {
@@ -1147,6 +1348,14 @@ impl DynamicIdaApi {
             return Ok(None);
         }
         Ok(out.to_string_lossy().filter(|value| !value.is_empty()))
+    }
+
+    fn is_string_literal(&self, ea: u64) -> bool {
+        let Some(get_flags_ex) = self.rich.get_flags_ex else {
+            return false;
+        };
+        let flags = unsafe { get_flags_ex(ea, 0) };
+        ida_is_strlit(flags)
     }
 
     fn import_module_name(&self, module_index: c_int) -> Option<String> {
@@ -1313,6 +1522,14 @@ impl DynamicIdaApi {
         dry_run: bool,
         allow_overwrite: bool,
     ) -> Result<MutationItemResult> {
+        if name.trim().is_empty() {
+            return Err(DbgFlowError::Backend(
+                "IDA name must not be empty".to_string(),
+            ));
+        }
+        if name.as_bytes().contains(&0) {
+            return Err(DbgFlowError::Backend("IDA name contains NUL".to_string()));
+        }
         let set_name = self
             .rich
             .set_name
@@ -1363,6 +1580,11 @@ impl DynamicIdaApi {
         repeatable: bool,
         view: &CommentView,
     ) -> Result<MutationItemResult> {
+        if matches!(view, CommentView::Decompiler | CommentView::Both) {
+            return Err(DbgFlowError::Backend(
+                "ida.set_comment decompiler comment view is unsupported because Hex-Rays direct decompiler dispatcher is unavailable in this build".to_string(),
+            ));
+        }
         let set_cmt = self
             .rich
             .set_cmt
@@ -1371,32 +1593,14 @@ impl DynamicIdaApi {
         let old = self.get_comment(ea, repeatable);
         let comment_c = CString::new(comment)
             .map_err(|_| DbgFlowError::Backend("IDA comment contains NUL".to_string()))?;
-        let disassembly_requested = matches!(view, CommentView::Disassembly | CommentView::Both);
-        let decompiler_requested = matches!(view, CommentView::Decompiler | CommentView::Both);
-        let mut success = true;
-        let mut error = None;
-        if disassembly_requested {
-            success = unsafe { set_cmt(ea, comment_c.as_ptr(), repeatable) };
-            if !success {
-                error = Some("set_cmt returned false".to_string());
-            }
-        }
-        if decompiler_requested {
-            error = Some(match error {
-                Some(existing) => {
-                    format!("{existing}; Hex-Rays decompiler comment view is unavailable")
-                }
-                None => "Hex-Rays decompiler comment view is unavailable".to_string(),
-            });
-            success = false;
-        }
+        let success = unsafe { set_cmt(ea, comment_c.as_ptr(), repeatable) };
         Ok(MutationItemResult {
             target: target.to_string(),
             old,
             new: Some(comment.to_string()),
             success,
             dry_run: false,
-            error,
+            error: (!success).then(|| "set_cmt returned false".to_string()),
         })
     }
 
@@ -1471,10 +1675,86 @@ fn any_capability(capabilities: &DirectIdaCapabilities) -> bool {
         || capabilities.imports
         || capabilities.exports
         || capabilities.xrefs
-        || capabilities.basic_blocks
         || capabilities.comments
         || capabilities.types
         || capabilities.decompiler
+}
+
+fn validate_qstring_sample(
+    sample: &IdaQString,
+    len: isize,
+    label: &str,
+) -> std::result::Result<bool, String> {
+    if len < 0 {
+        return Err(format!("{label} returned negative qstring length {len}"));
+    }
+    if len == 0 {
+        return Ok(false);
+    }
+    if len as usize > QSTRING_MAX_READ {
+        return Err(format!(
+            "{label} returned qstring length {len}, above maximum {QSTRING_MAX_READ}"
+        ));
+    }
+    let value = sample
+        .to_string_lossy()
+        .ok_or_else(|| format!("{label} returned a null qstring data pointer"))?;
+    Ok(!value.is_empty())
+}
+
+fn validate_xref_raw(
+    raw: types::RawXrefBlock,
+    segments: &[SegmentPrefix],
+) -> std::result::Result<(), String> {
+    if raw.from == BADADDR || raw.to == BADADDR {
+        return Err(format!(
+            "xref sample contained BADADDR endpoint: from={} to={}",
+            format_ea(raw.from),
+            format_ea(raw.to)
+        ));
+    }
+    if !ea_in_segments(raw.from, segments) || !ea_in_segments(raw.to, segments) {
+        return Err(format!(
+            "xref sample endpoints are outside loaded segments: from={} to={}",
+            format_ea(raw.from),
+            format_ea(raw.to)
+        ));
+    }
+    let base_type = raw.type_ & XREF_TYPE_MASK;
+    let type_valid = if raw.iscode {
+        (MIN_CODE_XREF_TYPE..=MAX_CODE_XREF_TYPE).contains(&base_type)
+    } else {
+        base_type <= MAX_DATA_XREF_TYPE
+    };
+    if !type_valid {
+        return Err(format!(
+            "xref sample type {} is outside the expected {} range",
+            raw.type_,
+            if raw.iscode { "code" } else { "data" }
+        ));
+    }
+    Ok(())
+}
+
+fn xref_sample_has_loaded_endpoints(raw: types::RawXrefBlock, segments: &[SegmentPrefix]) -> bool {
+    raw.from != BADADDR
+        && raw.to != BADADDR
+        && ea_in_segments(raw.from, segments)
+        && ea_in_segments(raw.to, segments)
+}
+
+fn ea_in_segments(ea: u64, segments: &[SegmentPrefix]) -> bool {
+    segments
+        .iter()
+        .any(|segment| ea >= segment.start_ea && ea < segment.end_ea)
+}
+
+fn ida_is_data(flags: u64) -> bool {
+    (flags & IDA_MS_CLS) == IDA_FF_DATA
+}
+
+fn ida_is_strlit(flags: u64) -> bool {
+    ida_is_data(flags) && (flags & IDA_DT_TYPE) == IDA_FF_STRLIT
 }
 
 fn path_for_ida_open_database(path: &str) -> std::borrow::Cow<'_, str> {
@@ -1582,7 +1862,10 @@ fn format_perm(perm: u8) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::path_for_ida_open_database;
+    use super::{
+        ida_is_strlit, path_for_ida_open_database, types::RawXrefBlock, validate_xref_raw,
+        xref_sample_has_loaded_endpoints, SegmentPrefix, IDA_FF_DATA, IDA_FF_STRLIT,
+    };
 
     #[test]
     fn ida_open_database_path_strips_drive_verbatim_prefix() {
@@ -1603,5 +1886,78 @@ mod tests {
         let path = path_for_ida_open_database(r"C:\samples\a.exe");
 
         assert_eq!(path, r"C:\samples\a.exe");
+    }
+
+    #[test]
+    fn validate_xref_raw_rejects_invalid_type_field() {
+        let segments = [test_segment()];
+        let mut raw = RawXrefBlock::default();
+        raw.from = 0x1010;
+        raw.to = 0x1020;
+        raw.iscode = true;
+        raw.type_ = 0xff;
+
+        let error = validate_xref_raw(raw, &segments).expect_err("invalid xref type");
+
+        assert!(error.contains("xref sample type"));
+    }
+
+    #[test]
+    fn validate_xref_raw_accepts_expected_code_and_data_types() {
+        let segments = [test_segment()];
+        let mut code = RawXrefBlock::default();
+        code.from = 0x1010;
+        code.to = 0x1020;
+        code.iscode = true;
+        code.type_ = 17;
+        validate_xref_raw(code, &segments).expect("valid code xref");
+
+        let mut data = RawXrefBlock::default();
+        data.from = 0x1030;
+        data.to = 0x1040;
+        data.iscode = false;
+        data.type_ = 3;
+        validate_xref_raw(data, &segments).expect("valid data xref");
+    }
+
+    #[test]
+    fn xref_sample_endpoint_filter_skips_external_or_badaddr_samples() {
+        let segments = [test_segment()];
+        let mut external = RawXrefBlock::default();
+        external.from = 0x1010;
+        external.to = 0x3000;
+        assert!(!xref_sample_has_loaded_endpoints(external, &segments));
+
+        let mut badaddr = RawXrefBlock::default();
+        badaddr.from = 0x1010;
+        badaddr.to = super::BADADDR;
+        assert!(!xref_sample_has_loaded_endpoints(badaddr, &segments));
+
+        let mut loaded = RawXrefBlock::default();
+        loaded.from = 0x1010;
+        loaded.to = 0x1020;
+        assert!(xref_sample_has_loaded_endpoints(loaded, &segments));
+    }
+
+    #[test]
+    fn ida_string_literal_flags_require_data_and_strlit_type() {
+        assert!(ida_is_strlit(IDA_FF_DATA | IDA_FF_STRLIT));
+        assert!(!ida_is_strlit(IDA_FF_STRLIT));
+        assert!(!ida_is_strlit(IDA_FF_DATA));
+        assert!(!ida_is_strlit(0));
+    }
+
+    fn test_segment() -> SegmentPrefix {
+        SegmentPrefix {
+            start_ea: 0x1000,
+            end_ea: 0x2000,
+            name: 0,
+            sclass: 0,
+            orgbase: 0,
+            align: 0,
+            comb: 0,
+            perm: 5,
+            bitness: 2,
+        }
     }
 }

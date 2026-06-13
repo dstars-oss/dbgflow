@@ -50,7 +50,6 @@ Current tool names:
 - `ida.disassemble`
 - `ida.decompile`
 - `ida.list_xrefs`
-- `ida.list_basic_blocks`
 - `ida.rename`
 - `ida.set_comment`
 - `ida.set_type`
@@ -219,9 +218,14 @@ loaded from official IDA DLLs. `ida.get_metadata` reports a `rich_api`
 capability matrix for direct bindings, missing symbols, the IDA 9.3 x64 version
 gate, and Hex-Rays availability. Missing rich capabilities return clear
 per-tool errors while the session remains usable for other queries. qstring and
-xrefblk_t based tools are enabled only after direct layout validation for the
-installed runtime. dbgflow still does not expose arbitrary IDA eval, IDAPython,
-debugger control, byte/assembly patching, or GUI adoption.
+xrefblk_t based tools are runtime-validated after a database opens; if validation
+cannot find a safe sample or detects an unexpected layout, the affected tools
+stay disabled and `rich_api.warnings` records the concrete reason. `ida.decompile`
+remains an explicit unsupported typed tool until a Hex-Rays dispatcher is
+validated. `ida.set_comment` defaults to the disassembly comment view; requesting
+decompiler or both views fails before writing. dbgflow still does not expose
+arbitrary IDA eval, IDAPython, debugger control, byte/assembly patching, or GUI
+adoption.
 
 `ida.close_session` requests saving the open database by default (`save: true`).
 Existing `.idb` / `.i64` database targets are operated on in place; pass
