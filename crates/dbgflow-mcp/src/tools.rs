@@ -266,7 +266,7 @@ impl ToolService {
                                             },
                                             "event_sets": {
                                                 "type": "array",
-                                                "items": { "type": "string", "enum": ["process_lifecycle"] },
+                                                "items": { "type": "string", "enum": ["process", "file_io"] },
                                                 "minItems": 1
                                             },
                                             "stacks": {
@@ -305,7 +305,7 @@ impl ToolService {
                                     }
                                 ]
                             },
-                            "description": "Collectors to run around the same launched target. Omit to use native_etw target_process process_lifecycle with stacks enabled."
+                            "description": "Collectors to run around the same launched target. Omit to use native_etw target_process process and file_io with stacks enabled."
                         }
                     },
                     "required": ["target", "timeout_ms"],
@@ -737,6 +737,13 @@ mod tests {
 
         assert!(record_profile.description.contains("profile"));
         assert_eq!(record_profile.input_schema["type"], "object");
+        let event_set_enum = record_profile.input_schema["properties"]["collectors"]["items"]
+            ["oneOf"][0]["properties"]["event_sets"]["items"]["enum"]
+            .as_array()
+            .expect("event set enum");
+        assert!(event_set_enum.contains(&Value::String("process".to_string())));
+        assert!(event_set_enum.contains(&Value::String("file_io".to_string())));
+        assert!(!event_set_enum.contains(&Value::String("process_lifecycle".to_string())));
     }
 
     #[test]
@@ -771,7 +778,7 @@ mod tests {
                 {
                     "kind": "native_etw",
                     "scope": { "kind": "target_process" },
-                    "event_sets": ["process_lifecycle"],
+                    "event_sets": ["process"],
                     "stacks": { "enabled": true }
                 }
             ]
@@ -790,7 +797,7 @@ mod tests {
                 scope: EtwProfileScope::TargetProcess,
                 ref event_sets,
                 stacks: EtwStackConfig { enabled: true }
-            } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
+            } if event_sets == &vec![EtwEventSet::Process]
         ));
     }
 
@@ -812,8 +819,60 @@ mod tests {
                 scope: EtwProfileScope::TargetProcess,
                 ref event_sets,
                 stacks: EtwStackConfig { enabled: true }
-            } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
+            } if event_sets == &vec![EtwEventSet::Process, EtwEventSet::FileIo]
         ));
+    }
+
+    #[test]
+    fn run_profile_arguments_decode_native_etw_file_io_event_set() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collectors": [
+                {
+                    "kind": "native_etw",
+                    "scope": { "kind": "target_process" },
+                    "event_sets": ["process", "file_io"]
+                }
+            ]
+        });
+
+        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
+
+        assert!(matches!(
+            request.collectors[0],
+            ProfileCollectorConfig::NativeEtw {
+                scope: EtwProfileScope::TargetProcess,
+                ref event_sets,
+                stacks: EtwStackConfig { enabled: true }
+            } if event_sets == &vec![EtwEventSet::Process, EtwEventSet::FileIo]
+        ));
+    }
+
+    #[test]
+    fn run_profile_arguments_reject_legacy_process_lifecycle_event_set() {
+        let value = json!({
+            "target": {
+                "kind": "launch",
+                "executable": "C:\\Windows\\System32\\cmd.exe"
+            },
+            "timeout_ms": 1000,
+            "collectors": [
+                {
+                    "kind": "native_etw",
+                    "scope": { "kind": "target_process" },
+                    "event_sets": ["process_lifecycle"]
+                }
+            ]
+        });
+
+        let error =
+            decode_arguments::<RunProfileRequest>(value).expect_err("reject old event set name");
+
+        assert!(error.to_string().contains("process_lifecycle"));
     }
 
     #[test]
@@ -869,7 +928,7 @@ mod tests {
                 {
                     "kind": "native_etw",
                     "scope": { "kind": "target_process" },
-                    "event_sets": ["process_lifecycle"]
+                    "event_sets": ["process"]
                 },
                 {
                     "kind": "procmon",

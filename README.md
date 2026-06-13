@@ -83,22 +83,34 @@ implemented by relying on worker environment variables.
 
 `trace.record_profile` launches a local executable and records one or more profiling
 collectors around the same target lifetime. The default collector is
-`native_etw` with `scope.kind=target_process`, `event_sets=["process_lifecycle"]`,
-and stack capture enabled. It writes a standard `.etl` trace plus filtered
-`events.jsonl` and `summary.json` artifacts for the target PID. The tool also
-accepts `collectors[]` for parallel collection. Collection stops when the
-target exits or when `timeout_ms` expires. Timeout stops collection but does not
-terminate the target process by default. Profile metadata, lifecycle events,
-collector artifacts, and captured target stdout/stderr are written under
+`native_etw` with `scope.kind=target_process`,
+`event_sets=["process", "file_io"]`, and stack capture enabled. It
+writes a standard `.etl` trace plus target-PID-filtered
+`process.jsonl`, `file_io.jsonl`, and `summary.json` artifacts. The
+tool also accepts `collectors[]` for parallel collection. Collection stops when
+the target exits or when `timeout_ms` expires. Timeout stops collection but does
+not terminate the target process by default. Profile metadata, audit lifecycle
+events, collector artifacts, and captured target stdout/stderr are written under
 `artifacts\profiles\<profile_id>`.
 
-Native ETW `process_lifecycle` captures process start/end, thread start/end, and
+Native ETW `process` captures process start/end, thread start/end, and
 image load/unload kernel events. The raw `trace.etl` may still contain
-system-wide lifecycle events; dbgflow's `events.jsonl` and `summary.json`
-post-processing artifacts are filtered to the launched target PID. Stack frames
-are emitted as a compact string array: `module+0xoffset` when the address can be
-matched to the target PID's image load interval, otherwise the raw `0x...`
-address is kept. Symbols are not resolved.
+system-wide events; dbgflow's post-processing artifacts are filtered to the
+launched target PID. Native ETW `file_io` captures common FileIo events including
+name/rundown, create, read, write, cleanup, flush, delete, rename, query,
+set, directory enumeration/notification, and file-system control. FileIo OpEnd
+completions are merged back into matching begin-side events by `IrpPtr` and add
+`nt_status`, `extra_info`, and `completion_*` fields when available. Unmatched
+OpEnd events are reported in `summary.json` instead of emitted as standalone
+rows. Close events are treated as redundant after cleanup and are not emitted as
+standalone `file_io` rows. File paths are resolved best-effort from direct path fields and
+`FileObject` / `FileKey` correlation; unresolved file events keep raw pointer
+fields. Stack frames are emitted as compact strings: `module+0xoffset` when the
+address can be matched to the target PID's image load interval, otherwise the raw
+`0x...` address is kept. The serialized order follows WinDbg-style stack display.
+Symbols are not resolved. File paths and trace contents
+are sensitive data and can increase trace size; use explicit `event_sets` to
+disable `file_io` when a lower-volume trace is needed.
 
 Example profile request:
 
@@ -127,7 +139,7 @@ Parallel collectors example:
     {
       "kind": "native_etw",
       "scope": { "kind": "target_process" },
-      "event_sets": ["process_lifecycle"],
+      "event_sets": ["process", "file_io"],
       "stacks": { "enabled": true }
     },
     {
@@ -152,7 +164,9 @@ the whole machine, and does not accept a standalone Procmon executable path.
 Procmon writes `capture.pml` as the authoritative artifact and exports
 `events.csv` plus a best-effort target PID / operation / path filtered
 `events.jsonl`; when stack capture is requested, dbgflow also requests an XML
-export with stack data.
+export with stack data. Procmon remains the higher-fidelity collector for file
+and registry evidence when the native ETW `file_io` event set is not detailed
+enough.
 
 `trace.record_ttd` records Microsoft Time Travel Debugging traces by running
 `TTD.exe` with typed launch, attach, or monitor targets. Configure

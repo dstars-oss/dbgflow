@@ -8,6 +8,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
 struct NativeEtwSettings {
+    event_sets: [Option<EtwEventSet>; 2],
     stacks_enabled: bool,
 }
 
@@ -27,14 +28,54 @@ fn native_etw_settings(config: &ProfileCollectorConfig) -> Result<NativeEtwSetti
             "native ETW scope must be target_process".to_string(),
         ));
     }
-    if event_sets.as_slice() != [EtwEventSet::ProcessLifecycle] {
+    if event_sets.is_empty() {
         return Err(DbgFlowError::Backend(
-            "native ETW event_sets must be [process_lifecycle]".to_string(),
+            "native ETW event_sets must contain at least one event set".to_string(),
         ));
     }
+    let mut normalized = [None, None];
+    for event_set in event_sets {
+        if event_sets
+            .iter()
+            .filter(|candidate| *candidate == event_set)
+            .count()
+            > 1
+        {
+            return Err(DbgFlowError::Backend(format!(
+                "duplicate native ETW event set is not supported: {}",
+                event_set_name(*event_set)
+            )));
+        }
+        match event_set {
+            EtwEventSet::Process => normalized[0] = Some(EtwEventSet::Process),
+            EtwEventSet::FileIo => normalized[1] = Some(EtwEventSet::FileIo),
+        }
+    }
     Ok(NativeEtwSettings {
+        event_sets: normalized,
         stacks_enabled: stacks.enabled,
     })
+}
+
+impl NativeEtwSettings {
+    fn includes(&self, event_set: EtwEventSet) -> bool {
+        self.event_sets.contains(&Some(event_set))
+    }
+
+    fn event_set_names(&self) -> Vec<&'static str> {
+        self.event_sets
+            .iter()
+            .flatten()
+            .map(|event_set| event_set_name(*event_set))
+            .collect()
+    }
+}
+
+fn event_set_name(event_set: EtwEventSet) -> &'static str {
+    match event_set {
+        EtwEventSet::Process => "process",
+        EtwEventSet::FileIo => "file_io",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +142,10 @@ fn hex64(value: u64) -> String {
     format!("0x{value:016x}")
 }
 
+fn hex32(value: u32) -> String {
+    format!("0x{value:08x}")
+}
+
 #[cfg(not(windows))]
 #[derive(Debug, Default)]
 pub struct NativeEtwCollectorFactory;
@@ -126,7 +171,7 @@ mod windows_impl {
     use serde::Serialize;
     use serde_json::json;
     use std::alloc::{alloc_zeroed, dealloc, Layout};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
     use std::fs::File;
     use std::io::Write;
@@ -141,11 +186,13 @@ mod windows_impl {
         ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_SUCCESS, WIN32_ERROR,
     };
     use windows::Win32::System::Diagnostics::Etw::{
-        CloseTrace, ControlTraceW, ImageLoadGuid, OpenTraceW, ProcessGuid, ProcessTrace,
-        PropertyStruct, StartTraceW, TdhGetEventInformation, TdhGetProperty, ThreadGuid,
-        TraceSetInformation, TraceStackTracingInfo, CLASSIC_EVENT_ID, CONTROLTRACE_HANDLE,
-        EVENT_HEADER_EXT_TYPE_STACK_TRACE32, EVENT_HEADER_EXT_TYPE_STACK_TRACE64, EVENT_RECORD,
-        EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FILE_MODE_SEQUENTIAL, EVENT_TRACE_FLAG_IMAGE_LOAD,
+        CloseTrace, ControlTraceW, FileIoGuid, ImageLoadGuid, OpenTraceW, ProcessGuid,
+        ProcessTrace, PropertyStruct, StartTraceW, TdhGetEventInformation, TdhGetProperty,
+        ThreadGuid, TraceSetInformation, TraceStackTracingInfo, CLASSIC_EVENT_ID,
+        CONTROLTRACE_HANDLE, EVENT_HEADER_EXT_TYPE_STACK_TRACE32,
+        EVENT_HEADER_EXT_TYPE_STACK_TRACE64, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
+        EVENT_TRACE_FILE_MODE_SEQUENTIAL, EVENT_TRACE_FLAG_DISK_FILE_IO, EVENT_TRACE_FLAG_DISK_IO,
+        EVENT_TRACE_FLAG_FILE_IO, EVENT_TRACE_FLAG_FILE_IO_INIT, EVENT_TRACE_FLAG_IMAGE_LOAD,
         EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_THREAD, EVENT_TRACE_LOGFILEW,
         EVENT_TRACE_PROPERTIES, EVENT_TRACE_SYSTEM_LOGGER_MODE, EVENT_TRACE_TYPE_END,
         EVENT_TRACE_TYPE_LOAD, EVENT_TRACE_TYPE_START, PROCESS_TRACE_MODE_EVENT_RECORD,
@@ -174,7 +221,8 @@ mod windows_impl {
             let settings = native_etw_settings(config)?;
             Ok(Box::new(NativeEtwCollector::new(
                 output_dir.join("trace.etl"),
-                output_dir.join("events.jsonl"),
+                output_dir.join("process.jsonl"),
+                output_dir.join("file_io.jsonl"),
                 output_dir.join("summary.json"),
                 settings,
             )))
@@ -183,7 +231,8 @@ mod windows_impl {
 
     struct NativeEtwCollector {
         trace_path: PathBuf,
-        events_path: PathBuf,
+        process_path: PathBuf,
+        file_io_path: PathBuf,
         summary_path: PathBuf,
         settings: NativeEtwSettings,
         state: Mutex<NativeEtwState>,
@@ -198,13 +247,15 @@ mod windows_impl {
     impl NativeEtwCollector {
         fn new(
             trace_path: PathBuf,
-            events_path: PathBuf,
+            process_path: PathBuf,
+            file_io_path: PathBuf,
             summary_path: PathBuf,
             settings: NativeEtwSettings,
         ) -> Self {
             Self {
                 trace_path,
-                events_path,
+                process_path,
+                file_io_path,
                 summary_path,
                 settings,
                 state: Mutex::new(NativeEtwState::default()),
@@ -232,11 +283,7 @@ mod windows_impl {
             }
 
             let session_name = format!("dbgflow-profile-{}", Uuid::new_v4());
-            start_trace_session(
-                &session_name,
-                &self.trace_path,
-                self.settings.stacks_enabled,
-            )?;
+            start_trace_session(&session_name, &self.trace_path, self.settings)?;
             state.session_name = Some(session_name);
             state.target_pid = None;
             Ok(super::super::CollectorStart {
@@ -278,23 +325,24 @@ mod windows_impl {
                 Some(pid) => {
                     let summary = match post_process_trace(
                         &self.trace_path,
-                        &self.events_path,
+                        &self.process_path,
+                        &self.file_io_path,
                         pid,
-                        self.settings.stacks_enabled,
+                        self.settings,
                     ) {
                         Ok(summary) => summary,
                         Err(error) => {
                             warnings.push(format!("native ETW post-processing failed: {error}"));
-                            if let Err(error) = ensure_empty_file(&self.events_path) {
+                            if let Err(error) = ensure_empty_event_set_files(
+                                self.settings,
+                                &self.process_path,
+                                &self.file_io_path,
+                            ) {
                                 warnings.push(format!(
                                     "native ETW events fallback write failed: {error}"
                                 ));
                             }
-                            EtwSummary::empty(
-                                Some(pid),
-                                self.settings.stacks_enabled,
-                                warnings.clone(),
-                            )
+                            EtwSummary::empty(Some(pid), self.settings, warnings.clone())
                         }
                     };
                     let new_summary_warnings = summary
@@ -313,11 +361,14 @@ mod windows_impl {
                         "native ETW post-processing skipped because the target pid is unavailable"
                             .to_string(),
                     );
-                    if let Err(error) = ensure_empty_file(&self.events_path) {
+                    if let Err(error) = ensure_empty_event_set_files(
+                        self.settings,
+                        &self.process_path,
+                        &self.file_io_path,
+                    ) {
                         warnings.push(format!("native ETW events fallback write failed: {error}"));
                     }
-                    let summary =
-                        EtwSummary::empty(None, self.settings.stacks_enabled, warnings.clone());
+                    let summary = EtwSummary::empty(None, self.settings, warnings.clone());
                     if let Err(error) = write_summary(&self.summary_path, &summary) {
                         warnings.push(format!("native ETW summary write failed: {error}"));
                     }
@@ -325,20 +376,13 @@ mod windows_impl {
             }
 
             Ok(super::super::CollectorStop {
-                artifacts: vec![
-                    ArtifactRef {
-                        kind: ArtifactKind::ProfileCollectorTrace,
-                        path: self.trace_path.clone(),
-                    },
-                    ArtifactRef {
-                        kind: ArtifactKind::ProfileCollectorEvents,
-                        path: self.events_path.clone(),
-                    },
-                    ArtifactRef {
-                        kind: ArtifactKind::ProfileCollectorSummary,
-                        path: self.summary_path.clone(),
-                    },
-                ],
+                artifacts: collector_artifacts(
+                    self.settings,
+                    &self.trace_path,
+                    &self.process_path,
+                    &self.file_io_path,
+                    &self.summary_path,
+                ),
                 warnings,
             })
         }
@@ -369,7 +413,7 @@ mod windows_impl {
     fn start_trace_session(
         session_name: &str,
         trace_path: &Path,
-        stacks_enabled: bool,
+        settings: NativeEtwSettings,
     ) -> Result<()> {
         let session_name_w = wide_null(OsStr::new(session_name));
         let trace_path_w = wide_null(trace_path.as_os_str());
@@ -385,8 +429,7 @@ mod windows_impl {
             (*properties).Wnode.ClientContext = 1;
             (*properties).LogFileMode =
                 EVENT_TRACE_FILE_MODE_SEQUENTIAL | EVENT_TRACE_SYSTEM_LOGGER_MODE;
-            (*properties).EnableFlags =
-                EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_IMAGE_LOAD;
+            (*properties).EnableFlags = enable_flags(settings);
             (*properties).BufferSize = 1024;
             (*properties).MinimumBuffers = 64;
             (*properties).MaximumBuffers = 256;
@@ -411,8 +454,8 @@ mod windows_impl {
             if status != ERROR_SUCCESS {
                 return Err(etw_error("StartTraceW", status));
             }
-            if stacks_enabled {
-                if let Err(error) = enable_process_lifecycle_stacks(handle) {
+            if settings.stacks_enabled {
+                if let Err(error) = enable_stack_tracing(handle, settings) {
                     let _ = stop_trace_session(session_name, trace_path);
                     return Err(error);
                 }
@@ -422,15 +465,44 @@ mod windows_impl {
         Ok(())
     }
 
-    unsafe fn enable_process_lifecycle_stacks(handle: CONTROLTRACE_HANDLE) -> Result<()> {
-        let events = [
-            classic_event(ProcessGuid, EVENT_TRACE_TYPE_START),
-            classic_event(ProcessGuid, EVENT_TRACE_TYPE_END),
-            classic_event(ThreadGuid, EVENT_TRACE_TYPE_START),
-            classic_event(ThreadGuid, EVENT_TRACE_TYPE_END),
-            classic_event(ImageLoadGuid, EVENT_TRACE_TYPE_LOAD),
-            classic_event(ImageLoadGuid, EVENT_TRACE_TYPE_END),
-        ];
+    fn enable_flags(
+        settings: NativeEtwSettings,
+    ) -> windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG {
+        let mut flags = windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG(0);
+        if settings.includes(EtwEventSet::Process) {
+            flags |=
+                EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_IMAGE_LOAD;
+        }
+        if settings.includes(EtwEventSet::FileIo) {
+            flags |= EVENT_TRACE_FLAG_DISK_IO
+                | EVENT_TRACE_FLAG_DISK_FILE_IO
+                | EVENT_TRACE_FLAG_FILE_IO_INIT
+                | EVENT_TRACE_FLAG_FILE_IO;
+        }
+        flags
+    }
+
+    unsafe fn enable_stack_tracing(
+        handle: CONTROLTRACE_HANDLE,
+        settings: NativeEtwSettings,
+    ) -> Result<()> {
+        let mut events = Vec::new();
+        if settings.includes(EtwEventSet::Process) {
+            events.extend([
+                classic_event(ProcessGuid, EVENT_TRACE_TYPE_START),
+                classic_event(ProcessGuid, EVENT_TRACE_TYPE_END),
+                classic_event(ThreadGuid, EVENT_TRACE_TYPE_START),
+                classic_event(ThreadGuid, EVENT_TRACE_TYPE_END),
+                classic_event(ImageLoadGuid, EVENT_TRACE_TYPE_LOAD),
+                classic_event(ImageLoadGuid, EVENT_TRACE_TYPE_END),
+            ]);
+        }
+        if settings.includes(EtwEventSet::FileIo) {
+            events.extend(file_io_stack_events());
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
         let status = TraceSetInformation(
             handle,
             TraceStackTracingInfo,
@@ -452,6 +524,46 @@ mod windows_impl {
             Type: event_type as u8,
             Reserved: [0; 7],
         }
+    }
+
+    const FILE_IO_NAME: u32 = 0;
+    const FILE_IO_FILE_CREATE_NAME: u32 = 32;
+    const FILE_IO_FILE_DELETE_NAME: u32 = 35;
+    const FILE_IO_RUNDOWN: u32 = 36;
+    const FILE_IO_CREATE: u32 = 64;
+    const FILE_IO_CLEANUP: u32 = 65;
+    const FILE_IO_CLOSE: u32 = 66;
+    const FILE_IO_READ: u32 = 67;
+    const FILE_IO_WRITE: u32 = 68;
+    const FILE_IO_SET_INFO: u32 = 69;
+    const FILE_IO_DELETE: u32 = 70;
+    const FILE_IO_RENAME: u32 = 71;
+    const FILE_IO_DIR_ENUM: u32 = 72;
+    const FILE_IO_FLUSH: u32 = 73;
+    const FILE_IO_QUERY_INFO: u32 = 74;
+    const FILE_IO_FS_CONTROL: u32 = 75;
+    const FILE_IO_OP_END: u32 = 76;
+    const FILE_IO_DIR_NOTIFY: u32 = 77;
+
+    fn file_io_stack_events() -> [CLASSIC_EVENT_ID; 16] {
+        [
+            classic_event(FileIoGuid, FILE_IO_NAME),
+            classic_event(FileIoGuid, FILE_IO_FILE_CREATE_NAME),
+            classic_event(FileIoGuid, FILE_IO_FILE_DELETE_NAME),
+            classic_event(FileIoGuid, FILE_IO_RUNDOWN),
+            classic_event(FileIoGuid, FILE_IO_CREATE),
+            classic_event(FileIoGuid, FILE_IO_CLEANUP),
+            classic_event(FileIoGuid, FILE_IO_READ),
+            classic_event(FileIoGuid, FILE_IO_WRITE),
+            classic_event(FileIoGuid, FILE_IO_SET_INFO),
+            classic_event(FileIoGuid, FILE_IO_DELETE),
+            classic_event(FileIoGuid, FILE_IO_RENAME),
+            classic_event(FileIoGuid, FILE_IO_DIR_ENUM),
+            classic_event(FileIoGuid, FILE_IO_FLUSH),
+            classic_event(FileIoGuid, FILE_IO_QUERY_INFO),
+            classic_event(FileIoGuid, FILE_IO_FS_CONTROL),
+            classic_event(FileIoGuid, FILE_IO_DIR_NOTIFY),
+        ]
     }
 
     fn stop_trace_session(session_name: &str, trace_path: &Path) -> Result<Vec<String>> {
@@ -503,25 +615,113 @@ mod windows_impl {
     #[derive(Debug, Serialize)]
     struct EtwSummary {
         target_pid: Option<u32>,
-        event_sets: Vec<&'static str>,
+        requested_event_sets: Vec<&'static str>,
         stacks_enabled: bool,
+        event_sets: BTreeMap<&'static str, EtwEventSetSummary>,
+        warnings: Vec<String>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct EtwEventSetSummary {
         event_counts: BTreeMap<&'static str, u64>,
         stack_frames_total: u64,
         stack_frames_resolved: u64,
         stack_frames_unresolved: u64,
-        warnings: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_path_resolved: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_path_unresolved: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        matched_op_end_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unmatched_op_end_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        incomplete_io_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reused_irp_without_op_end_count: Option<u64>,
+    }
+
+    #[derive(Debug, Default)]
+    struct StackStats {
+        total: u64,
+        resolved: u64,
+        unresolved: u64,
+    }
+
+    impl EtwEventSetSummary {
+        fn lifecycle(event_counts: BTreeMap<&'static str, u64>, stack: StackStats) -> Self {
+            Self {
+                event_counts,
+                stack_frames_total: stack.total,
+                stack_frames_resolved: stack.resolved,
+                stack_frames_unresolved: stack.unresolved,
+                file_path_resolved: None,
+                file_path_unresolved: None,
+                matched_op_end_count: None,
+                unmatched_op_end_count: None,
+                incomplete_io_count: None,
+                reused_irp_without_op_end_count: None,
+            }
+        }
+
+        fn file_io(
+            event_counts: BTreeMap<&'static str, u64>,
+            stack: StackStats,
+            file_path_resolved: u64,
+            file_path_unresolved: u64,
+            matched_op_end_count: u64,
+            unmatched_op_end_count: u64,
+            incomplete_io_count: u64,
+            reused_irp_without_op_end_count: u64,
+        ) -> Self {
+            Self {
+                event_counts,
+                stack_frames_total: stack.total,
+                stack_frames_resolved: stack.resolved,
+                stack_frames_unresolved: stack.unresolved,
+                file_path_resolved: Some(file_path_resolved),
+                file_path_unresolved: Some(file_path_unresolved),
+                matched_op_end_count: Some(matched_op_end_count),
+                unmatched_op_end_count: Some(unmatched_op_end_count),
+                incomplete_io_count: Some(incomplete_io_count),
+                reused_irp_without_op_end_count: Some(reused_irp_without_op_end_count),
+            }
+        }
     }
 
     impl EtwSummary {
-        fn empty(target_pid: Option<u32>, stacks_enabled: bool, warnings: Vec<String>) -> Self {
+        fn empty(
+            target_pid: Option<u32>,
+            settings: NativeEtwSettings,
+            warnings: Vec<String>,
+        ) -> Self {
+            let mut event_sets = BTreeMap::new();
+            if settings.includes(EtwEventSet::Process) {
+                event_sets.insert(
+                    "process",
+                    EtwEventSetSummary::lifecycle(lifecycle_count_map(), StackStats::default()),
+                );
+            }
+            if settings.includes(EtwEventSet::FileIo) {
+                event_sets.insert(
+                    "file_io",
+                    EtwEventSetSummary::file_io(
+                        file_io_count_map(),
+                        StackStats::default(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                );
+            }
             Self {
                 target_pid,
-                event_sets: vec!["process_lifecycle"],
-                stacks_enabled,
-                event_counts: lifecycle_count_map(),
-                stack_frames_total: 0,
-                stack_frames_resolved: 0,
-                stack_frames_unresolved: 0,
+                requested_event_sets: settings.event_set_names(),
+                stacks_enabled: settings.stacks_enabled,
+                event_sets,
                 warnings,
             }
         }
@@ -530,6 +730,7 @@ mod windows_impl {
     #[derive(Debug, Serialize)]
     struct LifecycleEvent {
         sequence: u64,
+        event_set: &'static str,
         event: &'static str,
         pid: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +744,54 @@ mod windows_impl {
         #[serde(skip_serializing_if = "Option::is_none")]
         image_size: Option<String>,
         stack: Vec<String>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct FileIoEvent {
+        sequence: u64,
+        event_set: &'static str,
+        event: &'static str,
+        pid: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tid: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ttid: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path_source: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_object: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        irp_ptr: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        offset: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        io_size: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        io_flags: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        create_options: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_attributes: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        share_access: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        info_class: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extra_info: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nt_status: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        stack: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completion_pid: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completion_tid: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completion_sequence: Option<u64>,
     }
 
     #[derive(Debug)]
@@ -559,6 +808,30 @@ mod windows_impl {
         stack_addresses: Vec<u64>,
     }
 
+    #[derive(Debug)]
+    struct DecodedFileIoEvent {
+        event_timestamp: i64,
+        event_thread_id: u32,
+        event: &'static str,
+        pid: u32,
+        ttid: Option<u32>,
+        path: Option<String>,
+        path_source: Option<&'static str>,
+        file_object: Option<u64>,
+        file_key: Option<u64>,
+        irp_ptr: Option<u64>,
+        offset: Option<u64>,
+        io_size: Option<u64>,
+        io_flags: Option<u32>,
+        create_options: Option<u32>,
+        file_attributes: Option<u32>,
+        share_access: Option<u32>,
+        info_class: Option<u32>,
+        extra_info: Option<u64>,
+        nt_status: Option<u32>,
+        stack_addresses: Vec<u64>,
+    }
+
     #[derive(Debug, Clone)]
     struct DecodedStackWalkEvent {
         event_timestamp: i64,
@@ -567,20 +840,46 @@ mod windows_impl {
         stack_addresses: Vec<u64>,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum StackTargetKind {
+        Lifecycle,
+        FileIo,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct StackTarget {
+        kind: StackTargetKind,
+        index: usize,
+    }
+
     struct EtwProcessor {
         target_pid: u32,
-        events: Vec<LifecycleEvent>,
-        event_timestamps: Vec<i64>,
-        event_header_threads: Vec<u32>,
-        event_stack_addresses: Vec<Vec<u64>>,
-        event_indices_by_timestamp: BTreeMap<i64, Vec<usize>>,
+        settings: NativeEtwSettings,
+        lifecycle_events: Vec<LifecycleEvent>,
+        lifecycle_timestamps: Vec<i64>,
+        lifecycle_header_threads: Vec<u32>,
+        lifecycle_stack_addresses: Vec<Vec<u64>>,
+        file_io_events: Vec<FileIoEvent>,
+        file_io_timestamps: Vec<i64>,
+        file_io_header_threads: Vec<u32>,
+        file_io_stack_addresses: Vec<Vec<u64>>,
+        pending_file_irps: BTreeMap<u64, usize>,
+        ignored_file_irps: BTreeSet<u64>,
+        event_indices_by_timestamp: BTreeMap<i64, Vec<StackTarget>>,
         pending_stacks_by_timestamp: BTreeMap<i64, Vec<DecodedStackWalkEvent>>,
+        file_paths_by_pointer: BTreeMap<u64, String>,
         modules: Vec<ModuleInterval>,
         warnings: Vec<String>,
-        event_counts: BTreeMap<&'static str, u64>,
-        stack_frames_total: u64,
-        stack_frames_resolved: u64,
-        stack_frames_unresolved: u64,
+        lifecycle_event_counts: BTreeMap<&'static str, u64>,
+        file_io_event_counts: BTreeMap<&'static str, u64>,
+        lifecycle_stack_stats: StackStats,
+        file_io_stack_stats: StackStats,
+        file_path_resolved: u64,
+        file_path_unresolved: u64,
+        file_io_raw_sequence: u64,
+        matched_op_end_count: u64,
+        unmatched_op_end_count: u64,
+        reused_irp_without_op_end_count: u64,
         stack_walk_events: u64,
         matched_stack_walk_events: u64,
         dropped_pending_stack_walk_events: u64,
@@ -589,21 +888,35 @@ mod windows_impl {
     }
 
     impl EtwProcessor {
-        fn new(target_pid: u32) -> Self {
+        fn new(target_pid: u32, settings: NativeEtwSettings) -> Self {
             Self {
                 target_pid,
-                events: Vec::new(),
-                event_timestamps: Vec::new(),
-                event_header_threads: Vec::new(),
-                event_stack_addresses: Vec::new(),
+                settings,
+                lifecycle_events: Vec::new(),
+                lifecycle_timestamps: Vec::new(),
+                lifecycle_header_threads: Vec::new(),
+                lifecycle_stack_addresses: Vec::new(),
+                file_io_events: Vec::new(),
+                file_io_timestamps: Vec::new(),
+                file_io_header_threads: Vec::new(),
+                file_io_stack_addresses: Vec::new(),
+                pending_file_irps: BTreeMap::new(),
+                ignored_file_irps: BTreeSet::new(),
                 event_indices_by_timestamp: BTreeMap::new(),
                 pending_stacks_by_timestamp: BTreeMap::new(),
+                file_paths_by_pointer: BTreeMap::new(),
                 modules: Vec::new(),
                 warnings: Vec::new(),
-                event_counts: lifecycle_count_map(),
-                stack_frames_total: 0,
-                stack_frames_resolved: 0,
-                stack_frames_unresolved: 0,
+                lifecycle_event_counts: lifecycle_count_map(),
+                file_io_event_counts: file_io_count_map(),
+                lifecycle_stack_stats: StackStats::default(),
+                file_io_stack_stats: StackStats::default(),
+                file_path_resolved: 0,
+                file_path_unresolved: 0,
+                file_io_raw_sequence: 0,
+                matched_op_end_count: 0,
+                unmatched_op_end_count: 0,
+                reused_irp_without_op_end_count: 0,
                 stack_walk_events: 0,
                 matched_stack_walk_events: 0,
                 dropped_pending_stack_walk_events: 0,
@@ -617,10 +930,15 @@ mod windows_impl {
                 self.process_stack_walk_event(stack);
                 return;
             }
-            let Some(decoded) = decode_lifecycle_event(record, &mut self.warnings) else {
+            if let Some(decoded) = decode_lifecycle_event(record, &mut self.warnings) {
+                self.process_lifecycle_event(decoded);
                 return;
-            };
-            self.process_lifecycle_event(decoded);
+            }
+            if self.settings.includes(EtwEventSet::FileIo) {
+                if let Some(decoded) = decode_file_io_event(record, &mut self.warnings) {
+                    self.process_file_io_event(decoded);
+                }
+            }
         }
 
         fn process_lifecycle_event(&mut self, decoded: DecodedLifecycleEvent) {
@@ -655,7 +973,11 @@ mod windows_impl {
                 _ => {}
             }
 
-            if let Some(count) = self.event_counts.get_mut(decoded.event) {
+            if !self.settings.includes(EtwEventSet::Process) {
+                return;
+            }
+
+            if let Some(count) = self.lifecycle_event_counts.get_mut(decoded.event) {
                 *count += 1;
             }
             if self.lifecycle_match_samples.len() < 5 {
@@ -664,10 +986,11 @@ mod windows_impl {
                     decoded.event, decoded.event_timestamp, decoded.event_thread_id, decoded.pid
                 ));
             }
-            let sequence = self.events.len() as u64 + 1;
-            let event_index = self.events.len();
-            self.events.push(LifecycleEvent {
+            let sequence = self.lifecycle_events.len() as u64 + 1;
+            let event_index = self.lifecycle_events.len();
+            self.lifecycle_events.push(LifecycleEvent {
                 sequence,
+                event_set: "process",
                 event: decoded.event,
                 pid: decoded.pid,
                 tid: decoded.tid,
@@ -677,14 +1000,17 @@ mod windows_impl {
                 image_size: decoded.image_size.map(hex64),
                 stack: Vec::new(),
             });
-            self.event_timestamps.push(decoded.event_timestamp);
-            self.event_header_threads.push(decoded.event_thread_id);
-            self.event_stack_addresses
+            self.lifecycle_timestamps.push(decoded.event_timestamp);
+            self.lifecycle_header_threads.push(decoded.event_thread_id);
+            self.lifecycle_stack_addresses
                 .push(decoded.stack_addresses.clone());
             self.event_indices_by_timestamp
                 .entry(decoded.event_timestamp)
                 .or_default()
-                .push(event_index);
+                .push(StackTarget {
+                    kind: StackTargetKind::Lifecycle,
+                    index: event_index,
+                });
 
             if let Some(pending) = self
                 .pending_stacks_by_timestamp
@@ -694,6 +1020,196 @@ mod windows_impl {
                     self.attach_stack_walk_event(stack);
                 }
             }
+        }
+
+        fn process_file_io_event(&mut self, decoded: DecodedFileIoEvent) {
+            if !self.file_io_event_matches_target(&decoded) {
+                return;
+            }
+            self.file_io_raw_sequence += 1;
+            self.prune_pending_stacks_before(decoded.event_timestamp);
+
+            if decoded.event == "op_end" {
+                self.merge_file_io_completion(decoded);
+                return;
+            }
+            if decoded.event == "close" {
+                self.ignore_file_io_close(decoded);
+                return;
+            }
+
+            self.cache_file_path(&decoded);
+            let (path, path_source) = self.resolve_file_path(&decoded);
+            if path.is_some() {
+                self.file_path_resolved += 1;
+            } else {
+                self.file_path_unresolved += 1;
+            }
+
+            if let Some(count) = self.file_io_event_counts.get_mut(decoded.event) {
+                *count += 1;
+            }
+
+            let sequence = self.file_io_events.len() as u64 + 1;
+            let event_index = self.file_io_events.len();
+            let invalidates_file_object = decoded.event == "cleanup";
+            self.file_io_events.push(FileIoEvent {
+                sequence,
+                event_set: "file_io",
+                event: decoded.event,
+                pid: decoded.pid,
+                tid: Some(decoded.event_thread_id),
+                ttid: decoded.ttid,
+                path,
+                path_source,
+                file_object: decoded.file_object.map(hex64),
+                file_key: decoded.file_key.map(hex64),
+                irp_ptr: decoded.irp_ptr.map(hex64),
+                offset: decoded.offset.map(hex64),
+                io_size: decoded.io_size,
+                io_flags: decoded.io_flags.map(hex32),
+                create_options: decoded.create_options.map(hex32),
+                file_attributes: decoded.file_attributes.map(hex32),
+                share_access: decoded.share_access.map(hex32),
+                info_class: decoded.info_class,
+                extra_info: decoded.extra_info.map(hex64),
+                nt_status: decoded.nt_status.map(hex32),
+                stack: Vec::new(),
+                completion_pid: None,
+                completion_tid: None,
+                completion_sequence: None,
+            });
+            self.file_io_timestamps.push(decoded.event_timestamp);
+            self.file_io_header_threads.push(decoded.event_thread_id);
+            self.file_io_stack_addresses
+                .push(decoded.stack_addresses.clone());
+            self.event_indices_by_timestamp
+                .entry(decoded.event_timestamp)
+                .or_default()
+                .push(StackTarget {
+                    kind: StackTargetKind::FileIo,
+                    index: event_index,
+                });
+            if let Some(irp_ptr) = decoded.irp_ptr {
+                if self
+                    .pending_file_irps
+                    .insert(irp_ptr, event_index)
+                    .is_some()
+                {
+                    self.reused_irp_without_op_end_count += 1;
+                }
+            }
+
+            if let Some(pending) = self
+                .pending_stacks_by_timestamp
+                .remove(&decoded.event_timestamp)
+            {
+                for stack in pending {
+                    self.attach_stack_walk_event(stack);
+                }
+            }
+            if invalidates_file_object {
+                self.remove_file_path(&decoded);
+            }
+        }
+
+        fn ignore_file_io_close(&mut self, decoded: DecodedFileIoEvent) {
+            if let Some(irp_ptr) = decoded.irp_ptr {
+                if self.pending_file_irps.remove(&irp_ptr).is_some() {
+                    self.reused_irp_without_op_end_count += 1;
+                }
+                self.ignored_file_irps.insert(irp_ptr);
+            }
+            self.remove_file_path(&decoded);
+        }
+
+        fn merge_file_io_completion(&mut self, decoded: DecodedFileIoEvent) {
+            let Some(irp_ptr) = decoded.irp_ptr else {
+                self.unmatched_op_end_count += 1;
+                return;
+            };
+            let Some(event_index) = self.pending_file_irps.remove(&irp_ptr) else {
+                if self.ignored_file_irps.remove(&irp_ptr) {
+                    return;
+                }
+                self.unmatched_op_end_count += 1;
+                return;
+            };
+            let Some(event) = self.file_io_events.get_mut(event_index) else {
+                self.unmatched_op_end_count += 1;
+                return;
+            };
+
+            self.matched_op_end_count += 1;
+            if let Some(extra_info) = decoded.extra_info {
+                event.extra_info = Some(hex64(extra_info));
+            }
+            if let Some(nt_status) = decoded.nt_status {
+                event.nt_status = Some(hex32(nt_status));
+            }
+            event.completion_pid = Some(decoded.pid);
+            event.completion_tid = Some(decoded.event_thread_id);
+            event.completion_sequence = Some(self.file_io_raw_sequence);
+        }
+
+        fn file_io_event_matches_target(&self, decoded: &DecodedFileIoEvent) -> bool {
+            if decoded.event == "op_end" {
+                if decoded
+                    .irp_ptr
+                    .map(|irp_ptr| {
+                        self.pending_file_irps.contains_key(&irp_ptr)
+                            || self.ignored_file_irps.contains(&irp_ptr)
+                    })
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+                return event_matches_target(decoded.pid, self.target_pid);
+            }
+            event_matches_target(decoded.pid, self.target_pid)
+        }
+
+        fn cache_file_path(&mut self, decoded: &DecodedFileIoEvent) {
+            let Some(path) = decoded.path.as_ref().filter(|path| !path.is_empty()) else {
+                return;
+            };
+            if let Some(file_object) = decoded.file_object {
+                self.file_paths_by_pointer.insert(file_object, path.clone());
+            }
+            if let Some(file_key) = decoded.file_key {
+                self.file_paths_by_pointer.insert(file_key, path.clone());
+            }
+        }
+
+        fn remove_file_path(&mut self, decoded: &DecodedFileIoEvent) {
+            if let Some(file_object) = decoded.file_object {
+                self.file_paths_by_pointer.remove(&file_object);
+            }
+            if let Some(file_key) = decoded.file_key {
+                self.file_paths_by_pointer.remove(&file_key);
+            }
+        }
+
+        fn resolve_file_path(
+            &self,
+            decoded: &DecodedFileIoEvent,
+        ) -> (Option<String>, Option<&'static str>) {
+            if let Some(path) = decoded.path.as_ref().filter(|path| !path.is_empty()) {
+                return (Some(path.clone()), decoded.path_source);
+            }
+            if let Some(path) = decoded
+                .file_object
+                .and_then(|pointer| self.file_paths_by_pointer.get(&pointer))
+            {
+                return (Some(path.clone()), Some("file_object_cache"));
+            }
+            if let Some(path) = decoded
+                .file_key
+                .and_then(|pointer| self.file_paths_by_pointer.get(&pointer))
+            {
+                return (Some(path.clone()), Some("file_key_cache"));
+            }
+            (None, None)
         }
 
         fn record_module_load(&mut self, timestamp: i64, base: u64, size: u64, name: String) {
@@ -793,26 +1309,22 @@ mod windows_impl {
             };
 
             let mut fallback_index = None;
-            for index in indices {
-                if self.events[index].pid != self.target_pid {
+            for target in indices {
+                let (pid, thread) = self.stack_target_identity(target);
+                if pid != self.target_pid {
                     continue;
                 }
-                fallback_index.get_or_insert(index);
-                if self.event_header_threads[index] == stack.stack_thread {
-                    append_stack_frames(
-                        &mut self.event_stack_addresses[index],
-                        &stack.stack_addresses,
-                    );
+                fallback_index.get_or_insert(target);
+                if thread == stack.stack_thread {
+                    self.append_stack_frames_to_target(target, &stack.stack_addresses);
                     self.matched_stack_walk_events += 1;
                     return true;
                 }
             }
 
-            if let Some(index) = fallback_index.filter(|_| stack.stack_process == self.target_pid) {
-                append_stack_frames(
-                    &mut self.event_stack_addresses[index],
-                    &stack.stack_addresses,
-                );
+            if let Some(target) = fallback_index.filter(|_| stack.stack_process == self.target_pid)
+            {
+                self.append_stack_frames_to_target(target, &stack.stack_addresses);
                 self.matched_stack_walk_events += 1;
                 return true;
             }
@@ -820,21 +1332,51 @@ mod windows_impl {
             false
         }
 
+        fn stack_target_identity(&self, target: StackTarget) -> (u32, u32) {
+            match target.kind {
+                StackTargetKind::Lifecycle => (
+                    self.lifecycle_events[target.index].pid,
+                    self.lifecycle_header_threads[target.index],
+                ),
+                StackTargetKind::FileIo => (
+                    self.file_io_events[target.index].pid,
+                    self.file_io_header_threads[target.index],
+                ),
+            }
+        }
+
+        fn append_stack_frames_to_target(&mut self, target: StackTarget, frames: &[u64]) {
+            match target.kind {
+                StackTargetKind::Lifecycle => {
+                    append_stack_frames(&mut self.lifecycle_stack_addresses[target.index], frames)
+                }
+                StackTargetKind::FileIo => {
+                    append_stack_frames(&mut self.file_io_stack_addresses[target.index], frames)
+                }
+            }
+        }
+
         fn finalize_stacks(&mut self, stacks_enabled: bool) {
-            for (index, addresses) in self.event_stack_addresses.iter().enumerate() {
-                let stack =
-                    resolve_stack_addresses(addresses, &self.modules, self.event_timestamps[index]);
-                self.stack_frames_total += stack.len() as u64;
-                self.stack_frames_resolved +=
-                    stack.iter().filter(|frame| frame.resolved).count() as u64;
-                self.stack_frames_unresolved +=
-                    stack.iter().filter(|frame| !frame.resolved).count() as u64;
-                self.events[index].stack = stack.into_iter().map(|frame| frame.value).collect();
+            for (index, addresses) in self.lifecycle_stack_addresses.iter().enumerate() {
+                self.lifecycle_events[index].stack = finalize_stack(
+                    addresses,
+                    &self.modules,
+                    self.lifecycle_timestamps[index],
+                    &mut self.lifecycle_stack_stats,
+                );
+            }
+            for (index, addresses) in self.file_io_stack_addresses.iter().enumerate() {
+                self.file_io_events[index].stack = finalize_stack(
+                    addresses,
+                    &self.modules,
+                    self.file_io_timestamps[index],
+                    &mut self.file_io_stack_stats,
+                );
             }
 
             if stacks_enabled && self.stack_walk_events > 0 && self.matched_stack_walk_events == 0 {
                 self.warnings.push(format!(
-                    "native ETW saw {} StackWalk events but none matched filtered lifecycle events; lifecycle_samples=[{}]; stack_samples=[{}]",
+                    "native ETW saw {} StackWalk events but none matched filtered target events; lifecycle_samples=[{}]; stack_samples=[{}]",
                     self.stack_walk_events,
                     self.lifecycle_match_samples.join("; "),
                     self.stack_walk_match_samples.join("; ")
@@ -848,15 +1390,63 @@ mod windows_impl {
             }
         }
 
-        fn finish(self, stacks_enabled: bool) -> EtwSummary {
+        fn finish(mut self) -> EtwSummary {
+            if self.file_path_unresolved > 0 {
+                self.warnings.push(format!(
+                    "native ETW file_io left {} target file events without a resolved path",
+                    self.file_path_unresolved
+                ));
+            }
+            if self.unmatched_op_end_count > 0 {
+                self.warnings.push(format!(
+                    "native ETW file_io saw {} target OpEnd events without a matching begin event",
+                    self.unmatched_op_end_count
+                ));
+            }
+            if self.reused_irp_without_op_end_count > 0 {
+                self.warnings.push(format!(
+                    "native ETW file_io saw {} reused IrpPtr values before a matching OpEnd",
+                    self.reused_irp_without_op_end_count
+                ));
+            }
+            let incomplete_io_count =
+                self.pending_file_irps.len() as u64 + self.reused_irp_without_op_end_count;
+            if incomplete_io_count > 0 {
+                self.warnings.push(format!(
+                    "native ETW file_io left {} begin events without a matching OpEnd",
+                    incomplete_io_count
+                ));
+            }
+            let mut event_sets = BTreeMap::new();
+            if self.settings.includes(EtwEventSet::Process) {
+                event_sets.insert(
+                    "process",
+                    EtwEventSetSummary::lifecycle(
+                        self.lifecycle_event_counts,
+                        self.lifecycle_stack_stats,
+                    ),
+                );
+            }
+            if self.settings.includes(EtwEventSet::FileIo) {
+                event_sets.insert(
+                    "file_io",
+                    EtwEventSetSummary::file_io(
+                        self.file_io_event_counts,
+                        self.file_io_stack_stats,
+                        self.file_path_resolved,
+                        self.file_path_unresolved,
+                        self.matched_op_end_count,
+                        self.unmatched_op_end_count,
+                        incomplete_io_count,
+                        self.reused_irp_without_op_end_count,
+                    ),
+                );
+            }
             EtwSummary {
                 target_pid: Some(self.target_pid),
-                event_sets: vec!["process_lifecycle"],
-                stacks_enabled,
-                event_counts: self.event_counts,
-                stack_frames_total: self.stack_frames_total,
-                stack_frames_resolved: self.stack_frames_resolved,
-                stack_frames_unresolved: self.stack_frames_unresolved,
+                requested_event_sets: self.settings.event_set_names(),
+                stacks_enabled: self.settings.stacks_enabled,
+                event_sets,
                 warnings: self.warnings,
             }
         }
@@ -868,6 +1458,19 @@ mod windows_impl {
                 target.push(*address);
             }
         }
+    }
+
+    fn finalize_stack(
+        addresses: &[u64],
+        modules: &[ModuleInterval],
+        timestamp: i64,
+        stats: &mut StackStats,
+    ) -> Vec<String> {
+        let stack = resolve_stack_addresses(addresses, modules, timestamp);
+        stats.total += stack.len() as u64;
+        stats.resolved += stack.iter().filter(|frame| frame.resolved).count() as u64;
+        stats.unresolved += stack.iter().filter(|frame| !frame.resolved).count() as u64;
+        stack.into_iter().rev().map(|frame| frame.value).collect()
     }
 
     fn lifecycle_count_map() -> BTreeMap<&'static str, u64> {
@@ -883,13 +1486,37 @@ mod windows_impl {
         .collect()
     }
 
+    fn file_io_count_map() -> BTreeMap<&'static str, u64> {
+        [
+            ("file_name", 0),
+            ("file_create_name", 0),
+            ("file_delete_name", 0),
+            ("file_rundown", 0),
+            ("create", 0),
+            ("cleanup", 0),
+            ("read", 0),
+            ("write", 0),
+            ("set_info", 0),
+            ("delete", 0),
+            ("rename", 0),
+            ("dir_enum", 0),
+            ("flush", 0),
+            ("query_info", 0),
+            ("fs_control", 0),
+            ("dir_notify", 0),
+        ]
+        .into_iter()
+        .collect()
+    }
+
     fn post_process_trace(
         trace_path: &Path,
-        events_path: &Path,
+        process_path: &Path,
+        file_io_path: &Path,
         target_pid: u32,
-        stacks_enabled: bool,
+        settings: NativeEtwSettings,
     ) -> Result<EtwSummary> {
-        let mut processor = EtwProcessor::new(target_pid);
+        let mut processor = EtwProcessor::new(target_pid, settings);
         let mut trace_path_w = wide_null(trace_path.as_os_str());
         let mut logfile = EVENT_TRACE_LOGFILEW::default();
         unsafe {
@@ -918,9 +1545,14 @@ mod windows_impl {
             }
         }
 
-        processor.finalize_stacks(stacks_enabled);
-        write_events(events_path, &processor.events)?;
-        Ok(processor.finish(stacks_enabled))
+        processor.finalize_stacks(settings.stacks_enabled);
+        if settings.includes(EtwEventSet::Process) {
+            write_events(process_path, &processor.lifecycle_events)?;
+        }
+        if settings.includes(EtwEventSet::FileIo) {
+            write_events(file_io_path, &processor.file_io_events)?;
+        }
+        Ok(processor.finish())
     }
 
     unsafe extern "system" fn etw_event_record_callback(record: *mut EVENT_RECORD) {
@@ -1012,6 +1644,86 @@ mod windows_impl {
             });
         }
         None
+    }
+
+    unsafe fn decode_file_io_event(
+        record: *mut EVENT_RECORD,
+        _warnings: &mut Vec<String>,
+    ) -> Option<DecodedFileIoEvent> {
+        let header = &(*record).EventHeader;
+        if header.ProviderId != FileIoGuid {
+            return None;
+        }
+        let opcode = header.EventDescriptor.Opcode as u32;
+        let event = match opcode {
+            FILE_IO_NAME => "file_name",
+            FILE_IO_FILE_CREATE_NAME => "file_create_name",
+            FILE_IO_FILE_DELETE_NAME => "file_delete_name",
+            FILE_IO_RUNDOWN => "file_rundown",
+            FILE_IO_CREATE => "create",
+            FILE_IO_CLEANUP => "cleanup",
+            FILE_IO_CLOSE => "close",
+            FILE_IO_READ => "read",
+            FILE_IO_WRITE => "write",
+            FILE_IO_SET_INFO => "set_info",
+            FILE_IO_DELETE => "delete",
+            FILE_IO_RENAME => "rename",
+            FILE_IO_DIR_ENUM => "dir_enum",
+            FILE_IO_FLUSH => "flush",
+            FILE_IO_QUERY_INFO => "query_info",
+            FILE_IO_FS_CONTROL => "fs_control",
+            FILE_IO_OP_END => "op_end",
+            FILE_IO_DIR_NOTIFY => "dir_notify",
+            _ => return None,
+        };
+        let path = match opcode {
+            FILE_IO_CREATE => read_string_any(record, &["OpenPath", "FileName", "Path"]),
+            FILE_IO_NAME
+            | FILE_IO_FILE_CREATE_NAME
+            | FILE_IO_FILE_DELETE_NAME
+            | FILE_IO_RUNDOWN
+            | FILE_IO_DIR_ENUM
+            | FILE_IO_DIR_NOTIFY => read_string_any(record, &["FileName", "OpenPath", "Path"]),
+            _ => None,
+        };
+        let path_source = path.as_ref().map(|_| match opcode {
+            FILE_IO_CREATE => "open_path",
+            _ => "file_name",
+        });
+        let stack_addresses = if opcode == FILE_IO_OP_END {
+            Vec::new()
+        } else {
+            stack_addresses(record)
+        };
+        let pid =
+            read_u32_any(record, &["ProcessId", "ProcessID", "PID"]).unwrap_or(header.ProcessId);
+        let ttid = read_u32_any(
+            record,
+            &["TTID", "TThreadId", "TThreadID", "ThreadId", "ThreadID"],
+        );
+
+        Some(DecodedFileIoEvent {
+            event_timestamp: header.TimeStamp,
+            event_thread_id: header.ThreadId,
+            event,
+            pid,
+            ttid,
+            path,
+            path_source,
+            file_object: read_u64_any(record, &["FileObject", "FileObj"]),
+            file_key: read_u64_any(record, &["FileKey", "FileObjectKey"]),
+            irp_ptr: read_u64_any(record, &["IrpPtr", "Irp", "IrpPointer"]),
+            offset: read_u64_any(record, &["Offset", "ByteOffset"]),
+            io_size: read_u64_any(record, &["IoSize", "Size", "TransferSize"]),
+            io_flags: read_u32_any(record, &["IoFlags", "Flags"]),
+            create_options: read_u32_any(record, &["CreateOptions"]),
+            file_attributes: read_u32_any(record, &["FileAttributes"]),
+            share_access: read_u32_any(record, &["ShareAccess"]),
+            info_class: read_u32_any(record, &["InfoClass"]),
+            extra_info: read_u64_any(record, &["ExtraInfo"]),
+            nt_status: read_u32_any(record, &["NtStatus", "Status"]),
+            stack_addresses,
+        })
     }
 
     unsafe fn decode_stack_walk_event(record: *mut EVENT_RECORD) -> Option<DecodedStackWalkEvent> {
@@ -1345,7 +2057,7 @@ mod windows_impl {
         words > 0 && zero_high_bytes * 2 >= words
     }
 
-    fn write_events(path: &Path, events: &[LifecycleEvent]) -> Result<()> {
+    fn write_events<T: Serialize>(path: &Path, events: &[T]) -> Result<()> {
         let mut file =
             File::create(path).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
         for event in events {
@@ -1356,10 +2068,54 @@ mod windows_impl {
         Ok(())
     }
 
+    fn ensure_empty_event_set_files(
+        settings: NativeEtwSettings,
+        process_path: &Path,
+        file_io_path: &Path,
+    ) -> Result<()> {
+        if settings.includes(EtwEventSet::Process) {
+            ensure_empty_file(process_path)?;
+        }
+        if settings.includes(EtwEventSet::FileIo) {
+            ensure_empty_file(file_io_path)?;
+        }
+        Ok(())
+    }
+
     fn ensure_empty_file(path: &Path) -> Result<()> {
         File::create(path)
             .map(|_| ())
             .map_err(|error| DbgFlowError::Artifact(error.to_string()))
+    }
+
+    fn collector_artifacts(
+        settings: NativeEtwSettings,
+        trace_path: &Path,
+        process_path: &Path,
+        file_io_path: &Path,
+        summary_path: &Path,
+    ) -> Vec<ArtifactRef> {
+        let mut artifacts = vec![ArtifactRef {
+            kind: ArtifactKind::ProfileCollectorTrace,
+            path: trace_path.to_path_buf(),
+        }];
+        if settings.includes(EtwEventSet::Process) {
+            artifacts.push(ArtifactRef {
+                kind: ArtifactKind::ProfileCollectorEvents,
+                path: process_path.to_path_buf(),
+            });
+        }
+        if settings.includes(EtwEventSet::FileIo) {
+            artifacts.push(ArtifactRef {
+                kind: ArtifactKind::ProfileCollectorEvents,
+                path: file_io_path.to_path_buf(),
+            });
+        }
+        artifacts.push(ArtifactRef {
+            kind: ArtifactKind::ProfileCollectorSummary,
+            path: summary_path.to_path_buf(),
+        });
+        artifacts
     }
 
     fn write_summary(path: &Path, summary: &EtwSummary) -> Result<()> {
@@ -1420,9 +2176,16 @@ mod windows_impl {
     mod tests {
         use super::*;
 
+        fn test_settings() -> NativeEtwSettings {
+            NativeEtwSettings {
+                event_sets: [Some(EtwEventSet::Process), Some(EtwEventSet::FileIo)],
+                stacks_enabled: true,
+            }
+        }
+
         #[test]
         fn stack_walk_after_lifecycle_event_attaches_by_timestamp_and_thread() {
-            let mut processor = EtwProcessor::new(42);
+            let mut processor = EtwProcessor::new(42, test_settings());
             processor.process_lifecycle_event(DecodedLifecycleEvent {
                 event_timestamp: 100,
                 event_thread_id: 7,
@@ -1444,17 +2207,64 @@ mod windows_impl {
 
             processor.finalize_stacks(true);
 
-            assert_eq!(processor.events[0].stack.len(), 2);
-            assert_eq!(processor.events[0].stack[0].as_str(), "target.dll+0x10");
-            assert_eq!(processor.events[0].stack[1].as_str(), "0x0000000000005000");
-            assert_eq!(processor.stack_frames_total, 2);
-            assert_eq!(processor.stack_frames_resolved, 1);
-            assert_eq!(processor.stack_frames_unresolved, 1);
+            assert_eq!(processor.lifecycle_events[0].event_set, "process");
+            assert_eq!(processor.lifecycle_events[0].stack.len(), 2);
+            assert_eq!(
+                processor.lifecycle_events[0].stack[0].as_str(),
+                "0x0000000000005000"
+            );
+            assert_eq!(
+                processor.lifecycle_events[0].stack[1].as_str(),
+                "target.dll+0x10"
+            );
+            assert_eq!(processor.lifecycle_stack_stats.total, 2);
+            assert_eq!(processor.lifecycle_stack_stats.resolved, 1);
+            assert_eq!(processor.lifecycle_stack_stats.unresolved, 1);
+        }
+
+        #[test]
+        fn process_summary_and_artifact_use_new_event_set_name() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_lifecycle_event(DecodedLifecycleEvent {
+                event_timestamp: 100,
+                event_thread_id: 7,
+                event: "process_start",
+                pid: 42,
+                tid: None,
+                parent_pid: Some(1),
+                image_path: Some("target.exe".to_string()),
+                image_base: None,
+                image_size: None,
+                stack_addresses: Vec::new(),
+            });
+
+            let summary = processor.finish();
+
+            assert!(summary.event_sets.contains_key("process"));
+            assert_eq!(
+                summary.event_sets["process"].event_counts["process_start"],
+                1
+            );
+
+            let artifacts = collector_artifacts(
+                test_settings(),
+                Path::new(r"C:\trace.etl"),
+                Path::new(r"C:\process.jsonl"),
+                Path::new(r"C:\file_io.jsonl"),
+                Path::new(r"C:\summary.json"),
+            );
+
+            assert!(artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("process.jsonl")));
+            assert!(!artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("process_lifecycle.jsonl")));
         }
 
         #[test]
         fn stack_walk_before_lifecycle_event_is_attached_when_event_arrives() {
-            let mut processor = EtwProcessor::new(42);
+            let mut processor = EtwProcessor::new(42, test_settings());
             processor.modules.push(ModuleInterval {
                 base: 0x2000,
                 size: 0x1000,
@@ -1483,13 +2293,16 @@ mod windows_impl {
 
             processor.finalize_stacks(true);
 
-            assert_eq!(processor.events[0].stack[0].as_str(), "later.dll+0x20");
+            assert_eq!(
+                processor.lifecycle_events[0].stack[0].as_str(),
+                "later.dll+0x20"
+            );
             assert_eq!(processor.matched_stack_walk_events, 1);
         }
 
         #[test]
         fn non_target_stack_walk_without_lifecycle_match_is_not_cached() {
-            let mut processor = EtwProcessor::new(42);
+            let mut processor = EtwProcessor::new(42, test_settings());
 
             processor.process_stack_walk_event(DecodedStackWalkEvent {
                 event_timestamp: 300,
@@ -1500,6 +2313,560 @@ mod windows_impl {
 
             assert!(processor.pending_stacks_by_timestamp.is_empty());
             assert_eq!(processor.dropped_pending_stack_walk_events, 1);
+        }
+
+        #[test]
+        fn file_io_event_resolves_path_from_prior_name_event() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 10,
+                event_thread_id: 7,
+                event: "file_name",
+                pid: 42,
+                ttid: None,
+                path: Some(r"\Device\HarddiskVolume1\data.txt".to_string()),
+                path_source: Some("file_name"),
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: None,
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "read",
+                pid: 42,
+                ttid: Some(8),
+                path: None,
+                path_source: None,
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: Some(0),
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            assert_eq!(processor.file_io_events.len(), 2);
+            assert_eq!(
+                processor.file_io_events[1].path.as_deref(),
+                Some(r"\Device\HarddiskVolume1\data.txt")
+            );
+            assert_eq!(
+                processor.file_io_events[1].path_source,
+                Some("file_object_cache")
+            );
+            assert_eq!(processor.file_path_resolved, 2);
+            assert_eq!(processor.file_path_unresolved, 0);
+        }
+
+        #[test]
+        fn file_io_path_cache_ignores_non_target_name_events() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 10,
+                event_thread_id: 7,
+                event: "file_name",
+                pid: 7,
+                ttid: None,
+                path: Some(r"\Device\HarddiskVolume1\other-process.txt".to_string()),
+                path_source: Some("file_name"),
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: None,
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "read",
+                pid: 42,
+                ttid: Some(8),
+                path: None,
+                path_source: None,
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: Some(0),
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            assert_eq!(processor.file_io_events.len(), 1);
+            assert_eq!(processor.file_io_events[0].path, None);
+            assert_eq!(processor.file_path_unresolved, 1);
+        }
+
+        #[test]
+        fn file_io_close_is_ignored_and_removes_path_cache() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 10,
+                event_thread_id: 7,
+                event: "file_name",
+                pid: 42,
+                ttid: None,
+                path: Some(r"\Device\HarddiskVolume1\data.txt".to_string()),
+                path_source: Some("file_name"),
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: None,
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+            assert_eq!(processor.file_io_events.len(), 1);
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 7,
+                event: "close",
+                pid: 42,
+                ttid: None,
+                path: None,
+                path_source: None,
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 25,
+                event_thread_id: 7,
+                event: "op_end",
+                pid: 42,
+                ttid: None,
+                path: None,
+                path_source: None,
+                file_object: None,
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: Some(0),
+                nt_status: Some(0),
+                stack_addresses: Vec::new(),
+            });
+
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 30,
+                event_thread_id: 8,
+                event: "read",
+                pid: 42,
+                ttid: Some(8),
+                path: None,
+                path_source: None,
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x3000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: Some(0),
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            assert_eq!(processor.file_io_events.len(), 2);
+            assert_eq!(processor.file_io_events[1].event, "read");
+            assert_eq!(processor.file_io_events[1].path, None);
+            assert_eq!(processor.unmatched_op_end_count, 0);
+            assert!(!processor.file_io_event_counts.contains_key("close"));
+        }
+
+        #[test]
+        fn file_io_event_keeps_unresolved_pointer_when_path_is_unknown() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "write",
+                pid: 42,
+                ttid: Some(8),
+                path: None,
+                path_source: None,
+                file_object: Some(0x1000),
+                file_key: Some(0x3000),
+                irp_ptr: Some(0x2000),
+                offset: Some(64),
+                io_size: Some(256),
+                io_flags: Some(1),
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            assert_eq!(processor.file_io_events[0].path, None);
+            assert_eq!(
+                processor.file_io_events[0].file_object.as_deref(),
+                Some("0x0000000000001000")
+            );
+            assert_eq!(processor.file_path_resolved, 0);
+            assert_eq!(processor.file_path_unresolved, 1);
+        }
+
+        #[test]
+        fn file_io_op_end_enriches_begin_event_without_path_resolution_pressure() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 10,
+                event_thread_id: 8,
+                event: "read",
+                pid: 42,
+                ttid: Some(8),
+                path: None,
+                path_source: None,
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "op_end",
+                pid: 4,
+                ttid: None,
+                path: None,
+                path_source: None,
+                file_object: None,
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: Some(128),
+                nt_status: Some(0),
+                stack_addresses: Vec::new(),
+            });
+
+            assert_eq!(processor.file_io_events.len(), 1);
+            assert_eq!(processor.file_io_events[0].event, "read");
+            assert_eq!(
+                processor.file_io_events[0].extra_info.as_deref(),
+                Some("0x0000000000000080")
+            );
+            assert_eq!(
+                processor.file_io_events[0].nt_status.as_deref(),
+                Some("0x00000000")
+            );
+            assert_eq!(processor.file_io_events[0].completion_pid, Some(4));
+            assert_eq!(processor.file_io_events[0].completion_tid, Some(8));
+            assert_eq!(processor.file_io_events[0].completion_sequence, Some(2));
+            assert_eq!(processor.matched_op_end_count, 1);
+            assert_eq!(processor.unmatched_op_end_count, 0);
+            assert!(processor.pending_file_irps.is_empty());
+            assert_eq!(processor.file_path_unresolved, 1);
+            assert!(!processor.file_io_event_counts.contains_key("op_end"));
+        }
+
+        #[test]
+        fn file_io_unmatched_op_end_is_counted_without_output() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "op_end",
+                pid: 42,
+                ttid: None,
+                path: None,
+                path_source: None,
+                file_object: None,
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: Some(128),
+                nt_status: Some(0),
+                stack_addresses: Vec::new(),
+            });
+
+            let summary = processor.finish();
+
+            assert_eq!(
+                summary.event_sets["file_io"].unmatched_op_end_count,
+                Some(1)
+            );
+            assert_eq!(summary.event_sets["file_io"].matched_op_end_count, Some(0));
+            assert!(summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("without a matching begin event")));
+        }
+
+        #[test]
+        fn file_io_begin_without_completion_is_counted() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "write",
+                pid: 42,
+                ttid: Some(8),
+                path: Some(r"C:\data.txt".to_string()),
+                path_source: Some("open_path"),
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            let summary = processor.finish();
+
+            assert_eq!(summary.event_sets["file_io"].incomplete_io_count, Some(1));
+            assert!(summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("without a matching OpEnd")));
+        }
+
+        #[test]
+        fn file_io_reused_irp_warns_and_matches_latest_begin() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 10,
+                event_thread_id: 7,
+                event: "read",
+                pid: 42,
+                ttid: Some(7),
+                path: Some(r"C:\old.txt".to_string()),
+                path_source: Some("open_path"),
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(64),
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "write",
+                pid: 42,
+                ttid: Some(8),
+                path: Some(r"C:\new.txt".to_string()),
+                path_source: Some("open_path"),
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 30,
+                event_thread_id: 9,
+                event: "op_end",
+                pid: 4,
+                ttid: None,
+                path: None,
+                path_source: None,
+                file_object: None,
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: None,
+                io_size: None,
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: Some(128),
+                nt_status: Some(0),
+                stack_addresses: Vec::new(),
+            });
+
+            assert_eq!(processor.file_io_events.len(), 2);
+            assert_eq!(processor.file_io_events[0].completion_sequence, None);
+            assert_eq!(processor.file_io_events[1].completion_sequence, Some(3));
+
+            let summary = processor.finish();
+
+            assert_eq!(
+                summary.event_sets["file_io"].reused_irp_without_op_end_count,
+                Some(1)
+            );
+            assert_eq!(summary.event_sets["file_io"].matched_op_end_count, Some(1));
+            assert_eq!(summary.event_sets["file_io"].incomplete_io_count, Some(1));
+            assert!(summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("reused IrpPtr")));
+        }
+
+        #[test]
+        fn summary_reports_counts_by_event_set() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "read",
+                pid: 42,
+                ttid: Some(8),
+                path: Some(r"C:\data.txt".to_string()),
+                path_source: Some("open_path"),
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: vec![0x5000],
+            });
+            processor.finalize_stacks(true);
+
+            let summary = processor.finish();
+
+            assert_eq!(summary.event_sets["file_io"].event_counts["read"], 1);
+            assert_eq!(summary.event_sets["file_io"].file_path_resolved, Some(1));
+            assert_eq!(summary.event_sets["file_io"].stack_frames_total, 1);
+        }
+
+        #[test]
+        fn summary_warns_when_file_paths_are_unresolved() {
+            let mut processor = EtwProcessor::new(42, test_settings());
+            processor.process_file_io_event(DecodedFileIoEvent {
+                event_timestamp: 20,
+                event_thread_id: 8,
+                event: "write",
+                pid: 42,
+                ttid: Some(8),
+                path: None,
+                path_source: None,
+                file_object: Some(0x1000),
+                file_key: None,
+                irp_ptr: Some(0x2000),
+                offset: Some(0),
+                io_size: Some(128),
+                io_flags: None,
+                create_options: None,
+                file_attributes: None,
+                share_access: None,
+                info_class: None,
+                extra_info: None,
+                nt_status: None,
+                stack_addresses: Vec::new(),
+            });
+
+            let summary = processor.finish();
+
+            assert!(summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("without a resolved path")));
         }
 
         #[test]
@@ -1572,14 +2939,21 @@ mod windows_impl {
             ));
             let _ = std::fs::remove_dir_all(&output_dir);
             std::fs::create_dir_all(&output_dir).expect("create replay output dir");
-            let events_path = output_dir.join("events.jsonl");
+            let process_path = output_dir.join("process.jsonl");
+            let file_io_path = output_dir.join("file_io.jsonl");
 
-            let summary =
-                post_process_trace(&trace, &events_path, target_pid, true).expect("post process");
-            let events = std::fs::read_to_string(&events_path).expect("read events");
+            let summary = post_process_trace(
+                &trace,
+                &process_path,
+                &file_io_path,
+                target_pid,
+                test_settings(),
+            )
+            .expect("post process");
+            let events = std::fs::read_to_string(&process_path).expect("read process events");
 
             assert!(
-                summary.stack_frames_total > 0,
+                summary.event_sets["process"].stack_frames_total > 0,
                 "expected stack frames from ETL replay; summary={}",
                 serde_json::to_string_pretty(&json!(summary)).expect("summary json")
             );
@@ -1657,5 +3031,29 @@ mod tests {
     fn filters_lifecycle_events_to_target_pid() {
         assert!(event_matches_target(1234, 1234));
         assert!(!event_matches_target(4321, 1234));
+    }
+
+    #[test]
+    fn native_etw_settings_rejects_empty_event_sets() {
+        let error = native_etw_settings(&ProfileCollectorConfig::NativeEtw {
+            scope: EtwProfileScope::TargetProcess,
+            event_sets: Vec::new(),
+            stacks: crate::profile::EtwStackConfig::default(),
+        })
+        .expect_err("empty event sets are rejected");
+
+        assert!(error.to_string().contains("at least one event set"));
+    }
+
+    #[test]
+    fn native_etw_settings_rejects_duplicate_event_sets() {
+        let error = native_etw_settings(&ProfileCollectorConfig::NativeEtw {
+            scope: EtwProfileScope::TargetProcess,
+            event_sets: vec![EtwEventSet::FileIo, EtwEventSet::FileIo],
+            stacks: crate::profile::EtwStackConfig::default(),
+        })
+        .expect_err("duplicate event sets are rejected");
+
+        assert!(error.to_string().contains("duplicate native ETW event set"));
     }
 }

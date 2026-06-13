@@ -59,7 +59,7 @@ fn profile_launch_target_canonicalizes_existing_executable_and_rejects_nul_args(
 }
 
 #[test]
-fn default_profile_collector_is_native_etw_process_lifecycle() {
+fn default_profile_collector_is_native_etw_process_and_file_io() {
     let config = ProfileCollectorConfig::default();
 
     assert_eq!(config.kind(), ProfileCollectorKind::NativeEtw);
@@ -69,12 +69,12 @@ fn default_profile_collector_is_native_etw_process_lifecycle() {
             scope: EtwProfileScope::TargetProcess,
             ref event_sets,
             stacks: EtwStackConfig { enabled: true }
-        } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
+        } if event_sets == &vec![EtwEventSet::Process, EtwEventSet::FileIo]
     ));
 }
 
 #[test]
-fn default_run_profile_collectors_is_native_etw_process_lifecycle() {
+fn default_run_profile_collectors_is_native_etw_process_and_file_io() {
     let request = RunProfile {
         target: ProfileTarget::Launch {
             executable: std::env::current_exe().expect("current exe"),
@@ -92,7 +92,7 @@ fn default_run_profile_collectors_is_native_etw_process_lifecycle() {
             scope: EtwProfileScope::TargetProcess,
             ref event_sets,
             stacks: EtwStackConfig { enabled: true }
-        } if event_sets == &vec![EtwEventSet::ProcessLifecycle]
+        } if event_sets == &vec![EtwEventSet::Process, EtwEventSet::FileIo]
     ));
 }
 
@@ -639,7 +639,7 @@ fn test_profile_root(name: &str) -> std::path::PathBuf {
 fn native_etw_config() -> ProfileCollectorConfig {
     ProfileCollectorConfig::NativeEtw {
         scope: EtwProfileScope::TargetProcess,
-        event_sets: vec![EtwEventSet::ProcessLifecycle],
+        event_sets: vec![EtwEventSet::Process],
         stacks: EtwStackConfig::default(),
     }
 }

@@ -68,7 +68,7 @@ impl Default for ProfileCollectorConfig {
     fn default() -> Self {
         Self::NativeEtw {
             scope: EtwProfileScope::TargetProcess,
-            event_sets: vec![EtwEventSet::ProcessLifecycle],
+            event_sets: vec![EtwEventSet::Process, EtwEventSet::FileIo],
             stacks: EtwStackConfig::default(),
         }
     }
@@ -83,7 +83,8 @@ pub enum EtwProfileScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EtwEventSet {
-    ProcessLifecycle,
+    Process,
+    FileIo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
