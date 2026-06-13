@@ -2,13 +2,18 @@ use super::dynamic::DynamicIdaApi;
 use super::install::{validate_ida_install_dir, IdaInstall, IDA_INSTALL_ENV};
 use super::model::{FunctionInfo, IdaInfo, SegmentInfo};
 use super::target::IdaTarget;
+use dbgflow_common::logging::LogSink;
+use dbgflow_common::process::{
+    log_process_launch, spawn_process, EnvChange, LaunchStdio, ManagedChild, ProcessLaunchContext,
+    ProcessLaunchSpec,
+};
 use dbgflow_common::SessionId;
 use dbgflow_common::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,6 +42,8 @@ pub trait ReverseWorkerLauncher: Send + Sync {
         session_id: SessionId,
         install: IdaInstall,
         worker_log_path: PathBuf,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
     ) -> Result<Arc<dyn ReverseWorker>>;
 }
 
@@ -72,6 +79,8 @@ impl ReverseWorkerLauncher for ProcessReverseWorkerLauncher {
         session_id: SessionId,
         install: IdaInstall,
         worker_log_path: PathBuf,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
     ) -> Result<Arc<dyn ReverseWorker>> {
         let executable = match &self.executable {
             Some(executable) => executable.clone(),
@@ -84,6 +93,8 @@ impl ReverseWorkerLauncher for ProcessReverseWorkerLauncher {
             executable,
             install,
             worker_log_path,
+            launch_context,
+            logger,
         )?))
     }
 }
@@ -96,9 +107,9 @@ struct ProcessReverseWorker {
 struct ProcessReverseWorkerInner {
     _session_id: SessionId,
     pid: u32,
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
-    stdout: Mutex<std::io::BufReader<ChildStdout>>,
+    child: Mutex<ManagedChild>,
+    stdin: Mutex<File>,
+    stdout: Mutex<BufReader<File>>,
     request_lock: Mutex<()>,
     next_request_id: AtomicU64,
 }
@@ -121,38 +132,37 @@ impl ProcessReverseWorker {
         executable: PathBuf,
         install: IdaInstall,
         worker_log_path: PathBuf,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
     ) -> Result<Self> {
-        let stderr = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&worker_log_path)
-            .map_err(|error| {
-                DbgFlowError::Artifact(format!(
-                    "open reverse worker log {}: {error}",
-                    worker_log_path.display()
-                ))
-            })?;
-        let mut command = Command::new(&executable);
-        command
-            .arg(REVERSE_WORKER_COMMAND)
-            .arg(REVERSE_WORKER_KIND_IDA)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr));
-        apply_ida_environment(&mut command, &install.install_dir)?;
-        let mut child = command.spawn().map_err(|error| {
+        let mut spec = ProcessLaunchSpec::new(&executable);
+        spec.args = vec![
+            REVERSE_WORKER_COMMAND.into(),
+            REVERSE_WORKER_KIND_IDA.into(),
+        ];
+        spec.env = ida_env_changes(&install.install_dir)?;
+        spec.stdin = LaunchStdio::Piped;
+        spec.stdout = LaunchStdio::Piped;
+        spec.stderr = LaunchStdio::File(worker_log_path.clone());
+        let mut child = spawn_process(&spec, &launch_context).map_err(|error| {
             DbgFlowError::Backend(format!(
                 "spawn reverse worker {} failed: {error}",
                 executable.display()
             ))
         })?;
-        let pid = child.id();
-        let stdin = child.stdin.take().ok_or_else(|| {
+        let pid = child.pid();
+        let stdin = child.take_stdin().ok_or_else(|| {
             DbgFlowError::Backend("reverse worker stdin was not captured".to_string())
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.take_stdout().ok_or_else(|| {
             DbgFlowError::Backend("reverse worker stdout was not captured".to_string())
         })?;
+        log_process_launch(
+            &logger,
+            "reverse_ida",
+            "worker_process_launch_resolved",
+            child.audit(),
+        );
 
         Ok(Self {
             inner: Arc::new(ProcessReverseWorkerInner {
@@ -160,7 +170,7 @@ impl ProcessReverseWorker {
                 pid,
                 child: Mutex::new(child),
                 stdin: Mutex::new(stdin),
-                stdout: Mutex::new(std::io::BufReader::new(stdout)),
+                stdout: Mutex::new(BufReader::new(stdout)),
                 request_lock: Mutex::new(()),
                 next_request_id: AtomicU64::new(0),
             }),
@@ -258,10 +268,7 @@ impl ReverseWorker for ProcessReverseWorker {
             self.inner.child.lock().map_err(|_| {
                 DbgFlowError::Backend("reverse worker child lock poisoned".to_string())
             })?;
-        child
-            .try_wait()
-            .map(|status| status.is_some())
-            .map_err(|error| DbgFlowError::Backend(format!("poll reverse worker: {error}")))
+        child.try_wait().map(|status| status.is_some())
     }
 
     fn close(&self) -> Result<()> {
@@ -284,14 +291,8 @@ impl ReverseWorker for ProcessReverseWorker {
             self.inner.child.lock().map_err(|_| {
                 DbgFlowError::Backend("reverse worker child lock poisoned".to_string())
             })?;
-        if child
-            .try_wait()
-            .map_err(|error| DbgFlowError::Backend(format!("poll reverse worker: {error}")))?
-            .is_none()
-        {
-            child
-                .kill()
-                .map_err(|error| DbgFlowError::Backend(format!("kill reverse worker: {error}")))?;
+        if child.try_wait()?.is_none() {
+            child.kill()?;
             let _ = child.wait();
         }
         Ok(())
@@ -433,8 +434,7 @@ impl WorkerRuntime {
     }
 }
 
-fn apply_ida_environment(command: &mut Command, install_dir: &Path) -> Result<()> {
-    command.env(IDA_INSTALL_ENV, install_dir);
+fn ida_env_changes(install_dir: &Path) -> Result<Vec<EnvChange>> {
     let mut path_entries = vec![install_dir.to_path_buf()];
     if let Some(existing) = std::env::var_os("PATH") {
         path_entries.extend(std::env::split_paths(&existing));
@@ -442,8 +442,10 @@ fn apply_ida_environment(command: &mut Command, install_dir: &Path) -> Result<()
     let joined = std::env::join_paths(path_entries).map_err(|error| {
         DbgFlowError::Backend(format!("construct reverse worker PATH: {error}"))
     })?;
-    command.env("PATH", joined);
-    Ok(())
+    Ok(vec![
+        EnvChange::set(IDA_INSTALL_ENV, install_dir.as_os_str()),
+        EnvChange::set("PATH", joined),
+    ])
 }
 
 #[cfg(test)]

@@ -6,12 +6,18 @@ use crate::backend::{
 };
 use crate::session::SessionId;
 use dbgflow_common::logging::{LogEvent, LogLevel, LogSink};
+use dbgflow_common::process::{
+    log_process_launch, spawn_process, EnvChange, LaunchStdio, ManagedChild, ProcessLaunchContext,
+    ProcessLaunchSpec,
+};
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_common::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -36,6 +42,7 @@ pub trait SessionWorkerLauncher: Send + Sync {
         session_id: SessionId,
         logger: Arc<dyn LogSink>,
         proxy: ProxyEnvironment,
+        launch_context: ProcessLaunchContext,
     ) -> Result<Arc<dyn SessionWorker>>;
 }
 
@@ -81,6 +88,7 @@ impl SessionWorkerLauncher for ProcessWorkerLauncher {
         session_id: SessionId,
         logger: Arc<dyn LogSink>,
         proxy: ProxyEnvironment,
+        launch_context: ProcessLaunchContext,
     ) -> Result<Arc<dyn SessionWorker>> {
         let executable = match &self.executable {
             Some(executable) => executable.clone(),
@@ -88,7 +96,8 @@ impl SessionWorkerLauncher for ProcessWorkerLauncher {
                 DbgFlowError::Backend(format!("resolve session worker executable failed: {error}"))
             })?,
         };
-        let worker = ProcessSessionWorker::spawn(session_id, executable, logger, proxy)?;
+        let worker =
+            ProcessSessionWorker::spawn(session_id, executable, logger, proxy, launch_context)?;
         Ok(Arc::new(worker))
     }
 }
@@ -101,9 +110,9 @@ struct ProcessSessionWorker {
 struct ProcessSessionWorkerInner {
     session_id: SessionId,
     pid: u32,
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
-    stdout: Mutex<std::io::BufReader<ChildStdout>>,
+    child: Mutex<ManagedChild>,
+    stdin: Mutex<File>,
+    stdout: Mutex<BufReader<File>>,
     request_lock: Mutex<()>,
     next_request_id: AtomicU64,
     logger: Arc<dyn LogSink>,
@@ -143,28 +152,36 @@ impl ProcessSessionWorker {
         executable: PathBuf,
         logger: Arc<dyn LogSink>,
         proxy: ProxyEnvironment,
+        launch_context: ProcessLaunchContext,
     ) -> Result<Self> {
-        let mut command = Command::new(&executable);
-        command
-            .arg(SESSION_WORKER_COMMAND)
-            .arg(SESSION_WORKER_KIND_SESSION)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        apply_proxy_environment(&mut command, &proxy);
-        let mut child = command.spawn().map_err(|error| {
+        let mut spec = ProcessLaunchSpec::new(&executable);
+        spec.args = vec![
+            SESSION_WORKER_COMMAND.into(),
+            SESSION_WORKER_KIND_SESSION.into(),
+        ];
+        spec.env = proxy_env_changes(&proxy);
+        spec.stdin = LaunchStdio::Piped;
+        spec.stdout = LaunchStdio::Piped;
+        spec.stderr = LaunchStdio::Null;
+        let mut child = spawn_process(&spec, &launch_context).map_err(|error| {
             DbgFlowError::Backend(format!(
                 "spawn session worker {} failed: {error}",
                 executable.display()
             ))
         })?;
-        let pid = child.id();
-        let stdin = child.stdin.take().ok_or_else(|| {
+        let pid = child.pid();
+        let stdin = child.take_stdin().ok_or_else(|| {
             DbgFlowError::Backend("session worker stdin was not captured".to_string())
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.take_stdout().ok_or_else(|| {
             DbgFlowError::Backend("session worker stdout was not captured".to_string())
         })?;
+        log_process_launch(
+            &logger,
+            "session_worker",
+            "worker_process_launch_resolved",
+            child.audit(),
+        );
 
         logger.log(
             LogEvent::new(LogLevel::Info, "session_worker", "worker_spawned")
@@ -181,7 +198,7 @@ impl ProcessSessionWorker {
                 pid,
                 child: Mutex::new(child),
                 stdin: Mutex::new(stdin),
-                stdout: Mutex::new(std::io::BufReader::new(stdout)),
+                stdout: Mutex::new(BufReader::new(stdout)),
                 request_lock: Mutex::new(()),
                 next_request_id: AtomicU64::new(0),
                 logger,
@@ -436,6 +453,7 @@ impl ProcessSessionWorker {
     }
 }
 
+#[cfg(test)]
 fn apply_proxy_environment(command: &mut Command, proxy: &ProxyEnvironment) {
     for key in proxy.removed_keys() {
         command.env_remove(key);
@@ -445,12 +463,27 @@ fn apply_proxy_environment(command: &mut Command, proxy: &ProxyEnvironment) {
     }
 }
 
+fn proxy_env_changes(proxy: &ProxyEnvironment) -> Vec<EnvChange> {
+    proxy
+        .removed_keys()
+        .into_iter()
+        .map(EnvChange::remove)
+        .chain(
+            proxy
+                .env_vars()
+                .into_iter()
+                .map(|(key, value)| EnvChange::set(key, value)),
+        )
+        .collect()
+}
+
 impl SessionWorker for ProcessSessionWorker {
     fn create_session(&self, request: CreateBackendSession) -> Result<WorkerSession> {
         match self.request(WorkerRequest::CreateSession {
             target: request.target,
             correlation_id: request.correlation_id,
             symbol_path: request.symbol_path,
+            process_launch_context: request.process_launch_context,
         })? {
             WorkerResult::SessionCreated {
                 backend,
@@ -540,7 +573,7 @@ impl SessionWorker for ProcessSessionWorker {
                     .duration_ms(started.elapsed().as_millis())
                     .field("pid", self.inner.pid)
                     .field("reason", reason)
-                    .field("status", status.to_string()),
+                    .field("status", format!("{status:?}")),
             );
             return Ok(());
         }
@@ -567,7 +600,7 @@ impl SessionWorker for ProcessSessionWorker {
                 .duration_ms(started.elapsed().as_millis())
                 .field("pid", self.inner.pid)
                 .field("reason", reason)
-                .field("status", status.to_string()),
+                .field("status", format!("{status:?}")),
         );
         Ok(())
     }
@@ -586,6 +619,7 @@ enum WorkerRequest {
         target: DebugTarget,
         correlation_id: Option<String>,
         symbol_path: Option<String>,
+        process_launch_context: ProcessLaunchContext,
     },
     Execute {
         command: String,
@@ -799,6 +833,7 @@ impl WorkerRuntime {
                 target,
                 correlation_id,
                 symbol_path,
+                process_launch_context,
             } => {
                 if self.backend_session_id.is_some() {
                     return (
@@ -813,6 +848,7 @@ impl WorkerRuntime {
                     target,
                     correlation_id,
                     symbol_path,
+                    process_launch_context,
                 }) {
                     Ok(session) => {
                         self.backend_session_id = Some(session.id.clone());
@@ -889,12 +925,17 @@ mod tests {
     };
     use crate::backend::{ExecuteBackendFailure, NoopBackendEventSink};
     use crate::session::SessionId;
+    use dbgflow_common::process::{
+        spawn_process, LaunchStdio, ManagedChild, ProcessLaunchContext, ProcessLaunchSpec,
+    };
     use dbgflow_common::proxy::ProxyEnvironment;
     use dbgflow_common::DbgFlowError;
     use serde_json::Value;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::io::{Cursor, Write};
-    use std::process::{Command, Stdio};
+    use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
 
@@ -971,9 +1012,9 @@ mod tests {
     fn process_session_worker_execute_preserves_structured_error_partial_output() {
         let response = r#"{"kind":"response","request_id":0,"result":null,"error":{"message":"backend error: execute failed","partial_output":"partial from worker\n"}}"#;
         let mut child = spawn_worker_response_child(response);
-        let pid = child.id();
-        let stdin = child.stdin.take().expect("fake worker stdin");
-        let stdout = child.stdout.take().expect("fake worker stdout");
+        let pid = child.pid();
+        let stdin = child.take_stdin().expect("fake worker stdin");
+        let stdout = child.take_stdout().expect("fake worker stdout");
         let worker = ProcessSessionWorker {
             inner: Arc::new(ProcessSessionWorkerInner {
                 session_id: SessionId::new(),
@@ -1103,34 +1144,48 @@ mod tests {
         }
     }
 
-    fn spawn_worker_response_child(response: &str) -> std::process::Child {
-        let mut command = worker_response_command(response);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+    fn spawn_worker_response_child(response: &str) -> ManagedChild {
+        let (executable, args) = worker_response_command(response);
+        let mut spec = ProcessLaunchSpec::new(executable);
+        spec.args = args;
+        spec.stdin = LaunchStdio::Piped;
+        spec.stdout = LaunchStdio::Piped;
+        spawn_process(&spec, &ProcessLaunchContext::default())
             .expect("spawn fake worker response process")
     }
 
     #[cfg(windows)]
-    fn worker_response_command(response: &str) -> Command {
+    fn worker_response_command(response: &str) -> (PathBuf, Vec<OsString>) {
         let escaped = response.replace('\'', "''");
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoProfile",
-            "-Command",
-            &format!("$null=[Console]::In.ReadLine(); [Console]::Out.WriteLine('{escaped}')"),
-        ]);
-        command
+        (
+            PathBuf::from(
+                std::env::var_os("SystemRoot")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(r"C:\Windows")),
+            )
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!("$null=[Console]::In.ReadLine(); [Console]::Out.WriteLine('{escaped}')")
+                    .into(),
+            ],
+        )
     }
 
     #[cfg(not(windows))]
-    fn worker_response_command(response: &str) -> Command {
+    fn worker_response_command(response: &str) -> (PathBuf, Vec<OsString>) {
         let escaped = response.replace('\'', "'\\''");
-        let mut command = Command::new("sh");
-        command.args(["-c", &format!("read line; printf '%s\\n' '{escaped}'")]);
-        command
+        (
+            PathBuf::from("sh"),
+            vec![
+                "-c".into(),
+                format!("read line; printf '%s\\n' '{escaped}'").into(),
+            ],
+        )
     }
 }
 

@@ -10,15 +10,18 @@ use dbgflow_common::artifacts::{
 };
 use dbgflow_common::job::SingleActiveJob;
 use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use dbgflow_common::process::{
+    log_process_launch, spawn_process, LaunchStdio, ProcessLaunchConfig, ProcessLaunchContext,
+    ProcessLaunchSpec, ToolCallContext,
+};
 use dbgflow_common::time::now_unix_ms;
 pub use dbgflow_common::TtdRecordingId;
 use dbgflow_common::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -221,25 +224,47 @@ pub struct TtdRecorderExit {
 }
 
 pub trait TtdRecorderRunner: Send + Sync {
-    fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdRecorderExit>;
-    fn stop(&self, invocation: TtdStopInvocation) -> Result<TtdRecorderExit>;
+    fn run(
+        &self,
+        invocation: TtdRecorderInvocation,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit>;
+    fn stop(
+        &self,
+        invocation: TtdStopInvocation,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit>;
 }
 
 #[derive(Debug, Default)]
 pub struct ProcessTtdRecorderRunner;
 
 impl TtdRecorderRunner for ProcessTtdRecorderRunner {
-    fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdRecorderExit> {
+    fn run(
+        &self,
+        invocation: TtdRecorderInvocation,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit> {
         run_ttd_process(
             &invocation.ttd_exe,
             &invocation.args,
             invocation.timeout,
             &invocation.stdout_path,
             &invocation.stderr_path,
+            &launch_context,
+            &logger,
         )
     }
 
-    fn stop(&self, invocation: TtdStopInvocation) -> Result<TtdRecorderExit> {
+    fn stop(
+        &self,
+        invocation: TtdStopInvocation,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit> {
         let args = [
             OsString::from("-stop"),
             invocation.stop_target,
@@ -252,6 +277,8 @@ impl TtdRecorderRunner for ProcessTtdRecorderRunner {
             invocation.timeout,
             &invocation.stdout_path,
             &invocation.stderr_path,
+            &launch_context,
+            &logger,
         )
     }
 }
@@ -263,6 +290,7 @@ pub struct TtdRecordingManager {
     runner: Arc<dyn TtdRecorderRunner>,
     active_job: SingleActiveJob<TtdRecordingId>,
     logger: Arc<dyn LogSink>,
+    process_launch: ProcessLaunchConfig,
 }
 
 impl TtdRecordingManager {
@@ -279,11 +307,26 @@ impl TtdRecordingManager {
         runtime: TtdRecorderRuntime,
         logger: Arc<dyn LogSink>,
     ) -> Self {
+        Self::with_runtime_logger_and_process_launch(
+            artifact_root,
+            runtime,
+            logger,
+            ProcessLaunchConfig::default(),
+        )
+    }
+
+    pub fn with_runtime_logger_and_process_launch(
+        artifact_root: impl Into<PathBuf>,
+        runtime: TtdRecorderRuntime,
+        logger: Arc<dyn LogSink>,
+        process_launch: ProcessLaunchConfig,
+    ) -> Self {
         Self::with_components_and_logger(
             artifact_root,
             runtime,
             Arc::new(ProcessTtdRecorderRunner),
             logger,
+            process_launch,
         )
     }
 
@@ -292,7 +335,13 @@ impl TtdRecordingManager {
         runtime: TtdRecorderRuntime,
         runner: Arc<dyn TtdRecorderRunner>,
     ) -> Self {
-        Self::with_components_and_logger(artifact_root, runtime, runner, noop_logger())
+        Self::with_components_and_logger(
+            artifact_root,
+            runtime,
+            runner,
+            noop_logger(),
+            ProcessLaunchConfig::default(),
+        )
     }
 
     pub fn with_components_and_logger(
@@ -300,6 +349,7 @@ impl TtdRecordingManager {
         runtime: TtdRecorderRuntime,
         runner: Arc<dyn TtdRecorderRunner>,
         logger: Arc<dyn LogSink>,
+        process_launch: ProcessLaunchConfig,
     ) -> Self {
         Self {
             artifacts: ArtifactManager::new(artifact_root),
@@ -307,10 +357,19 @@ impl TtdRecordingManager {
             runner,
             active_job: SingleActiveJob::default(),
             logger,
+            process_launch,
         }
     }
 
-    pub fn record_ttd(&self, mut request: RecordTtd) -> Result<TtdRecordingResult> {
+    pub fn record_ttd(&self, request: RecordTtd) -> Result<TtdRecordingResult> {
+        self.record_ttd_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn record_ttd_with_context(
+        &self,
+        mut request: RecordTtd,
+        tool_context: ToolCallContext,
+    ) -> Result<TtdRecordingResult> {
         let request_started = Instant::now();
         let requested_target = request.target.clone();
         request.target = match validate_ttd_target(request.target) {
@@ -402,6 +461,7 @@ impl TtdRecordingManager {
         );
 
         let args = build_ttd_args(&request.target, &request.options, &traces_dir);
+        let launch_context = ProcessLaunchContext::new(self.process_launch.clone(), tool_context);
         self.record_event(
             recording_id,
             "recorder_starting",
@@ -409,13 +469,17 @@ impl TtdRecordingManager {
             None,
             recorder_command_fields(&ttd_exe, &args),
         );
-        let recorder_exit = self.runner.run(TtdRecorderInvocation {
-            ttd_exe: ttd_exe.clone(),
-            args,
-            timeout: Duration::from_millis(request.timeout_ms),
-            stdout_path: recorder_stdout_path.clone(),
-            stderr_path: recorder_stderr_path.clone(),
-        });
+        let recorder_exit = self.runner.run(
+            TtdRecorderInvocation {
+                ttd_exe: ttd_exe.clone(),
+                args,
+                timeout: Duration::from_millis(request.timeout_ms),
+                stdout_path: recorder_stdout_path.clone(),
+                stderr_path: recorder_stderr_path.clone(),
+            },
+            launch_context.clone(),
+            self.logger.clone(),
+        );
 
         let mut warnings = Vec::new();
         let mut error = None;
@@ -506,13 +570,17 @@ impl TtdRecordingManager {
                         kind: ArtifactKind::TtdRecorderOutput,
                         path: recorder_stop_stderr_path.clone(),
                     });
-                    match self.runner.stop(TtdStopInvocation {
-                        ttd_exe: ttd_exe.clone(),
-                        stop_target: stop_target.clone(),
-                        timeout: Duration::from_secs(15),
-                        stdout_path: recorder_stop_stdout_path.clone(),
-                        stderr_path: recorder_stop_stderr_path.clone(),
-                    }) {
+                    match self.runner.stop(
+                        TtdStopInvocation {
+                            ttd_exe: ttd_exe.clone(),
+                            stop_target: stop_target.clone(),
+                            timeout: Duration::from_secs(15),
+                            stdout_path: recorder_stop_stdout_path.clone(),
+                            stderr_path: recorder_stop_stderr_path.clone(),
+                        },
+                        launch_context.clone(),
+                        self.logger.clone(),
+                    ) {
                         Ok(stop) => {
                             let mut fields = recorder_exit_fields(&stop);
                             fields.insert(
@@ -766,25 +834,26 @@ fn run_ttd_process(
     timeout: Duration,
     stdout_path: &Path,
     stderr_path: &Path,
+    launch_context: &ProcessLaunchContext,
+    logger: &Arc<dyn LogSink>,
 ) -> Result<TtdRecorderExit> {
-    let stdout = File::create(stdout_path)
-        .map_err(|error| DbgFlowError::Artifact(format!("create TTD stdout failed: {error}")))?;
-    let stderr = File::create(stderr_path)
-        .map_err(|error| DbgFlowError::Artifact(format!("create TTD stderr failed: {error}")))?;
-    let mut child = Command::new(ttd_exe)
-        .args(args)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
+    let mut spec = ProcessLaunchSpec::new(ttd_exe);
+    spec.args = args.to_vec();
+    spec.stdout = LaunchStdio::File(stdout_path.to_path_buf());
+    spec.stderr = LaunchStdio::File(stderr_path.to_path_buf());
+    let mut child = spawn_process(&spec, launch_context)
         .map_err(|error| DbgFlowError::Backend(format!("start TTD recorder failed: {error}")))?;
+    log_process_launch(
+        logger,
+        "ttd",
+        "recorder_process_launch_resolved",
+        child.audit(),
+    );
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| DbgFlowError::Backend(format!("poll TTD recorder failed: {error}")))?
-        {
+        if let Some(status) = child.try_wait()? {
             return Ok(TtdRecorderExit {
-                exit_code: status.code(),
+                exit_code: status.code,
                 timed_out: false,
             });
         }
@@ -792,7 +861,7 @@ fn run_ttd_process(
             let _ = child.kill();
             let status = child.wait().ok();
             return Ok(TtdRecorderExit {
-                exit_code: status.and_then(|status| status.code()),
+                exit_code: status.and_then(|status| status.code),
                 timed_out: true,
             });
         }
@@ -827,6 +896,96 @@ struct DiscoveredTtdArtifacts {
     traces: Vec<ArtifactRef>,
     trace_indexes: Vec<ArtifactRef>,
     recorder_logs: Vec<ArtifactRef>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbgflow_common::logging::noop_logger;
+    use std::sync::Mutex;
+
+    #[test]
+    fn record_ttd_with_context_passes_process_launch_context_to_runner() {
+        let root = std::env::temp_dir().join(format!("dbgflow-ttd-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("ttd")).expect("create ttd dir");
+        std::fs::write(root.join("ttd").join("TTD.exe"), b"").expect("fake TTD.exe");
+        let runner = Arc::new(RecordingTtdRunner::default());
+        let process_launch = ProcessLaunchConfig::installed_service_default();
+        let tool_context = ToolCallContext {
+            peer_pid: Some(555),
+            peer_session_id: Some(66),
+        };
+        let manager = TtdRecordingManager::with_components_and_logger(
+            root.join("artifacts"),
+            TtdRecorderRuntime::with_ttd_dir(root.join("ttd")),
+            runner.clone(),
+            noop_logger(),
+            process_launch.clone(),
+        );
+
+        manager
+            .record_ttd_with_context(
+                RecordTtd {
+                    target: TtdTarget::Launch {
+                        executable: std::env::current_exe().expect("current exe"),
+                        args: Vec::new(),
+                    },
+                    timeout_ms: 1000,
+                    options: TtdRecordingOptions::default(),
+                },
+                tool_context,
+            )
+            .expect("record ttd");
+
+        let recorded = runner.last_context();
+        assert_eq!(recorded.config, process_launch);
+        assert_eq!(recorded.tool_call, tool_context);
+    }
+
+    #[derive(Default)]
+    struct RecordingTtdRunner {
+        contexts: Mutex<Vec<ProcessLaunchContext>>,
+    }
+
+    impl RecordingTtdRunner {
+        fn last_context(&self) -> ProcessLaunchContext {
+            self.contexts
+                .lock()
+                .expect("contexts")
+                .last()
+                .expect("context")
+                .clone()
+        }
+    }
+
+    impl TtdRecorderRunner for RecordingTtdRunner {
+        fn run(
+            &self,
+            _invocation: TtdRecorderInvocation,
+            launch_context: ProcessLaunchContext,
+            _logger: Arc<dyn LogSink>,
+        ) -> Result<TtdRecorderExit> {
+            self.contexts.lock().expect("contexts").push(launch_context);
+            Ok(TtdRecorderExit {
+                exit_code: Some(0),
+                timed_out: false,
+            })
+        }
+
+        fn stop(
+            &self,
+            _invocation: TtdStopInvocation,
+            launch_context: ProcessLaunchContext,
+            _logger: Arc<dyn LogSink>,
+        ) -> Result<TtdRecorderExit> {
+            self.contexts.lock().expect("contexts").push(launch_context);
+            Ok(TtdRecorderExit {
+                exit_code: Some(0),
+                timed_out: false,
+            })
+        }
+    }
 }
 
 fn discover_ttd_artifacts(traces_dir: &Path) -> Result<DiscoveredTtdArtifacts> {

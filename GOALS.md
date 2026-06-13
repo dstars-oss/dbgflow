@@ -636,6 +636,31 @@ decompile、xref、rename、comment 或 patch。
 * 最小只读 ABI 降低 C++ layout 和 IDA SDK 版本漂移风险，为后续增量能力保留空间。
 * session worker 子进程隔离能在 IDA 加载失败、阻塞或崩溃时保护主 MCP server。
 
+### D-023: 子进程默认使用 MCP loopback peer 所在交互会话
+
+决定：
+
+安装脚本生成的配置显式写入 `[process]`，默认
+`child_identity = "mcp_peer_session"`、`fallback_child_identity = "active_interactive_session"`、
+`elevate_if_admin = true`。该策略统一用于 debug session worker、IDA reverse worker、
+DbgEng launch target、profile launch target 和 TTD recorder process。未配置 `[process]`
+的旧配置继续使用 `current_process`，避免改变既有部署行为。
+
+HTTP `/mcp` 当前没有 bearer token、Windows Integrated Auth、named-pipe impersonation
+或其他强客户端身份。dbgflow 只在本机 loopback 场景中通过 TCP owner table 推断 peer
+PID，再用 `ProcessIdToSessionId` 得到 peer session id；如果解析失败，则按配置回退到
+active interactive session，再失败则回退当前进程并记录 warning。若目标用户 token 有
+linked elevated token 且配置允许，则优先使用 elevated token。
+
+原因：
+
+* Windows service 默认 LocalSystem 时，直接用服务身份启动 IDA/TTD/debuggee 容易遇到
+  桌面会话、license、UAC 和用户环境不匹配。
+* loopback peer PID/session 不是强认证身份，但足以覆盖当前可信本机 MCP bridge 场景，
+  且所有解析结果、fallback reason 和 elevated 状态都会进入审计日志。
+* 将 launcher 放入 `dbgflow-common` 可避免 debug / trace / reverse 各自重复实现
+  token、stdio、artifact 输出和审计逻辑。
+
 ## 8. 当前待办
 
 ### P0
@@ -671,6 +696,7 @@ decompile、xref、rename、comment 或 patch。
 * [x] 支持主服务级代理配置，并通过 `_NT_SYMBOL_PROXY` 支持 SymSrv 符号下载代理。
 * [x] 支持安装配置中的初始 DbgEng symbol path，并通过 DbgEng symbols API 应用。
 * [x] 将 Windows service 交互式安装旅程、依赖探测、提权和 service 环境写入收敛到主程序。
+* [x] 支持安装配置写入统一子进程身份策略，并在运行时解析 `[process]`。
 * [x] 移除依赖提权或本机 live 调试环境的 ignored 测试，真实环境验证改用受控 smoke。
 * [x] 补齐 `transcript.log` 和 `events.jsonl` 审计链路。
 
@@ -691,6 +717,7 @@ decompile、xref、rename、comment 或 patch。
 ### P4
 
 * [x] 完成 IDA runtime 探测和 `[reverse.ida] install_dir` 配置设计。
+* [x] 安装脚本探测常见 IDA 安装目录，并在有效时写入 `[reverse.ida].install_dir`。
 * [x] 定义 `ReverseSessionManager` 和 reverse IDA worker 协议。
 * [x] 实现 Rust-first、no-SDK build-time dependency 的 IDA dynamic binding worker MVP。
 * [x] 设计 `ida.*` MCP tool schema 和 session lifecycle。

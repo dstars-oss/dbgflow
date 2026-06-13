@@ -139,7 +139,8 @@ impl DynamicIdaApi {
     }
 
     pub fn open_database(&self, path: &str, run_auto_analysis: bool) -> Result<()> {
-        let path = CString::new(path)
+        let ida_path = path_for_ida_open_database(path);
+        let path = CString::new(ida_path.as_ref())
             .map_err(|_| DbgFlowError::Backend("IDA target path contains NUL".to_string()))?;
         let result =
             unsafe { (self.open_database)(path.as_ptr(), run_auto_analysis, std::ptr::null()) };
@@ -221,6 +222,16 @@ impl DynamicIdaApi {
     }
 }
 
+fn path_for_ida_open_database(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(path) = path.strip_prefix("\\\\?\\UNC\\") {
+        return std::borrow::Cow::Owned(format!("\\\\{path}"));
+    }
+    if let Some(path) = path.strip_prefix("\\\\?\\") {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 fn missing_symbol(dll: &str, symbol: &str, error: libloading::Error) -> DbgFlowError {
     DbgFlowError::Backend(format!("load {dll} symbol {symbol}: {error}"))
 }
@@ -243,4 +254,30 @@ fn format_perm(perm: u8) -> String {
     let write = if perm & 2 != 0 { 'w' } else { '-' };
     let exec = if perm & 1 != 0 { 'x' } else { '-' };
     format!("{read}{write}{exec}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_for_ida_open_database;
+
+    #[test]
+    fn ida_open_database_path_strips_drive_verbatim_prefix() {
+        let path = path_for_ida_open_database(r"\\?\C:\samples\a.exe");
+
+        assert_eq!(path, r"C:\samples\a.exe");
+    }
+
+    #[test]
+    fn ida_open_database_path_converts_unc_verbatim_prefix() {
+        let path = path_for_ida_open_database(r"\\?\UNC\server\share\a.exe");
+
+        assert_eq!(path, r"\\server\share\a.exe");
+    }
+
+    #[test]
+    fn ida_open_database_path_leaves_normal_path_unchanged() {
+        let path = path_for_ida_open_database(r"C:\samples\a.exe");
+
+        assert_eq!(path, r"C:\samples\a.exe");
+    }
 }

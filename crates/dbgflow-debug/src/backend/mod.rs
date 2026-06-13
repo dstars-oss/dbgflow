@@ -1,6 +1,7 @@
 #[cfg(windows)]
 pub mod dbgeng;
 
+use dbgflow_common::process::ProcessLaunchContext;
 use dbgflow_common::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -38,6 +39,7 @@ pub struct CreateBackendSession {
     pub target: DebugTarget,
     pub correlation_id: Option<String>,
     pub symbol_path: Option<String>,
+    pub process_launch_context: ProcessLaunchContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

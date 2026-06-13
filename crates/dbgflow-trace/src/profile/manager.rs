@@ -7,6 +7,7 @@ use super::{
 use dbgflow_common::artifacts::{ArtifactKind, ArtifactManager, ArtifactRef, ProfileArtifactEvent};
 use dbgflow_common::job::SingleActiveJob;
 use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use dbgflow_common::process::{ProcessLaunchConfig, ProcessLaunchContext, ToolCallContext};
 use dbgflow_common::time::now_unix_ms;
 use dbgflow_common::{DbgFlowError, Result};
 use serde_json::{json, Map, Value};
@@ -22,6 +23,7 @@ pub struct ProfileManager {
     target_runner: Arc<dyn TargetRunner>,
     active_job: SingleActiveJob<ProfileId>,
     logger: Arc<dyn LogSink>,
+    process_launch: ProcessLaunchConfig,
 }
 
 impl ProfileManager {
@@ -30,11 +32,20 @@ impl ProfileManager {
     }
 
     pub fn with_logger(artifact_root: impl Into<PathBuf>, logger: Arc<dyn LogSink>) -> Self {
+        Self::with_logger_and_process_launch(artifact_root, logger, ProcessLaunchConfig::default())
+    }
+
+    pub fn with_logger_and_process_launch(
+        artifact_root: impl Into<PathBuf>,
+        logger: Arc<dyn LogSink>,
+        process_launch: ProcessLaunchConfig,
+    ) -> Self {
         Self::with_components_and_logger(
             artifact_root,
             Arc::new(super::DefaultProfileCollectorFactory::new()),
             Arc::new(ProcessTargetRunner),
             logger,
+            process_launch,
         )
     }
 
@@ -48,6 +59,7 @@ impl ProfileManager {
             collector_factory,
             target_runner,
             noop_logger(),
+            ProcessLaunchConfig::default(),
         )
     }
 
@@ -56,6 +68,7 @@ impl ProfileManager {
         collector_factory: Arc<dyn CollectorFactory>,
         target_runner: Arc<dyn TargetRunner>,
         logger: Arc<dyn LogSink>,
+        process_launch: ProcessLaunchConfig,
     ) -> Self {
         Self {
             artifacts: ArtifactManager::new(artifact_root),
@@ -63,10 +76,19 @@ impl ProfileManager {
             target_runner,
             active_job: SingleActiveJob::default(),
             logger,
+            process_launch,
         }
     }
 
-    pub fn run_profile(&self, mut request: RunProfile) -> Result<ProfileResult> {
+    pub fn run_profile(&self, request: RunProfile) -> Result<ProfileResult> {
+        self.run_profile_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn run_profile_with_context(
+        &self,
+        mut request: RunProfile,
+        tool_context: ToolCallContext,
+    ) -> Result<ProfileResult> {
         let request_started = Instant::now();
         let requested_target = request.target.clone();
         request.target = match validate_profile_target(request.target) {
@@ -324,6 +346,8 @@ impl ProfileManager {
             Duration::from_millis(request.timeout_ms),
             &stdout_path,
             &stderr_path,
+            ProcessLaunchContext::new(self.process_launch.clone(), tool_context),
+            self.logger.clone(),
             Arc::new(ProfileTargetEventSink {
                 manager: self.clone(),
                 profile_id,
@@ -846,4 +870,128 @@ fn stop_started_collectors_for_start_failure(
         }
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{CollectorStart, CollectorStop, ProfileCollectorConfig, ProfileTarget};
+    use dbgflow_common::logging::noop_logger;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    #[test]
+    fn run_profile_with_context_passes_process_launch_context_to_target_runner() {
+        let root =
+            std::env::temp_dir().join(format!("dbgflow-profile-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let runner = Arc::new(RecordingTargetRunner::default());
+        let process_launch = ProcessLaunchConfig::installed_service_default();
+        let tool_context = ToolCallContext {
+            peer_pid: Some(2001),
+            peer_session_id: Some(33),
+        };
+        let manager = ProfileManager::with_components_and_logger(
+            &root,
+            Arc::new(TestCollectorFactory),
+            runner.clone(),
+            noop_logger(),
+            process_launch.clone(),
+        );
+
+        manager
+            .run_profile_with_context(
+                RunProfile {
+                    target: ProfileTarget::Launch {
+                        executable: std::env::current_exe().expect("current exe"),
+                        args: Vec::new(),
+                    },
+                    timeout_ms: 1000,
+                    collectors: Vec::new(),
+                },
+                tool_context,
+            )
+            .expect("run profile");
+
+        let recorded = runner.last_context();
+        assert_eq!(recorded.config, process_launch);
+        assert_eq!(recorded.tool_call, tool_context);
+    }
+
+    #[derive(Default)]
+    struct RecordingTargetRunner {
+        contexts: Mutex<Vec<ProcessLaunchContext>>,
+    }
+
+    impl RecordingTargetRunner {
+        fn last_context(&self) -> ProcessLaunchContext {
+            self.contexts
+                .lock()
+                .expect("contexts")
+                .last()
+                .expect("context")
+                .clone()
+        }
+    }
+
+    impl TargetRunner for RecordingTargetRunner {
+        fn launch_and_wait(
+            &self,
+            _target: &ProfileTarget,
+            _timeout: Duration,
+            _stdout_path: &Path,
+            _stderr_path: &Path,
+            launch_context: ProcessLaunchContext,
+            _logger: Arc<dyn LogSink>,
+            event_sink: Arc<dyn TargetEventSink>,
+        ) -> Result<TargetExit> {
+            self.contexts.lock().expect("contexts").push(launch_context);
+            event_sink.target_started(99);
+            Ok(TargetExit::Exited {
+                pid: 99,
+                exit_code: Some(0),
+            })
+        }
+    }
+
+    struct TestCollectorFactory;
+
+    impl CollectorFactory for TestCollectorFactory {
+        fn create(
+            &self,
+            _config: &ProfileCollectorConfig,
+            _output_dir: &Path,
+        ) -> Result<Box<dyn ProfileCollector>> {
+            Ok(Box::new(TestCollector))
+        }
+    }
+
+    struct TestCollector;
+
+    impl ProfileCollector for TestCollector {
+        fn name(&self) -> &str {
+            "native_etw"
+        }
+
+        fn kind(&self) -> ProfileCollectorKind {
+            ProfileCollectorKind::NativeEtw
+        }
+
+        fn start(&self) -> Result<CollectorStart> {
+            Ok(CollectorStart {
+                warnings: Vec::new(),
+            })
+        }
+
+        fn stop(&self, _target_pid: Option<u32>) -> Result<CollectorStop> {
+            Ok(CollectorStop {
+                artifacts: Vec::new(),
+                warnings: Vec::new(),
+            })
+        }
+
+        fn cleanup(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 }

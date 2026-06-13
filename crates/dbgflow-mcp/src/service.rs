@@ -1,6 +1,5 @@
 use crate::http::{run_http, HttpConfig};
 use crate::logging::FileLogSink;
-use crate::mcp::server_with_data_dir_proxy_ttd_ida_symbol_path_and_logger;
 use crate::runtime::{
     apply_runtime_environment, parse_installed_service_command,
     service_process_options_from_command_line, validate_install_root_removal, RuntimeConfig,
@@ -121,12 +120,13 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
     )?;
 
     let result = run_http(
-        server_with_data_dir_proxy_ttd_ida_symbol_path_and_logger(
+        crate::mcp::server_with_data_dir_proxy_ttd_ida_symbol_path_process_and_logger(
             data_dir,
             config.app.proxy.clone(),
             config.app.ttd_dir.clone(),
             config.app.ida_install_dir.clone(),
             config.app.symbol_path.clone(),
+            config.app.process_launch.clone(),
             logger.clone(),
         ),
         HttpConfig {

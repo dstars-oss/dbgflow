@@ -1,5 +1,6 @@
 use crate::mcp::{session_resource_uri, McpServer};
 use dbgflow_common::logging::{LogEvent, LogLevel};
+use dbgflow_common::process::{resolve_peer_process_context, ToolCallContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -60,10 +61,11 @@ pub fn run_http(server: McpServer, config: HttpConfig, shutdown: Receiver<()>) -
 
 fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()> {
     let request_id = NEXT_HTTP_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let peer = stream
-        .peer_addr()
+    let peer_addr = stream.peer_addr().ok();
+    let local_addr = stream.local_addr().ok();
+    let peer = peer_addr
         .map(|peer| peer.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
+        .unwrap_or_else(|| "<unknown>".to_string());
     stream.set_read_timeout(Some(CONNECTION_READ_TIMEOUT))?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -99,7 +101,7 @@ fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()>
         return handle_mcp_sse(server, request_id, request, stream, started);
     }
 
-    let response = route_request(server.clone(), request, request_id);
+    let response = route_request(server.clone(), request, request_id, local_addr, peer_addr);
     let status = response.status;
     let response_bytes = response.body.len();
     server.log(
@@ -115,7 +117,13 @@ fn handle_connection(server: McpServer, mut stream: TcpStream) -> io::Result<()>
     write_response(&mut stream, response)
 }
 
-fn route_request(server: McpServer, request: HttpRequest, request_id: u64) -> HttpResponse {
+fn route_request(
+    server: McpServer,
+    request: HttpRequest,
+    request_id: u64,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+) -> HttpResponse {
     if !origin_is_allowed(request.headers.get("origin")) {
         server.log(
             LogEvent::new(LogLevel::Warn, "http", "http_origin_rejected")
@@ -134,7 +142,7 @@ fn route_request(server: McpServer, request: HttpRequest, request_id: u64) -> Ht
     match (request.method.as_str(), path) {
         ("GET", "/healthz") => HttpResponse::json(200, json!({ "status": "ok" })),
         ("GET", "/mcp") => HttpResponse::empty(405),
-        ("POST", "/mcp") => handle_mcp_post(server, request, request_id),
+        ("POST", "/mcp") => handle_mcp_post(server, request, request_id, local_addr, peer_addr),
         _ => HttpResponse::json(404, json!({ "error": "not found" })),
     }
 }
@@ -239,7 +247,13 @@ fn write_sse_json(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
     stream.flush()
 }
 
-fn handle_mcp_post(server: McpServer, request: HttpRequest, request_id: u64) -> HttpResponse {
+fn handle_mcp_post(
+    server: McpServer,
+    request: HttpRequest,
+    request_id: u64,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+) -> HttpResponse {
     if !content_type_is_json(request.headers.get("content-type")) {
         server.log(
             LogEvent::new(LogLevel::Warn, "http", "http_request_invalid_content_type")
@@ -290,9 +304,27 @@ fn handle_mcp_post(server: McpServer, request: HttpRequest, request_id: u64) -> 
         return HttpResponse::empty(202);
     }
 
-    match server.handle_message_with_http_request_id(message, request_id) {
+    let tool_context = resolve_tool_call_context(local_addr, peer_addr);
+    server.log(
+        LogEvent::new(LogLevel::Info, "http", "http_mcp_peer_context_resolved")
+            .field("http_request_id", request_id)
+            .field("peer_pid", tool_context.peer_pid)
+            .field("peer_session_id", tool_context.peer_session_id),
+    );
+
+    match server.handle_message_with_http_context(message, request_id, tool_context) {
         Some(response) => HttpResponse::json(200, response),
         None => HttpResponse::empty(202),
+    }
+}
+
+fn resolve_tool_call_context(
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+) -> ToolCallContext {
+    match (local_addr, peer_addr) {
+        (Some(local_addr), Some(peer_addr)) => resolve_peer_process_context(local_addr, peer_addr),
+        _ => ToolCallContext::default(),
     }
 }
 
@@ -518,6 +550,8 @@ mod tests {
             test_server(),
             request("GET", "/healthz", HashMap::new(), Vec::new()),
             1,
+            None,
+            None,
         );
 
         assert_eq!(response.status, 200);
@@ -530,6 +564,8 @@ mod tests {
             test_server(),
             request("GET", "/mcp", HashMap::new(), Vec::new()),
             1,
+            None,
+            None,
         );
 
         assert_eq!(response.status, 405);
@@ -547,7 +583,13 @@ mod tests {
         }))
         .expect("serialize body");
 
-        let response = route_request(test_server(), request("POST", "/mcp", headers, body), 1);
+        let response = route_request(
+            test_server(),
+            request("POST", "/mcp", headers, body),
+            1,
+            None,
+            None,
+        );
 
         assert_eq!(response.status, 200);
         assert_eq!(json_body(response)["id"], 1);
@@ -563,7 +605,13 @@ mod tests {
         }))
         .expect("serialize body");
 
-        let response = route_request(test_server(), request("POST", "/mcp", headers, body), 1);
+        let response = route_request(
+            test_server(),
+            request("POST", "/mcp", headers, body),
+            1,
+            None,
+            None,
+        );
 
         assert_eq!(response.status, 202);
         assert!(response.body.is_empty());
@@ -581,7 +629,13 @@ mod tests {
         }))
         .expect("serialize body");
 
-        let response = route_request(test_server(), request("POST", "/mcp", headers, body), 1);
+        let response = route_request(
+            test_server(),
+            request("POST", "/mcp", headers, body),
+            1,
+            None,
+            None,
+        );
 
         assert_eq!(response.status, 200);
     }
@@ -596,6 +650,8 @@ mod tests {
             test_server(),
             request("POST", "/mcp", headers, b"{}".to_vec()),
             1,
+            None,
+            None,
         );
 
         assert_eq!(response.status, 403);
@@ -618,7 +674,13 @@ mod tests {
         }))
         .expect("serialize body");
 
-        let response = route_request(server, request("POST", "/mcp", headers, body), 42);
+        let response = route_request(
+            server,
+            request("POST", "/mcp", headers, body),
+            42,
+            None,
+            None,
+        );
 
         assert_eq!(response.status, 200);
         let events = logger.events();

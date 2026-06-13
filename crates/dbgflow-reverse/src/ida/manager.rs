@@ -6,6 +6,7 @@ use super::worker::{
 };
 use dbgflow_common::artifacts::{ArtifactManager, ArtifactRef, ReverseSessionArtifactEvent};
 use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use dbgflow_common::process::{ProcessLaunchConfig, ProcessLaunchContext, ToolCallContext};
 use dbgflow_common::time::now_unix_ms;
 use dbgflow_common::{DbgFlowError, Result, SessionId};
 use serde::{Deserialize, Serialize};
@@ -52,14 +53,16 @@ pub struct IdaSessionManager {
     artifacts: ArtifactManager,
     runtime: IdaRuntimeConfig,
     logger: Arc<dyn LogSink>,
+    process_launch: ProcessLaunchConfig,
 }
 
 impl IdaSessionManager {
     pub fn new(artifact_root: impl Into<PathBuf>, runtime: IdaRuntimeConfig) -> Self {
-        Self::with_worker_launcher_runtime_and_logger(
+        Self::with_worker_launcher_runtime_process_and_logger(
             Arc::new(ProcessReverseWorkerLauncher::new()),
             artifact_root,
             runtime,
+            ProcessLaunchConfig::default(),
             noop_logger(),
         )
     }
@@ -69,10 +72,11 @@ impl IdaSessionManager {
         runtime: IdaRuntimeConfig,
         logger: Arc<dyn LogSink>,
     ) -> Self {
-        Self::with_worker_launcher_runtime_and_logger(
+        Self::with_worker_launcher_runtime_process_and_logger(
             Arc::new(ProcessReverseWorkerLauncher::new()),
             artifact_root,
             runtime,
+            ProcessLaunchConfig::default(),
             logger,
         )
     }
@@ -83,6 +87,22 @@ impl IdaSessionManager {
         runtime: IdaRuntimeConfig,
         logger: Arc<dyn LogSink>,
     ) -> Self {
+        Self::with_worker_launcher_runtime_process_and_logger(
+            worker_launcher,
+            artifact_root,
+            runtime,
+            ProcessLaunchConfig::default(),
+            logger,
+        )
+    }
+
+    pub fn with_worker_launcher_runtime_process_and_logger(
+        worker_launcher: Arc<dyn ReverseWorkerLauncher>,
+        artifact_root: impl Into<PathBuf>,
+        runtime: IdaRuntimeConfig,
+        process_launch: ProcessLaunchConfig,
+        logger: Arc<dyn LogSink>,
+    ) -> Self {
         Self {
             worker_launcher,
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -91,10 +111,19 @@ impl IdaSessionManager {
             artifacts: ArtifactManager::new(artifact_root),
             runtime,
             logger,
+            process_launch,
         }
     }
 
-    pub fn create_session(&self, mut request: CreateIdaSession) -> Result<ReverseSession> {
+    pub fn create_session(&self, request: CreateIdaSession) -> Result<ReverseSession> {
+        self.create_session_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn create_session_with_context(
+        &self,
+        mut request: CreateIdaSession,
+        tool_context: ToolCallContext,
+    ) -> Result<ReverseSession> {
         let requested_target = request.target.clone();
         request.target = match validate_ida_target(request.target) {
             Ok(target) => target,
@@ -158,10 +187,13 @@ impl IdaSessionManager {
         );
 
         let started = Instant::now();
+        let launch_context = ProcessLaunchContext::new(self.process_launch.clone(), tool_context);
         let worker = match self.worker_launcher.spawn(
             session.id,
             install.clone(),
             self.artifacts.reverse_session_worker_log_path(session.id),
+            launch_context,
+            self.logger.clone(),
         ) {
             Ok(worker) => worker,
             Err(error) => {
@@ -862,6 +894,43 @@ mod tests {
     }
 
     #[test]
+    fn create_session_with_context_passes_process_launch_context_to_worker_launcher() {
+        let root = test_root("process-context");
+        let install = fake_ida_install(&root);
+        let target = fake_binary(&root);
+        let launcher = Arc::new(MockReverseWorkerLauncher::default());
+        let process_launch = ProcessLaunchConfig::installed_service_default();
+        let tool_context = ToolCallContext {
+            peer_pid: Some(4321),
+            peer_session_id: Some(87),
+        };
+        let manager = IdaSessionManager::with_worker_launcher_runtime_process_and_logger(
+            launcher.clone(),
+            root.join("artifacts"),
+            IdaRuntimeConfig {
+                install_dir: Some(install.install_dir.clone()),
+            },
+            process_launch.clone(),
+            noop_logger(),
+        );
+
+        manager
+            .create_session_with_context(
+                CreateIdaSession {
+                    target: IdaTarget::Binary { path: target },
+                    run_auto_analysis: true,
+                    startup_timeout_ms: Some(1000),
+                },
+                tool_context,
+            )
+            .expect("create");
+
+        let recorded = launcher.last_context();
+        assert_eq!(recorded.config, process_launch);
+        assert_eq!(recorded.tool_call, tool_context);
+    }
+
+    #[test]
     fn list_segments_and_functions_write_outputs() {
         let root = test_root("list");
         let install = fake_ida_install(&root);
@@ -1051,6 +1120,7 @@ mod tests {
     struct MockReverseWorkerLauncher {
         spawn_count: AtomicU64,
         workers: Mutex<Vec<Arc<MockReverseWorker>>>,
+        contexts: Mutex<Vec<ProcessLaunchContext>>,
         open_error: Mutex<Option<String>>,
     }
 
@@ -1070,6 +1140,15 @@ mod tests {
                 .expect("worker")
                 .clone()
         }
+
+        fn last_context(&self) -> ProcessLaunchContext {
+            self.contexts
+                .lock()
+                .expect("contexts")
+                .last()
+                .expect("context")
+                .clone()
+        }
     }
 
     impl ReverseWorkerLauncher for MockReverseWorkerLauncher {
@@ -1078,8 +1157,11 @@ mod tests {
             _session_id: SessionId,
             _install: IdaInstall,
             _worker_log_path: PathBuf,
+            launch_context: ProcessLaunchContext,
+            _logger: Arc<dyn LogSink>,
         ) -> Result<Arc<dyn ReverseWorker>> {
             self.spawn_count.fetch_add(1, Ordering::Relaxed);
+            self.contexts.lock().expect("contexts").push(launch_context);
             let worker = Arc::new(MockReverseWorker {
                 open_error: self.open_error.lock().expect("open error").clone(),
                 ..Default::default()

@@ -10,6 +10,7 @@ param(
     [string]$DbgEngDir,
     [string]$SymbolPath,
     [string]$TtdDir,
+    [string]$IdaInstallDir,
     [switch]$NoProxy,
     [switch]$NonInteractive
 )
@@ -100,6 +101,40 @@ function Test-TtdDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     return (Test-Path -LiteralPath (Join-Path $Path "TTD.exe") -PathType Leaf)
+}
+
+function Test-IdaInstallDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    foreach ($fileName in @("ida.exe", "ida.dll", "idalib.dll", "ida.hlp")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Path $fileName) -PathType Leaf)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Add-PathCandidate {
+    param(
+        [Parameter(Mandatory = $true)]$Candidates,
+        [Parameter(Mandatory = $true)]$Seen,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    try {
+        $fullPath = Get-FullPath -Path $Path
+    }
+    catch {
+        return
+    }
+
+    if ($Seen.Add($fullPath)) {
+        $Candidates.Add($fullPath)
+    }
 }
 
 function Get-ExeArchitectureInfo {
@@ -272,6 +307,106 @@ function Find-TtdDir {
     return $null
 }
 
+function Add-IdaRegistryCandidates {
+    param(
+        [Parameter(Mandatory = $true)]$Candidates,
+        [Parameter(Mandatory = $true)]$Seen
+    )
+
+    $registryRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+
+    foreach ($root in $registryRoots) {
+        if (-not (Test-Path -LiteralPath $root)) {
+            continue
+        }
+
+        $subKeys = @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)
+        foreach ($subKey in $subKeys) {
+            try {
+                $item = Get-ItemProperty -LiteralPath $subKey.PSPath -ErrorAction Stop
+            }
+            catch {
+                continue
+            }
+
+            $displayName = [string]$item.DisplayName
+            if ([string]::IsNullOrWhiteSpace($displayName) -or $displayName -notmatch '^(IDA(\s|$)|Hex-Rays.*IDA)') {
+                continue
+            }
+
+            Add-PathCandidate -Candidates $Candidates -Seen $Seen -Path ([string]$item.InstallLocation)
+            if ($item.DisplayIcon) {
+                $displayIcon = ([string]$item.DisplayIcon).Trim()
+                if ($displayIcon.StartsWith('"')) {
+                    $displayIconPath = ($displayIcon -replace '^\s*"', '') -replace '"\s*(,.*)?$', ''
+                } else {
+                    $displayIconPath = ($displayIcon -split ',', 2)[0].Trim()
+                }
+                if ($displayIconPath -match '\.exe$' -and (Test-Path -LiteralPath $displayIconPath -PathType Leaf)) {
+                    Add-PathCandidate -Candidates $Candidates -Seen $Seen -Path (Split-Path -Parent $displayIconPath)
+                }
+            }
+        }
+    }
+}
+
+function Find-IdaInstallDir {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+
+    Add-PathCandidate -Candidates $candidates -Seen $seen -Path ([System.Environment]::GetEnvironmentVariable("DBGFLOW_IDA_DIR"))
+    Add-IdaRegistryCandidates -Candidates $candidates -Seen $seen
+
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($root in @(
+        $env:ProgramFiles,
+        [System.Environment]::GetEnvironmentVariable("ProgramFiles(x86)"),
+        $env:LOCALAPPDATA,
+        $env:ProgramData,
+        "C:\Program Files",
+        "C:\Program Files (x86)"
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($root)) {
+            $roots.Add($root)
+        }
+    }
+
+    $versions = @("9.4", "9.3", "9.2", "9.1", "9.0", "8.5", "8.4", "8.3", "8.2", "8.1", "8.0")
+    foreach ($root in $roots) {
+        foreach ($version in $versions) {
+            foreach ($name in @(
+                "IDA Professional $version",
+                "IDA Pro $version",
+                "IDA Freeware $version"
+            )) {
+                Add-PathCandidate -Candidates $candidates -Seen $seen -Path (Join-Path $root $name)
+            }
+        }
+    }
+
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            continue
+        }
+        Get-ChildItem -LiteralPath $root -Directory -Filter "IDA*" -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object {
+                Add-PathCandidate -Candidates $candidates -Seen $seen -Path $_.FullName
+            }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-IdaInstallDirectory -Path $candidate) {
+            return (Get-FullPath -Path $candidate)
+        }
+    }
+    return $null
+}
+
 function Get-ProxyConfig {
     if ($NoProxy -and $ProxyUrl) {
         throw "-ProxyUrl and -NoProxy cannot be used together"
@@ -342,6 +477,7 @@ function Write-DbgFlowConfig {
         [string]$ResolvedDbgEngDir,
         [string]$ResolvedSymbolPath,
         [string]$ResolvedTtdDir,
+        [string]$ResolvedIdaInstallDir,
         [Parameter(Mandatory = $true)]$ProxyConfig
     )
 
@@ -372,6 +508,17 @@ function Write-DbgFlowConfig {
         $lines.Add("[tools]")
         $lines.Add("ttd_dir = $(ConvertTo-TomlString $ResolvedTtdDir)")
     }
+    if ($ResolvedIdaInstallDir) {
+        $lines.Add("")
+        $lines.Add("[reverse.ida]")
+        $lines.Add("install_dir = $(ConvertTo-TomlString $ResolvedIdaInstallDir)")
+    }
+
+    $lines.Add("")
+    $lines.Add("[process]")
+    $lines.Add('child_identity = "mcp_peer_session"')
+    $lines.Add('fallback_child_identity = "active_interactive_session"')
+    $lines.Add("elevate_if_admin = true")
 
     $lines.Add("")
     $lines.Add("[proxy]")
@@ -460,6 +607,16 @@ try {
         $resolvedTtdDir = Find-TtdDir -DbgEngDir $resolvedDbgEngDir
     }
 
+    $resolvedIdaInstallDir = $IdaInstallDir
+    if ($resolvedIdaInstallDir) {
+        $resolvedIdaInstallDir = Get-FullPath -Path $resolvedIdaInstallDir
+        if (-not (Test-IdaInstallDirectory -Path $resolvedIdaInstallDir)) {
+            throw "IDA install directory must contain ida.exe, ida.dll, idalib.dll, and ida.hlp: $resolvedIdaInstallDir"
+        }
+    } else {
+        $resolvedIdaInstallDir = Find-IdaInstallDir
+    }
+
     $proxyConfig = Get-ProxyConfig
     $resolvedSymbolPath = Get-SymbolPathConfig
 
@@ -474,6 +631,8 @@ try {
     Write-Host "DbgEng dir: $(if ($resolvedDbgEngDir) { $resolvedDbgEngDir } else { 'not configured' })"
     Write-Host "Symbol path: $(if ($resolvedSymbolPath) { 'configured' } else { 'not configured' })"
     Write-Host "TTD dir: $(if ($resolvedTtdDir) { $resolvedTtdDir } else { 'not configured' })"
+    Write-Host "IDA dir: $(if ($resolvedIdaInstallDir) { $resolvedIdaInstallDir } else { 'not configured' })"
+    Write-Host "Child identity: mcp_peer_session (fallback active_interactive_session, elevate_if_admin true)"
     Write-Host "Proxy mode: $($proxyConfig.Mode)"
     if ($proxyConfig.Url) {
         Write-Host "Proxy URL: $($proxyConfig.Url)"
@@ -490,7 +649,7 @@ try {
         }
     }
 
-    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedTtdDir $resolvedTtdDir -ProxyConfig $proxyConfig
+    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedTtdDir $resolvedTtdDir -ResolvedIdaInstallDir $resolvedIdaInstallDir -ProxyConfig $proxyConfig
 
     & $Exe service install --config $ConfigPath
     exit $LASTEXITCODE

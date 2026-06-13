@@ -1,3 +1,4 @@
+use dbgflow_common::process::{ChildIdentity, FallbackChildIdentity, ProcessLaunchConfig};
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_debug::backend::dbgeng::DBGFLOW_DBGENG_DIR_ENV;
 use dbgflow_reverse::ida::DBGFLOW_IDA_DIR_ENV;
@@ -29,6 +30,7 @@ pub struct AppConfig {
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
     pub proxy: ProxyEnvironment,
+    pub process_launch: ProcessLaunchConfig,
     pub ttd_dir: Option<PathBuf>,
     pub dbgeng_dir: Option<PathBuf>,
     pub ida_install_dir: Option<PathBuf>,
@@ -115,6 +117,7 @@ impl RuntimeConfig {
             .map(|path| parse_ida_install_dir_path(path, "reverse.ida.install_dir"))
             .transpose()?;
         let proxy = proxy_from_config(raw.proxy)?;
+        let process_launch = process_launch_from_config(raw.process)?;
 
         Ok(Self {
             config_path,
@@ -127,6 +130,7 @@ impl RuntimeConfig {
                 bind,
                 data_dir,
                 proxy,
+                process_launch,
                 ttd_dir,
                 dbgeng_dir,
                 ida_install_dir,
@@ -271,6 +275,7 @@ fn parse_legacy_http_options(args: Vec<OsString>) -> Result<AppConfig, String> {
         bind,
         data_dir,
         proxy,
+        process_launch: ProcessLaunchConfig::default(),
         ttd_dir: None,
         dbgeng_dir: None,
         ida_install_dir: None,
@@ -535,6 +540,7 @@ struct RawRuntimeConfig {
     debugger: Option<RawDebuggerConfig>,
     tools: Option<RawToolsConfig>,
     reverse: Option<RawReverseConfig>,
+    process: Option<RawProcessConfig>,
     proxy: Option<RawProxyConfig>,
 }
 
@@ -570,6 +576,13 @@ struct RawReverseConfig {
 #[derive(Debug, Deserialize)]
 struct RawReverseIdaConfig {
     install_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProcessConfig {
+    child_identity: Option<String>,
+    fallback_child_identity: Option<String>,
+    elevate_if_admin: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -748,6 +761,52 @@ fn proxy_from_config(config: Option<RawProxyConfig>) -> Result<ProxyEnvironment,
         }
         other => Err(format!(
             "proxy.mode must be one of none, disabled, url, env; got {other}"
+        )),
+    }
+}
+
+fn process_launch_from_config(
+    config: Option<RawProcessConfig>,
+) -> Result<ProcessLaunchConfig, String> {
+    let mut process_launch = ProcessLaunchConfig::default();
+    if let Some(config) = config {
+        if let Some(child_identity) = config.child_identity {
+            process_launch.child_identity =
+                parse_child_identity(&child_identity, "process.child_identity")?;
+        }
+        if let Some(fallback_child_identity) = config.fallback_child_identity {
+            process_launch.fallback_child_identity = parse_fallback_child_identity(
+                &fallback_child_identity,
+                "process.fallback_child_identity",
+            )?;
+        }
+        if let Some(elevate_if_admin) = config.elevate_if_admin {
+            process_launch.elevate_if_admin = elevate_if_admin;
+        }
+    }
+    Ok(process_launch)
+}
+
+fn parse_child_identity(value: &str, label: &str) -> Result<ChildIdentity, String> {
+    match value {
+        "current_process" => Ok(ChildIdentity::CurrentProcess),
+        "mcp_peer_session" => Ok(ChildIdentity::McpPeerSession),
+        "active_interactive_session" => Ok(ChildIdentity::ActiveInteractiveSession),
+        other => Err(format!(
+            "{label} must be one of current_process, mcp_peer_session, active_interactive_session; got {other:?}"
+        )),
+    }
+}
+
+fn parse_fallback_child_identity(
+    value: &str,
+    label: &str,
+) -> Result<FallbackChildIdentity, String> {
+    match value {
+        "current_process" => Ok(FallbackChildIdentity::CurrentProcess),
+        "active_interactive_session" => Ok(FallbackChildIdentity::ActiveInteractiveSession),
+        other => Err(format!(
+            "{label} must be one of current_process, active_interactive_session; got {other:?}"
         )),
     }
 }
@@ -1014,6 +1073,90 @@ url = "http://127.0.0.1:7897"
             config.app.ida_install_dir.as_deref(),
             Some(canonical_ida.as_path())
         );
+        assert_eq!(
+            config.app.process_launch,
+            ProcessLaunchConfig {
+                child_identity: ChildIdentity::CurrentProcess,
+                fallback_child_identity: FallbackChildIdentity::CurrentProcess,
+                elevate_if_admin: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_process_launch_config() {
+        let root = unique_test_dir("runtime-process");
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[process]
+child_identity = "mcp_peer_session"
+fallback_child_identity = "active_interactive_session"
+elevate_if_admin = true
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+            ),
+        );
+
+        let config = RuntimeConfig::load(&config_path).expect("load config");
+
+        assert_eq!(
+            config.app.process_launch,
+            ProcessLaunchConfig::installed_service_default()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_process_launch_identity() {
+        let root = unique_test_dir("runtime-process-invalid");
+        let config_path = root.join("config.toml");
+        write_config(
+            &config_path,
+            &format!(
+                r#"
+version = 1
+
+[service]
+name = "dbgflow-mcp"
+display_name = "dbgflow MCP Server"
+install_root = "{}"
+
+[server]
+bind = "127.0.0.1:7331"
+data_dir = "{}"
+
+[process]
+child_identity = "browser_magic"
+
+[proxy]
+mode = "none"
+"#,
+                toml_path(&root),
+                toml_path(&root.join("var")),
+            ),
+        );
+
+        let error = RuntimeConfig::load(&config_path).expect_err("reject invalid process config");
+
+        assert!(error.contains("process.child_identity"));
+        assert!(error.contains("browser_magic"));
     }
 
     #[test]

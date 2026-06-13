@@ -1,6 +1,7 @@
 use crate::logging::FileLogSink;
 use crate::tools::{ToolCallError, ToolService};
 use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use dbgflow_common::process::{ProcessLaunchConfig, ToolCallContext};
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_debug::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
 use dbgflow_debug::session::SessionId;
@@ -31,6 +32,7 @@ pub struct McpServer {
 pub struct McpServerConfig {
     pub data_dir: PathBuf,
     pub proxy: ProxyEnvironment,
+    pub process_launch: ProcessLaunchConfig,
     pub ttd_dir: Option<PathBuf>,
     pub ida_install_dir: Option<PathBuf>,
     pub symbol_path: Option<String>,
@@ -42,6 +44,7 @@ impl McpServerConfig {
         Self {
             data_dir: data_dir.into(),
             proxy: ProxyEnvironment::none(),
+            process_launch: ProcessLaunchConfig::default(),
             ttd_dir: None,
             ida_install_dir: None,
             symbol_path: None,
@@ -56,6 +59,11 @@ impl McpServerConfig {
 
     pub fn with_ttd_dir(mut self, ttd_dir: Option<PathBuf>) -> Self {
         self.ttd_dir = ttd_dir;
+        self
+    }
+
+    pub fn with_process_launch(mut self, process_launch: ProcessLaunchConfig) -> Self {
+        self.process_launch = process_launch;
         self
     }
 
@@ -80,7 +88,7 @@ impl McpServer {
     }
 
     pub fn handle_message(&self, message: Value) -> Option<Value> {
-        self.handle_message_with_context(message, None)
+        self.handle_message_with_context(message, None, ToolCallContext::default())
     }
 
     pub(crate) fn handle_message_with_http_request_id(
@@ -88,13 +96,23 @@ impl McpServer {
         message: Value,
         http_request_id: u64,
     ) -> Option<Value> {
-        self.handle_message_with_context(message, Some(http_request_id))
+        self.handle_message_with_context(message, Some(http_request_id), ToolCallContext::default())
+    }
+
+    pub(crate) fn handle_message_with_http_context(
+        &self,
+        message: Value,
+        http_request_id: u64,
+        tool_context: ToolCallContext,
+    ) -> Option<Value> {
+        self.handle_message_with_context(message, Some(http_request_id), tool_context)
     }
 
     fn handle_message_with_context(
         &self,
         message: Value,
         http_request_id: Option<u64>,
+        tool_context: ToolCallContext,
     ) -> Option<Value> {
         let Some(object) = message.as_object() else {
             self.log_with_context(
@@ -177,6 +195,7 @@ impl McpServer {
                 message.get("params").cloned().unwrap_or_default(),
                 http_request_id,
                 id.as_ref(),
+                tool_context,
             ),
             "resources/list" => self.resources_list(),
             "resources/read" => {
@@ -271,6 +290,7 @@ impl McpServer {
         params: Value,
         http_request_id: Option<u64>,
         jsonrpc_id: Option<&Value>,
+        tool_context: ToolCallContext,
     ) -> std::result::Result<Value, ServerError> {
         let params: CallToolParams = serde_json::from_value(params).map_err(|error| {
             ServerError::new(-32602, format!("invalid tools/call params: {error}"))
@@ -287,33 +307,37 @@ impl McpServer {
                 .field("jsonrpc_id", jsonrpc_id.clone()),
             http_request_id,
         );
-        let result = match self.service.call_tool(&params.name, arguments) {
-            Ok(value) => tool_success(value),
-            Err(ToolCallError::InvalidRequest(message)) => {
-                self.log_with_context(
-                    LogEvent::new(LogLevel::Error, "mcp", "mcp_tool_call_finished")
-                        .duration_ms(started.elapsed().as_millis())
-                        .field("tool_name", params.name.clone())
-                        .field("jsonrpc_id", jsonrpc_id.clone())
-                        .field("error_kind", "invalid_request")
-                        .error(message.clone()),
-                    http_request_id,
-                );
-                return Err(ServerError::new(-32602, message));
-            }
-            Err(ToolCallError::Execution(message)) => {
-                self.log_with_context(
-                    LogEvent::new(LogLevel::Warn, "mcp", "mcp_tool_call_finished")
-                        .duration_ms(started.elapsed().as_millis())
-                        .field("tool_name", params.name.clone())
-                        .field("jsonrpc_id", jsonrpc_id.clone())
-                        .field("is_tool_error", true)
-                        .error(message.clone()),
-                    http_request_id,
-                );
-                return Ok(tool_error(message));
-            }
-        };
+        let result =
+            match self
+                .service
+                .call_tool_with_context(&params.name, arguments, tool_context)
+            {
+                Ok(value) => tool_success(value),
+                Err(ToolCallError::InvalidRequest(message)) => {
+                    self.log_with_context(
+                        LogEvent::new(LogLevel::Error, "mcp", "mcp_tool_call_finished")
+                            .duration_ms(started.elapsed().as_millis())
+                            .field("tool_name", params.name.clone())
+                            .field("jsonrpc_id", jsonrpc_id.clone())
+                            .field("error_kind", "invalid_request")
+                            .error(message.clone()),
+                        http_request_id,
+                    );
+                    return Err(ServerError::new(-32602, message));
+                }
+                Err(ToolCallError::Execution(message)) => {
+                    self.log_with_context(
+                        LogEvent::new(LogLevel::Warn, "mcp", "mcp_tool_call_finished")
+                            .duration_ms(started.elapsed().as_millis())
+                            .field("tool_name", params.name.clone())
+                            .field("jsonrpc_id", jsonrpc_id.clone())
+                            .field("is_tool_error", true)
+                            .error(message.clone()),
+                        http_request_id,
+                    );
+                    return Ok(tool_error(message));
+                }
+            };
 
         self.log_with_context(
             LogEvent::new(LogLevel::Info, "mcp", "mcp_tool_call_finished")
@@ -491,6 +515,24 @@ pub fn server_with_data_dir_proxy_ttd_ida_and_symbol_path(
     ida_install_dir: Option<PathBuf>,
     symbol_path: Option<String>,
 ) -> std::result::Result<McpServer, String> {
+    server_with_data_dir_proxy_ttd_ida_symbol_path_and_process(
+        data_dir,
+        proxy,
+        ttd_dir,
+        ida_install_dir,
+        symbol_path,
+        ProcessLaunchConfig::default(),
+    )
+}
+
+pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_and_process(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    ttd_dir: Option<PathBuf>,
+    ida_install_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
+    process_launch: ProcessLaunchConfig,
+) -> std::result::Result<McpServer, String> {
     let data_dir = data_dir.into();
     let logger = Arc::new(
         FileLogSink::new(data_dir.join("logs"), 7)
@@ -501,7 +543,8 @@ pub fn server_with_data_dir_proxy_ttd_ida_and_symbol_path(
             .with_proxy(proxy)
             .with_ttd_dir(ttd_dir)
             .with_ida_install_dir(ida_install_dir)
-            .with_symbol_path(symbol_path),
+            .with_symbol_path(symbol_path)
+            .with_process_launch(process_launch),
     ))
 }
 
@@ -560,40 +603,68 @@ pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_and_logger(
     symbol_path: Option<String>,
     logger: Arc<dyn LogSink>,
 ) -> McpServer {
+    server_with_data_dir_proxy_ttd_ida_symbol_path_process_and_logger(
+        data_dir,
+        proxy,
+        ttd_dir,
+        ida_install_dir,
+        symbol_path,
+        ProcessLaunchConfig::default(),
+        logger,
+    )
+}
+
+pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_process_and_logger(
+    data_dir: impl Into<PathBuf>,
+    proxy: ProxyEnvironment,
+    ttd_dir: Option<PathBuf>,
+    ida_install_dir: Option<PathBuf>,
+    symbol_path: Option<String>,
+    process_launch: ProcessLaunchConfig,
+    logger: Arc<dyn LogSink>,
+) -> McpServer {
     server_from_config(
         McpServerConfig::new(data_dir, logger)
             .with_proxy(proxy)
             .with_ttd_dir(ttd_dir)
             .with_ida_install_dir(ida_install_dir)
-            .with_symbol_path(symbol_path),
+            .with_symbol_path(symbol_path)
+            .with_process_launch(process_launch),
     )
 }
 
 pub fn server_from_config(config: McpServerConfig) -> McpServer {
     let artifact_root = config.data_dir.join("artifacts");
     let sessions =
-        dbgflow_debug::session::SessionManager::with_worker_launcher_proxy_symbol_path_and_logger(
+        dbgflow_debug::session::SessionManager::with_worker_launcher_proxy_symbol_path_process_and_logger(
             default_process_worker_launcher(),
             &artifact_root,
             config.proxy,
             config.symbol_path,
+            config.process_launch.clone(),
             config.logger.clone(),
         );
-    let profiles = ProfileManager::with_logger(&artifact_root, config.logger.clone());
-    let ttd_recordings = TtdRecordingManager::with_runtime_and_logger(
+    let profiles = ProfileManager::with_logger_and_process_launch(
+        &artifact_root,
+        config.logger.clone(),
+        config.process_launch.clone(),
+    );
+    let ttd_recordings = TtdRecordingManager::with_runtime_logger_and_process_launch(
         &artifact_root,
         config
             .ttd_dir
             .map(TtdRecorderRuntime::with_ttd_dir)
             .unwrap_or_else(TtdRecorderRuntime::unavailable),
         config.logger.clone(),
+        config.process_launch.clone(),
     );
-    let ida_sessions = IdaSessionManager::with_worker_launcher_runtime_and_logger(
+    let ida_sessions = IdaSessionManager::with_worker_launcher_runtime_process_and_logger(
         default_process_reverse_worker_launcher(),
         &artifact_root,
         IdaRuntimeConfig {
             install_dir: config.ida_install_dir,
         },
+        config.process_launch,
         config.logger.clone(),
     );
     McpServer::new_with_logger(
@@ -654,6 +725,8 @@ fn with_http_request_id(event: LogEvent, http_request_id: Option<u64>) -> LogEve
 mod tests {
     use super::McpServer;
     use crate::tools::ToolService;
+    use dbgflow_common::logging::noop_logger;
+    use dbgflow_common::process::{ProcessLaunchConfig, ProcessLaunchContext, ToolCallContext};
     use dbgflow_common::proxy::ProxyEnvironment;
     use dbgflow_common::Result;
     use dbgflow_debug::backend::{CreateBackendSession, ExecuteBackendResult};
@@ -838,6 +911,50 @@ mod tests {
             .as_str()
             .expect("output")
             .contains("fake worker executed: k"));
+    }
+
+    #[test]
+    fn tools_call_create_session_passes_tool_context_to_worker_launcher() {
+        let launcher = Arc::new(TestWorkerLauncher::default());
+        let process_launch = ProcessLaunchConfig::installed_service_default();
+        let server = McpServer::new(ToolService::new(
+            SessionManager::with_worker_launcher_proxy_symbol_path_process_and_logger(
+                launcher.clone(),
+                test_artifact_root("mcp-context-propagation"),
+                ProxyEnvironment::none(),
+                None,
+                process_launch.clone(),
+                noop_logger(),
+            ),
+        ));
+        let dump_path = test_dump_path("mcp-context-dump");
+        let tool_context = ToolCallContext {
+            peer_pid: Some(1234),
+            peer_session_id: Some(56),
+        };
+
+        let response = server
+            .handle_message_with_context(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "dbg.create_session",
+                        "arguments": {
+                            "target": { "kind": "dump", "path": dump_path }
+                        }
+                    }
+                }),
+                Some(42),
+                tool_context,
+            )
+            .expect("create response");
+
+        assert_eq!(response["result"]["isError"], false);
+        let recorded = wait_for_launch_context(&launcher);
+        assert_eq!(recorded.config, process_launch);
+        assert_eq!(recorded.tool_call, tool_context);
     }
 
     #[test]
@@ -1250,6 +1367,7 @@ mod tests {
     #[derive(Default)]
     struct TestWorkerLauncher {
         next_id: AtomicU64,
+        contexts: Mutex<Vec<ProcessLaunchContext>>,
     }
 
     impl SessionWorkerLauncher for TestWorkerLauncher {
@@ -1258,12 +1376,37 @@ mod tests {
             _session_id: SessionId,
             _logger: Arc<dyn dbgflow_common::logging::LogSink>,
             _proxy: ProxyEnvironment,
+            launch_context: ProcessLaunchContext,
         ) -> Result<Arc<dyn SessionWorker>> {
+            self.contexts
+                .lock()
+                .expect("contexts lock")
+                .push(launch_context);
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             Ok(Arc::new(TestWorker {
                 backend_session_id: format!("fake-{id}"),
                 closed: Mutex::new(false),
             }))
+        }
+    }
+
+    fn wait_for_launch_context(launcher: &TestWorkerLauncher) -> ProcessLaunchContext {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(context) = launcher
+                .contexts
+                .lock()
+                .expect("contexts lock")
+                .last()
+                .cloned()
+            {
+                return context;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker launcher did not receive process launch context"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

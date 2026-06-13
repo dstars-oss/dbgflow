@@ -1,3 +1,4 @@
+use dbgflow_common::process::ProcessLaunchContext;
 use dbgflow_core::backend::{
     BackendEventSink, BackendExecutionEvent, BackendExecutionState, CreateBackendSession,
     DebugTarget, ExecuteBackendFailure, ExecuteBackendResult,
@@ -1112,6 +1113,7 @@ impl SessionWorkerLauncher for RecordingProxyWorkerLauncher {
         _session_id: SessionId,
         _logger: Arc<dyn LogSink>,
         proxy: ProxyEnvironment,
+        _launch_context: ProcessLaunchContext,
     ) -> Result<Arc<dyn SessionWorker>> {
         *self.observed_proxy.lock().expect("observed proxy lock") = Some(proxy);
         Ok(Arc::new(TestWorker {
@@ -1128,6 +1130,7 @@ impl SessionWorkerLauncher for RecordingCreateSessionWorkerLauncher {
         _session_id: SessionId,
         _logger: Arc<dyn LogSink>,
         _proxy: ProxyEnvironment,
+        _launch_context: ProcessLaunchContext,
     ) -> Result<Arc<dyn SessionWorker>> {
         Ok(Arc::new(RecordingCreateSessionWorker {
             observed_request: self.observed_request.clone(),
@@ -1142,6 +1145,7 @@ impl SessionWorkerLauncher for TestWorkerLauncher {
         _session_id: SessionId,
         _logger: Arc<dyn LogSink>,
         _proxy: ProxyEnvironment,
+        _launch_context: ProcessLaunchContext,
     ) -> Result<Arc<dyn SessionWorker>> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(TestWorker {

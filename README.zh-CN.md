@@ -234,6 +234,11 @@ ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
 [reverse.ida]
 install_dir = "C:\\Program Files\\IDA Professional 9.3"
 
+[process]
+child_identity = "mcp_peer_session"
+fallback_child_identity = "active_interactive_session"
+elevate_if_admin = true
+
 [proxy]
 mode = "url"
 url = "http://127.0.0.1:7897"
@@ -242,6 +247,15 @@ url = "http://127.0.0.1:7897"
 HTTP endpoint 是 `http://127.0.0.1:7331/mcp`。`POST /mcp` 返回 JSON response；`GET /mcp` 打开 server-sent event stream，用于发送 MCP notifications，包括 session 状态变化对应的 `notifications/resources/updated`。`GET /healthz` 返回简单健康检查响应。
 
 HTTP transport 仅用于本机调试：dbgflow 只允许绑定 loopback 地址，并拒绝非 localhost 的 `Origin` header。`/mcp` 不需要 bearer token 认证。HTTP request body 上限为 16 MiB。
+
+`[process]` 控制 dbgflow 启动子进程时使用的身份，覆盖 debug session worker、
+IDA reverse worker、DbgEng launch target、profile target 和 TTD recorder。
+未配置 `[process]` 时保持兼容的 `current_process` 行为。安装脚本会写入
+`child_identity = "mcp_peer_session"`、fallback 为
+`active_interactive_session`，并启用 `elevate_if_admin = true`。当前 HTTP `/mcp`
+没有强客户端认证或 impersonation；dbgflow 会从本机 loopback TCP owner table
+推断 peer PID/session，并在日志中记录最终 policy、session id、是否 elevated
+以及 fallback 原因。
 
 代理配置是主服务级别的配置，来自 `config.toml` 的 `[proxy]`。使用
 `mode = "url"` 和 `url = "http://host:port"` 会为 DbgEng/SymSrv 符号下载
@@ -281,11 +295,23 @@ transcript 中。
 System32 最后的顺序探测 DbgEng。TTD 是可选依赖；脚本会先从已解析的
 DbgEng 目录按 `<dbgeng_dir>\ttd` 推导，
 再回退到独立 TTD package 和 `PATH` 探测。可用 `-TtdDir <path>` 显式覆盖该位置。
+脚本也会从 `DBGFLOW_IDA_DIR`、Windows uninstall registry 和常见 Program Files
+目录探测 IDA 安装目录；当目录包含 `ida.exe`、`ida.dll`、`idalib.dll` 和
+`ida.hlp` 时写入 `[reverse.ida].install_dir`。可用 `-IdaInstallDir <path>` 显式覆盖
+IDA 探测结果。
+
 使用 `-ProxyUrl <url>`、`-NoProxy` 或现有 proxy 环境变量控制生成的 `[proxy]`
 配置。使用 `-SymbolPath <path>` 写入 `[debugger].symbol_path`；如果未传该参数，
 安装脚本会在当前环境存在 `_NT_ALT_SYMBOL_PATH` / `_NT_SYMBOL_PATH` 时持久化它们，
 否则不写入该字段。脚本不会默认写入 Microsoft public symbol server。使用
 `-NonInteractive` 可跳过最终确认，直接写入探测值 / 默认值。
+
+使用安装脚本生成的 `[process]` policy 时，IDA/idalib 通常运行在 MCP loopback peer
+所在 Windows session，或 active interactive session fallback；当用户存在 linked
+elevated token 时会优先使用提升 token。因此 IDA license 和 license terms 接受状态
+需要对最终解析出的用户 token 可见。若 token 解析失败，dbgflow 会 fallback 并记录
+原因；这种情况下可能需要让 IDA license 对服务账号（例如 LocalSystem）可见，或使用
+机器可见的 license 文件 / floating-license 设置。
 
 卸载会从 Windows Service Control Manager 查询已安装服务命令行，找回已安装 exe
 路径和 `--config` 路径，然后删除服务并删除整个配置中的 install root，包括 `bin`、

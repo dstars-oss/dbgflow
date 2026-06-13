@@ -1,4 +1,5 @@
 use super::registry::{AddSymbolsRequest, CreateSessionRequest, EvalRequest};
+use dbgflow_common::process::ToolCallContext;
 use dbgflow_common::{DbgFlowError, Result};
 use dbgflow_debug::session::{
     CreateSession, EvalSession, EvalSessionResult, Session, SessionId, SessionManager,
@@ -7,11 +8,15 @@ use dbgflow_debug::session::{
 pub(super) fn create_session(
     sessions: &SessionManager,
     request: CreateSessionRequest,
+    context: ToolCallContext,
 ) -> Result<Session> {
-    sessions.create_session(CreateSession {
-        target: request.target,
-        startup_timeout_ms: request.startup_timeout_ms,
-    })
+    sessions.create_session_with_context(
+        CreateSession {
+            target: request.target,
+            startup_timeout_ms: request.startup_timeout_ms,
+        },
+        context,
+    )
 }
 
 pub(super) fn query_session(sessions: &SessionManager, session_id: SessionId) -> Result<Session> {

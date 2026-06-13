@@ -4,6 +4,10 @@ use super::{
     ExecuteBackendFailure, ExecuteBackendRequest, ExecuteBackendResult,
 };
 use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use dbgflow_common::process::{
+    log_process_launch, spawn_process, LaunchStdio, ManagedChild, ProcessLaunchContext,
+    ProcessLaunchSpec,
+};
 use dbgflow_common::{DbgFlowError, Result};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -12,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::core::{implement, Interface, Type, GUID, HRESULT, PCSTR, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+use windows::core::{implement, Interface, Type, GUID, HRESULT, PCSTR, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, HMODULE};
 use windows::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugClient, IDebugClient4, IDebugClient5, IDebugControl4, IDebugOutputCallbacksWide,
@@ -29,9 +33,8 @@ use windows::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, OpenProcess, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, PROCESS_CREATE_THREAD, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
-    PROCESS_VM_OPERATION, PROCESS_VM_WRITE, STARTUPINFOW,
+    OpenProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_CREATE_THREAD,
+    PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
 };
 
 mod resolver;
@@ -95,6 +98,7 @@ impl DebugBackend for DbgEngBackend {
         let logger = self.logger.clone();
         let correlation_id = request.correlation_id.clone();
         let symbol_path = request.symbol_path.clone();
+        let process_launch_context = request.process_launch_context.clone();
         let startup_key = correlation_id.clone().unwrap_or_else(|| id.clone());
         let startup_cancel = Arc::new(StartupCancellation::default());
         self.pending_startups
@@ -107,6 +111,7 @@ impl DebugBackend for DbgEngBackend {
                 request.target,
                 correlation_id,
                 symbol_path,
+                process_launch_context,
                 logger,
                 rx,
                 init_tx,
@@ -459,6 +464,7 @@ fn worker_main(
     target: DebugTarget,
     correlation_id: Option<String>,
     symbol_path: Option<String>,
+    process_launch_context: ProcessLaunchContext,
     logger: Arc<dyn LogSink>,
     rx: mpsc::Receiver<WorkerCommand>,
     init_tx: mpsc::SyncSender<Result<WorkerInit>>,
@@ -469,6 +475,7 @@ fn worker_main(
         correlation_id,
         &target,
         symbol_path,
+        process_launch_context,
         logger,
         startup_cancel,
     ) {
@@ -524,6 +531,7 @@ impl DbgEngSession {
         correlation_id: Option<String>,
         target: &DebugTarget,
         symbol_path: Option<String>,
+        process_launch_context: ProcessLaunchContext,
         logger: Arc<dyn LogSink>,
         startup_cancel: Arc<StartupCancellation>,
     ) -> Result<Self> {
@@ -543,6 +551,7 @@ impl DbgEngSession {
             correlation_id.clone(),
             target,
             symbol_path,
+            process_launch_context,
             logger.clone(),
             startup_cancel,
             startup_started,
@@ -568,6 +577,7 @@ impl DbgEngSession {
         correlation_id: Option<String>,
         target: &DebugTarget,
         symbol_path: Option<String>,
+        process_launch_context: ProcessLaunchContext,
         logger: Arc<dyn LogSink>,
         startup_cancel: Arc<StartupCancellation>,
         startup_started: Instant,
@@ -744,7 +754,12 @@ impl DbgEngSession {
                     }
                     DebugTarget::Launch { executable, args } => {
                         startup_cancel.check_canceled()?;
-                        let mut launched = create_suspended_process(executable, args)?;
+                        let mut launched = create_suspended_process(
+                            executable,
+                            args,
+                            &process_launch_context,
+                            &logger,
+                        )?;
                         attach_process(&client4, launched.pid)?;
                         launched.resume()?;
                         launched_process = Some(launched);
@@ -1315,8 +1330,7 @@ fn cleanup_open_target_failure(
 }
 
 struct LaunchedProcess {
-    process: HANDLE,
-    thread: HANDLE,
+    child: ManagedChild,
     pid: u32,
     resumed: bool,
     terminated: bool,
@@ -1324,17 +1338,13 @@ struct LaunchedProcess {
 
 impl LaunchedProcess {
     fn resume(&mut self) -> Result<()> {
-        let previous_suspend_count = unsafe { ResumeThread(self.thread) };
-        if previous_suspend_count == u32::MAX {
-            return Err(DbgFlowError::Backend("ResumeThread failed".to_string()));
-        }
+        self.child.resume_thread()?;
         self.resumed = true;
         Ok(())
     }
 
     fn terminate(&mut self) -> Result<()> {
-        unsafe { TerminateProcess(self.process, 1) }
-            .map_err(|error| DbgFlowError::Backend(format!("TerminateProcess failed: {error}")))?;
+        self.child.kill()?;
         self.terminated = true;
         Ok(())
     }
@@ -1343,43 +1353,39 @@ impl LaunchedProcess {
 impl Drop for LaunchedProcess {
     fn drop(&mut self) {
         if !self.resumed && !self.terminated {
-            let _ = unsafe { TerminateProcess(self.process, 1) };
+            let _ = self.child.kill();
         }
-        let _ = unsafe { CloseHandle(self.thread) };
-        let _ = unsafe { CloseHandle(self.process) };
     }
 }
 
-fn create_suspended_process(executable: &Path, args: &[String]) -> Result<LaunchedProcess> {
-    let mut executable_wide = to_wide_null(executable);
-    let command_line = launch_command_line(executable, args);
-    let mut command_line_wide = to_wide_null_str(&command_line);
-    let startup_info = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    let mut process_info = PROCESS_INFORMATION::default();
-
-    unsafe {
-        CreateProcessW(
-            PCWSTR(executable_wide.as_mut_ptr()),
-            Some(PWSTR(command_line_wide.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW,
-            None,
-            PCWSTR::null(),
-            &startup_info,
-            &mut process_info,
-        )
-    }
-    .map_err(|error| DbgFlowError::Backend(format!("CreateProcessW suspended failed: {error}")))?;
-
+fn create_suspended_process(
+    executable: &Path,
+    args: &[String],
+    launch_context: &ProcessLaunchContext,
+    logger: &Arc<dyn LogSink>,
+) -> Result<LaunchedProcess> {
+    let mut spec = ProcessLaunchSpec::new(executable);
+    spec.args = args.iter().map(Into::into).collect();
+    spec.stdin = LaunchStdio::Null;
+    spec.stdout = LaunchStdio::Null;
+    spec.stderr = LaunchStdio::Null;
+    spec.creation_flags = (CREATE_SUSPENDED | CREATE_NO_WINDOW).0;
+    let child = spawn_process(&spec, launch_context).map_err(|error| {
+        DbgFlowError::Backend(format!(
+            "CreateProcess suspended failed for {}: {error}",
+            executable.display()
+        ))
+    })?;
+    let pid = child.pid();
+    log_process_launch(
+        logger,
+        "dbgeng",
+        "launch_target_process_launch_resolved",
+        child.audit(),
+    );
     Ok(LaunchedProcess {
-        process: process_info.hProcess,
-        thread: process_info.hThread,
-        pid: process_info.dwProcessId,
+        child,
+        pid,
         resumed: false,
         terminated: false,
     })
@@ -1396,41 +1402,4 @@ unsafe fn pcwstr_to_string(value: PCWSTR) -> String {
         len += 1;
     }
     String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
-}
-
-fn launch_command_line(executable: &Path, args: &[String]) -> String {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(quote_windows_arg(&executable.display().to_string()));
-    parts.extend(args.iter().map(|arg| quote_windows_arg(arg)));
-    parts.join(" ")
-}
-
-fn quote_windows_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        return "\"\"".to_string();
-    }
-    if !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
-        return arg.to_string();
-    }
-
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                quoted.extend(std::iter::repeat('\\').take(backslashes));
-                backslashes = 0;
-                quoted.push(ch);
-            }
-        }
-    }
-    quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
-    quoted.push('"');
-    quoted
 }

@@ -267,6 +267,11 @@ ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
 [reverse.ida]
 install_dir = "C:\\Program Files\\IDA Professional 9.3"
 
+[process]
+child_identity = "mcp_peer_session"
+fallback_child_identity = "active_interactive_session"
+elevate_if_admin = true
+
 [proxy]
 mode = "url"
 url = "http://127.0.0.1:7897"
@@ -280,6 +285,16 @@ including `notifications/resources/updated` for session state changes. `GET
 The HTTP transport is local-only: dbgflow only accepts loopback bind addresses
 and rejects non-localhost `Origin` headers. `/mcp` does not require bearer token
 authentication. HTTP request bodies are limited to 16 MiB.
+
+`[process]` controls how dbgflow launches child processes: debug session
+workers, IDA reverse workers, DbgEng launch targets, profiling targets, and
+TTD recorder processes. Missing `[process]` keeps backward-compatible
+`current_process` behavior. The install script writes
+`child_identity = "mcp_peer_session"`, falling back to
+`active_interactive_session`, with `elevate_if_admin = true`. For HTTP `/mcp`,
+dbgflow does not have strong client authentication or impersonation; it infers
+the local loopback peer PID/session from the TCP owner table and records the
+resolved policy, session id, elevation state, and fallback reason in logs.
 
 Proxy configuration is service-wide and comes from `[proxy]` in `config.toml`.
 Use `mode = "url"` with `url = "http://host:port"` to set
@@ -329,13 +344,27 @@ The install script detects DbgEng from Microsoft Store WinDbg packages first,
 then Windows Kits / WDK Debuggers, then System32. TTD is optional; the script
 first derives it from the resolved DbgEng directory as `<dbgeng_dir>\ttd`, then
 falls back to standalone TTD discovery and `PATH`. Use `-TtdDir <path>` to
-override that location. Use `-ProxyUrl <url>`, `-NoProxy`, or existing proxy
-environment variables to control the generated `[proxy]` section. Use
-`-SymbolPath <path>` to write `[debugger].symbol_path`; if omitted, the install script persists
+override that location. The script also detects common IDA installation
+directories from `DBGFLOW_IDA_DIR`, Windows uninstall registry entries, and
+standard Program Files locations, then writes `[reverse.ida].install_dir` when
+the directory contains `ida.exe`, `ida.dll`, `idalib.dll`, and `ida.hlp`. Use
+`-IdaInstallDir <path>` to override IDA discovery.
+
+Use `-ProxyUrl <url>`, `-NoProxy`, or existing proxy environment variables to
+control the generated `[proxy]` section. Use `-SymbolPath <path>` to write
+`[debugger].symbol_path`; if omitted, the install script persists
 `_NT_ALT_SYMBOL_PATH` and `_NT_SYMBOL_PATH` from the current environment when
 present, and otherwise leaves the field unset. It does not default to
 Microsoft's public symbol server. Use `-NonInteractive` to write the
 detected/default config without the final confirmation prompt.
+
+With the generated `[process]` policy, IDA/idalib normally runs under the MCP
+loopback peer's Windows session, or the active interactive session fallback, and
+uses a linked elevated token when available. IDA must be licensed and its
+license terms accepted for the resolved user token. If token resolution fails,
+dbgflow falls back and logs the reason; in that case IDA licensing may need to
+be visible to the service account, such as LocalSystem, or provided through a
+machine-visible license file or floating-license settings.
 
 Uninstall queries the installed service command line from the Windows Service
 Control Manager to recover the installed executable path and `--config` path,

@@ -1,4 +1,5 @@
 use super::adapters::{decode_arguments, to_value};
+use dbgflow_common::process::ToolCallContext;
 use dbgflow_common::{DbgFlowError, Result};
 use dbgflow_debug::backend::DebugTarget;
 use dbgflow_debug::session::{EvalSessionResult, Session, SessionId, SessionManager};
@@ -109,7 +110,15 @@ impl ToolService {
     }
 
     pub fn create_session(&self, request: CreateSessionRequest) -> Result<Session> {
-        super::debug::create_session(&self.sessions, request)
+        self.create_session_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn create_session_with_context(
+        &self,
+        request: CreateSessionRequest,
+        context: ToolCallContext,
+    ) -> Result<Session> {
+        super::debug::create_session(&self.sessions, request, context)
     }
 
     pub fn query_session(&self, session_id: SessionId) -> Result<Session> {
@@ -133,15 +142,40 @@ impl ToolService {
     }
 
     pub fn run_profile(&self, request: RunProfileRequest) -> Result<ProfileResult> {
-        super::trace::run_profile(&self.profiles, request)
+        self.run_profile_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn run_profile_with_context(
+        &self,
+        request: RunProfileRequest,
+        context: ToolCallContext,
+    ) -> Result<ProfileResult> {
+        super::trace::run_profile(&self.profiles, request, context)
     }
 
     pub fn record_ttd(&self, request: RecordTtd) -> Result<TtdRecordingResult> {
-        super::trace::record_ttd(&self.ttd_recordings, request)
+        self.record_ttd_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn record_ttd_with_context(
+        &self,
+        request: RecordTtd,
+        context: ToolCallContext,
+    ) -> Result<TtdRecordingResult> {
+        super::trace::record_ttd(&self.ttd_recordings, request, context)
     }
 
     pub fn create_ida_session(&self, request: CreateIdaSession) -> Result<ReverseSession> {
-        self.ida_sessions.create_session(request)
+        self.create_ida_session_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn create_ida_session_with_context(
+        &self,
+        request: CreateIdaSession,
+        context: ToolCallContext,
+    ) -> Result<ReverseSession> {
+        self.ida_sessions
+            .create_session_with_context(request, context)
     }
 
     pub fn get_ida_session(&self, session_id: SessionId) -> Result<ReverseSession> {
@@ -173,9 +207,18 @@ impl ToolService {
         name: &str,
         arguments: Value,
     ) -> std::result::Result<Value, ToolCallError> {
+        self.call_tool_with_context(name, arguments, ToolCallContext::default())
+    }
+
+    pub fn call_tool_with_context(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: ToolCallContext,
+    ) -> std::result::Result<Value, ToolCallError> {
         match name {
             CREATE_SESSION => self
-                .create_session(decode_arguments(arguments)?)
+                .create_session_with_context(decode_arguments(arguments)?, context)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             GET_SESSION => {
@@ -203,15 +246,15 @@ impl ToolService {
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             RECORD_PROFILE => self
-                .run_profile(decode_arguments(arguments)?)
+                .run_profile_with_context(decode_arguments(arguments)?, context)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             RECORD_TTD => self
-                .record_ttd(decode_arguments(arguments)?)
+                .record_ttd_with_context(decode_arguments(arguments)?, context)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             IDA_CREATE_SESSION => self
-                .create_ida_session(decode_arguments(arguments)?)
+                .create_ida_session_with_context(decode_arguments(arguments)?, context)
                 .map_err(ToolCallError::execution)
                 .and_then(to_value),
             IDA_GET_SESSION => {

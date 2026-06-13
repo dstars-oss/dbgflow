@@ -1,8 +1,10 @@
 use super::ProfileTarget;
+use dbgflow_common::logging::LogSink;
+use dbgflow_common::process::{
+    log_process_launch, spawn_process, LaunchStdio, ProcessLaunchContext, ProcessLaunchSpec,
+};
 use dbgflow_common::{DbgFlowError, Result};
-use std::fs::File;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,6 +45,8 @@ pub trait TargetRunner: Send + Sync {
         timeout: Duration,
         stdout_path: &Path,
         stderr_path: &Path,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
         event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit>;
 }
@@ -68,33 +72,32 @@ impl TargetRunner for ProcessTargetRunner {
         timeout: Duration,
         stdout_path: &Path,
         stderr_path: &Path,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
         event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         let ProfileTarget::Launch { executable, args } = target;
-        let stdout = File::create(stdout_path).map_err(|error| {
-            DbgFlowError::Artifact(format!("create target stdout failed: {error}"))
+        let mut spec = ProcessLaunchSpec::new(executable);
+        spec.args = args.iter().map(Into::into).collect();
+        spec.stdout = LaunchStdio::File(stdout_path.to_path_buf());
+        spec.stderr = LaunchStdio::File(stderr_path.to_path_buf());
+        let mut child = spawn_process(&spec, &launch_context).map_err(|error| {
+            DbgFlowError::Backend(format!("launch profile target failed: {error}"))
         })?;
-        let stderr = File::create(stderr_path).map_err(|error| {
-            DbgFlowError::Artifact(format!("create target stderr failed: {error}"))
-        })?;
-        let mut child = Command::new(executable)
-            .args(args)
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .map_err(|error| {
-                DbgFlowError::Backend(format!("launch profile target failed: {error}"))
-            })?;
-        let pid = child.id();
+        let pid = child.pid();
+        log_process_launch(
+            &logger,
+            "profile",
+            "target_process_launch_resolved",
+            child.audit(),
+        );
         event_sink.target_started(pid);
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = child.try_wait().map_err(|error| {
-                DbgFlowError::Backend(format!("poll profile target failed: {error}"))
-            })? {
+            if let Some(status) = child.try_wait()? {
                 return Ok(TargetExit::Exited {
                     pid,
-                    exit_code: exit_code(status),
+                    exit_code: status.code,
                 });
             }
             if Instant::now() >= deadline {
@@ -103,8 +106,4 @@ impl TargetRunner for ProcessTargetRunner {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
-}
-
-fn exit_code(status: ExitStatus) -> Option<i32> {
-    status.code()
 }

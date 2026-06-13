@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use dbgflow_common::process::ProcessLaunchContext;
 use dbgflow_core::backend::dbgeng::DbgEngBackend;
 use dbgflow_core::backend::{
     CreateBackendSession, DebugBackend, DebugTarget, ExecuteBackendResult,
@@ -193,6 +194,7 @@ impl SessionWorkerLauncher for InProcessDbgEngWorkerLauncher {
         _session_id: dbgflow_core::session::SessionId,
         _logger: Arc<dyn dbgflow_core::logging::LogSink>,
         _proxy: ProxyEnvironment,
+        _launch_context: ProcessLaunchContext,
     ) -> Result<Arc<dyn SessionWorker>> {
         Ok(Arc::new(InProcessDbgEngWorker {
             backend: DbgEngBackend::new(),

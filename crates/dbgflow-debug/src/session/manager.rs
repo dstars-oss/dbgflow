@@ -13,6 +13,7 @@ use dbgflow_common::artifacts::{
     ArtifactManager, ArtifactRef, CommandArtifactRecord, SessionArtifactEvent,
 };
 use dbgflow_common::logging::{noop_logger, LogEvent, LogLevel, LogSink};
+use dbgflow_common::process::{ProcessLaunchConfig, ProcessLaunchContext, ToolCallContext};
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_common::time::now_unix_ms;
 use dbgflow_common::{DbgFlowError, Result};
@@ -59,6 +60,7 @@ pub struct SessionManager {
     logger: Arc<dyn LogSink>,
     proxy: ProxyEnvironment,
     symbol_path: Option<String>,
+    process_launch: ProcessLaunchConfig,
 }
 
 impl SessionManager {
@@ -107,11 +109,12 @@ impl SessionManager {
         proxy: ProxyEnvironment,
         logger: Arc<dyn LogSink>,
     ) -> Self {
-        Self::with_worker_launcher_proxy_symbol_path_and_logger(
+        Self::with_worker_launcher_proxy_symbol_path_process_and_logger(
             worker_launcher,
             artifact_root,
             proxy,
             None,
+            ProcessLaunchConfig::default(),
             logger,
         )
     }
@@ -121,6 +124,24 @@ impl SessionManager {
         artifact_root: impl Into<PathBuf>,
         proxy: ProxyEnvironment,
         symbol_path: Option<String>,
+        logger: Arc<dyn LogSink>,
+    ) -> Self {
+        Self::with_worker_launcher_proxy_symbol_path_process_and_logger(
+            worker_launcher,
+            artifact_root,
+            proxy,
+            symbol_path,
+            ProcessLaunchConfig::default(),
+            logger,
+        )
+    }
+
+    pub fn with_worker_launcher_proxy_symbol_path_process_and_logger(
+        worker_launcher: Arc<dyn SessionWorkerLauncher>,
+        artifact_root: impl Into<PathBuf>,
+        proxy: ProxyEnvironment,
+        symbol_path: Option<String>,
+        process_launch: ProcessLaunchConfig,
         logger: Arc<dyn LogSink>,
     ) -> Self {
         Self {
@@ -133,6 +154,7 @@ impl SessionManager {
             logger,
             proxy,
             symbol_path,
+            process_launch,
         }
     }
 
@@ -160,7 +182,15 @@ impl SessionManager {
         Ok(sessions)
     }
 
-    pub fn create_session(&self, mut request: CreateSession) -> Result<Session> {
+    pub fn create_session(&self, request: CreateSession) -> Result<Session> {
+        self.create_session_with_context(request, ToolCallContext::default())
+    }
+
+    pub fn create_session_with_context(
+        &self,
+        mut request: CreateSession,
+        tool_context: ToolCallContext,
+    ) -> Result<Session> {
         let requested_target = request.target.clone();
         request.target = match super::validation::validate_target(request.target) {
             Ok(target) => target,
@@ -245,7 +275,7 @@ impl SessionManager {
             );
         }
 
-        self.spawn_worker_startup(session.id, request.target);
+        self.spawn_worker_startup(session.id, request.target, tool_context);
         self.notify_session_updated(session.id);
 
         Ok(session)
@@ -1272,10 +1302,17 @@ impl SessionManager {
         self.notify_session_updated(session_id);
     }
 
-    fn spawn_worker_startup(&self, session_id: SessionId, target: DebugTarget) {
+    fn spawn_worker_startup(
+        &self,
+        session_id: SessionId,
+        target: DebugTarget,
+        tool_context: ToolCallContext,
+    ) {
         let manager = self.clone();
         let proxy = self.proxy.clone();
         let symbol_path = self.symbol_path.clone();
+        let process_launch_context =
+            ProcessLaunchContext::new(self.process_launch.clone(), tool_context);
         thread::spawn(move || {
             let startup_started = Instant::now();
             let operation_lock = match manager.operation_lock(session_id) {
@@ -1308,21 +1345,22 @@ impl SessionManager {
                     .operation("create_session"),
             );
 
-            let worker =
-                match manager
-                    .worker_launcher
-                    .spawn(session_id, manager.logger.clone(), proxy)
-                {
-                    Ok(worker) => worker,
-                    Err(error) => {
-                        manager.finish_worker_startup(
-                            session_id,
-                            Err(error),
-                            startup_started.elapsed().as_millis(),
-                        );
-                        return;
-                    }
-                };
+            let worker = match manager.worker_launcher.spawn(
+                session_id,
+                manager.logger.clone(),
+                proxy,
+                process_launch_context.clone(),
+            ) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    manager.finish_worker_startup(
+                        session_id,
+                        Err(error),
+                        startup_started.elapsed().as_millis(),
+                    );
+                    return;
+                }
+            };
 
             if let Err(error) = manager.insert_worker(session_id, worker.clone()) {
                 let _ = worker.kill("insert_worker_failed");
@@ -1346,6 +1384,7 @@ impl SessionManager {
                 target,
                 correlation_id: Some(session_id.to_string()),
                 symbol_path,
+                process_launch_context,
             });
             manager.finish_worker_startup(
                 session_id,

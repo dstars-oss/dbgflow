@@ -1,4 +1,6 @@
+use dbgflow_common::process::ProcessLaunchContext;
 use dbgflow_core::artifacts::ArtifactKind;
+use dbgflow_core::logging::LogSink;
 use dbgflow_core::ttd::{
     build_ttd_args, validate_ttd_options, validate_ttd_target, RecordTtd, TtdRecordMode,
     TtdRecorderExit, TtdRecorderInvocation, TtdRecorderRunner, TtdRecorderRuntime,
@@ -466,7 +468,12 @@ impl FakeTtdRunner {
 }
 
 impl TtdRecorderRunner for FakeTtdRunner {
-    fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdRecorderExit> {
+    fn run(
+        &self,
+        invocation: TtdRecorderInvocation,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit> {
         self.invocations
             .lock()
             .expect("invocations")
@@ -486,7 +493,12 @@ impl TtdRecorderRunner for FakeTtdRunner {
         }
     }
 
-    fn stop(&self, invocation: TtdStopInvocation) -> Result<TtdRecorderExit> {
+    fn stop(
+        &self,
+        invocation: TtdStopInvocation,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit> {
         fs::write(&invocation.stdout_path, b"stop output\n").expect("write stop stdout");
         fs::write(&invocation.stderr_path, b"").expect("write stop stderr");
         self.stops.lock().expect("stops").push(invocation);
@@ -502,7 +514,12 @@ struct BlockingTtdRunner {
 }
 
 impl TtdRecorderRunner for BlockingTtdRunner {
-    fn run(&self, invocation: TtdRecorderInvocation) -> Result<TtdRecorderExit> {
+    fn run(
+        &self,
+        invocation: TtdRecorderInvocation,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit> {
         if let Some(traces_dir) = traces_dir_from_args(&invocation.args) {
             fs::create_dir_all(&traces_dir).expect("create traces dir");
             fs::write(traces_dir.join("blocked.run"), b"trace").expect("write trace");
@@ -522,7 +539,12 @@ impl TtdRecorderRunner for BlockingTtdRunner {
         })
     }
 
-    fn stop(&self, _invocation: TtdStopInvocation) -> Result<TtdRecorderExit> {
+    fn stop(
+        &self,
+        _invocation: TtdStopInvocation,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
+    ) -> Result<TtdRecorderExit> {
         Ok(TtdRecorderExit {
             exit_code: Some(0),
             timed_out: false,

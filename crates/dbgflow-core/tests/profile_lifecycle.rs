@@ -1,3 +1,5 @@
+use dbgflow_common::logging::noop_logger;
+use dbgflow_common::process::{ProcessLaunchConfig, ProcessLaunchContext};
 use dbgflow_core::artifacts::{ArtifactKind, ArtifactRef};
 use dbgflow_core::logging::{LogEvent, LogSink};
 use dbgflow_core::profile::{
@@ -136,6 +138,8 @@ fn target_runner_returns_exit_or_timeout_without_killing_target() {
             Duration::from_millis(1),
             Path::new("stdout.txt"),
             Path::new("stderr.txt"),
+            ProcessLaunchContext::default(),
+            noop_logger(),
             Arc::new(NoopTargetEventSink),
         )
         .expect("launch target");
@@ -230,6 +234,8 @@ impl TargetRunner for TestTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
         event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         match &self.exit {
@@ -354,6 +360,7 @@ fn run_profile_logs_lifecycle_events() {
             },
         }),
         logger.clone(),
+        ProcessLaunchConfig::default(),
     );
 
     let result = manager
@@ -563,6 +570,8 @@ impl TargetRunner for PanicTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
         _event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         panic!("target runner must not be called when collector start fails");
@@ -742,6 +751,8 @@ impl TargetRunner for BlockingTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
         event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         let (lock, cvar) = &*self.blocker;
@@ -774,6 +785,8 @@ impl TargetRunner for FailingTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
         _event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         Err(dbgflow_core::DbgFlowError::Backend(
@@ -793,6 +806,8 @@ impl TargetRunner for SequenceTargetRunner {
         _timeout: Duration,
         _stdout_path: &Path,
         _stderr_path: &Path,
+        _launch_context: ProcessLaunchContext,
+        _logger: Arc<dyn LogSink>,
         event_sink: Arc<dyn TargetEventSink>,
     ) -> Result<TargetExit> {
         let mut exits = self.exits.lock().expect("sequence lock");

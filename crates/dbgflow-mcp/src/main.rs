@@ -1,5 +1,5 @@
 use dbgflow_mcp::http::{run_http, HttpConfig};
-use dbgflow_mcp::mcp::server_with_data_dir_proxy_ttd_ida_and_symbol_path;
+use dbgflow_mcp::mcp::server_with_data_dir_proxy_ttd_ida_symbol_path_and_process;
 use dbgflow_mcp::runtime::{
     apply_runtime_environment, help_text, parse_options, parse_service_install_options,
     parse_service_uninstall_options,
@@ -39,12 +39,13 @@ fn run() -> Result<(), String> {
             let config = parse_options(args.into_iter().skip(1))?;
             apply_runtime_environment(&config);
             let (_shutdown_tx, shutdown_rx) = mpsc::channel();
-            let server = server_with_data_dir_proxy_ttd_ida_and_symbol_path(
+            let server = server_with_data_dir_proxy_ttd_ida_symbol_path_and_process(
                 config.data_dir,
                 config.proxy,
                 config.ttd_dir,
                 config.ida_install_dir,
                 config.symbol_path,
+                config.process_launch,
             )?;
             run_http(server, HttpConfig { bind: config.bind }, shutdown_rx)
                 .map_err(|error| error.to_string())
