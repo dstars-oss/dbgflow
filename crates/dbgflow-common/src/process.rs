@@ -162,6 +162,13 @@ impl ProcessLaunchSpec {
             current_dir: None,
         }
     }
+
+    pub fn hide_console_window(&mut self) {
+        #[cfg(windows)]
+        {
+            self.creation_flags |= windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1307,6 +1314,18 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn hide_console_window_sets_create_no_window_flag() {
+        let mut spec = ProcessLaunchSpec::new(system32_exe("cmd.exe"));
+
+        spec.hide_console_window();
+
+        assert_ne!(
+            spec.creation_flags & windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+            0
+        );
+    }
+
+    #[test]
     fn current_process_launch_applies_environment_changes() {
         let mut spec = ProcessLaunchSpec::new(system32_exe("cmd.exe"));
         spec.args = vec!["/C".into(), "echo %DBGFLOW_PROCESS_TEST_ENV%".into()];
@@ -1372,5 +1391,19 @@ mod tests {
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
             .join("System32")
             .join(name)
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hide_console_window_is_noop_on_non_windows() {
+        let mut spec = ProcessLaunchSpec::new("dbgflow-test");
+
+        spec.hide_console_window();
+
+        assert_eq!(spec.creation_flags, 0);
     }
 }

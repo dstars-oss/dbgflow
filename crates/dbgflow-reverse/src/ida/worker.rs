@@ -151,15 +151,7 @@ impl ProcessReverseWorker {
         launch_context: ProcessLaunchContext,
         logger: Arc<dyn LogSink>,
     ) -> Result<Self> {
-        let mut spec = ProcessLaunchSpec::new(&executable);
-        spec.args = vec![
-            REVERSE_WORKER_COMMAND.into(),
-            REVERSE_WORKER_KIND_IDA.into(),
-        ];
-        spec.env = ida_env_changes(&install.install_dir)?;
-        spec.stdin = LaunchStdio::Piped;
-        spec.stdout = LaunchStdio::Piped;
-        spec.stderr = LaunchStdio::File(worker_log_path.clone());
+        let spec = reverse_worker_launch_spec(&executable, &install, &worker_log_path)?;
         let mut child = spawn_process(&spec, &launch_context).map_err(|error| {
             DbgFlowError::Backend(format!(
                 "spawn reverse worker {} failed: {error}",
@@ -356,6 +348,24 @@ impl ReverseWorker for ProcessReverseWorker {
         }
         Ok(())
     }
+}
+
+fn reverse_worker_launch_spec(
+    executable: &Path,
+    install: &IdaInstall,
+    worker_log_path: &Path,
+) -> Result<ProcessLaunchSpec> {
+    let mut spec = ProcessLaunchSpec::new(executable);
+    spec.args = vec![
+        REVERSE_WORKER_COMMAND.into(),
+        REVERSE_WORKER_KIND_IDA.into(),
+    ];
+    spec.env = ida_env_changes(&install.install_dir)?;
+    spec.stdin = LaunchStdio::Piped;
+    spec.stdout = LaunchStdio::Piped;
+    spec.stderr = LaunchStdio::File(worker_log_path.to_path_buf());
+    spec.hide_console_window();
+    Ok(spec)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,6 +665,7 @@ fn ida_env_changes(install_dir: &Path) -> Result<Vec<EnvChange>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::io::Cursor;
 
     #[test]
@@ -742,5 +753,33 @@ mod tests {
         let decoded: WorkerInput = serde_json::from_str(&encoded).expect("decode");
 
         assert_eq!(decoded.request_id, 7);
+    }
+
+    #[test]
+    fn reverse_worker_launch_spec_hides_console_window() {
+        let executable = PathBuf::from("dbgflow-mcp.exe");
+        let install_dir = std::env::temp_dir().join("dbgflow-fake-ida-install");
+        let install = IdaInstall {
+            ida_dll: install_dir.join("ida.dll"),
+            idalib_dll: install_dir.join("idalib.dll"),
+            install_dir,
+        };
+        let worker_log_path = PathBuf::from("worker.log");
+        let spec = reverse_worker_launch_spec(&executable, &install, &worker_log_path)
+            .expect("build reverse worker launch spec");
+        let mut expected = ProcessLaunchSpec::new(&executable);
+        expected.hide_console_window();
+
+        assert_eq!(
+            spec.args,
+            vec![
+                OsString::from(REVERSE_WORKER_COMMAND),
+                OsString::from(REVERSE_WORKER_KIND_IDA)
+            ]
+        );
+        assert_eq!(spec.stdin, LaunchStdio::Piped);
+        assert_eq!(spec.stdout, LaunchStdio::Piped);
+        assert_eq!(spec.stderr, LaunchStdio::File(worker_log_path));
+        assert_eq!(spec.creation_flags, expected.creation_flags);
     }
 }

@@ -15,7 +15,7 @@ use dbgflow_common::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -154,15 +154,7 @@ impl ProcessSessionWorker {
         proxy: ProxyEnvironment,
         launch_context: ProcessLaunchContext,
     ) -> Result<Self> {
-        let mut spec = ProcessLaunchSpec::new(&executable);
-        spec.args = vec![
-            SESSION_WORKER_COMMAND.into(),
-            SESSION_WORKER_KIND_SESSION.into(),
-        ];
-        spec.env = proxy_env_changes(&proxy);
-        spec.stdin = LaunchStdio::Piped;
-        spec.stdout = LaunchStdio::Piped;
-        spec.stderr = LaunchStdio::Null;
+        let spec = session_worker_launch_spec(&executable, &proxy);
         let mut child = spawn_process(&spec, &launch_context).map_err(|error| {
             DbgFlowError::Backend(format!(
                 "spawn session worker {} failed: {error}",
@@ -451,6 +443,20 @@ impl ProcessSessionWorker {
             thread::sleep(Duration::from_millis(25));
         }
     }
+}
+
+fn session_worker_launch_spec(executable: &Path, proxy: &ProxyEnvironment) -> ProcessLaunchSpec {
+    let mut spec = ProcessLaunchSpec::new(executable);
+    spec.args = vec![
+        SESSION_WORKER_COMMAND.into(),
+        SESSION_WORKER_KIND_SESSION.into(),
+    ];
+    spec.env = proxy_env_changes(proxy);
+    spec.stdin = LaunchStdio::Piped;
+    spec.stdout = LaunchStdio::Piped;
+    spec.stderr = LaunchStdio::Null;
+    spec.hide_console_window();
+    spec
 }
 
 #[cfg(test)]
@@ -920,8 +926,9 @@ impl<W: Write + Send + 'static> BackendEventSink for WorkerProtocolEventSink<W> 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_proxy_environment, run_session_worker_stdio, ProcessSessionWorker,
-        ProcessSessionWorkerInner, SessionWorker, WorkerError, WorkerOutput,
+        apply_proxy_environment, run_session_worker_stdio, session_worker_launch_spec,
+        ProcessSessionWorker, ProcessSessionWorkerInner, SessionWorker, WorkerError, WorkerOutput,
+        SESSION_WORKER_COMMAND, SESSION_WORKER_KIND_SESSION,
     };
     use crate::backend::{ExecuteBackendFailure, NoopBackendEventSink};
     use crate::session::SessionId;
@@ -1041,6 +1048,26 @@ mod tests {
             failure.partial_output.as_deref(),
             Some("partial from worker\n")
         );
+    }
+
+    #[test]
+    fn session_worker_launch_spec_hides_console_window() {
+        let executable = PathBuf::from("dbgflow-mcp.exe");
+        let spec = session_worker_launch_spec(&executable, &ProxyEnvironment::none());
+        let mut expected = ProcessLaunchSpec::new(&executable);
+        expected.hide_console_window();
+
+        assert_eq!(
+            spec.args,
+            vec![
+                OsString::from(SESSION_WORKER_COMMAND),
+                OsString::from(SESSION_WORKER_KIND_SESSION)
+            ]
+        );
+        assert_eq!(spec.stdin, LaunchStdio::Piped);
+        assert_eq!(spec.stdout, LaunchStdio::Piped);
+        assert_eq!(spec.stderr, LaunchStdio::Null);
+        assert_eq!(spec.creation_flags, expected.creation_flags);
     }
 
     #[test]
