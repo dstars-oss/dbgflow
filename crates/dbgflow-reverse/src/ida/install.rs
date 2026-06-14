@@ -72,6 +72,7 @@ pub fn validate_ida_install_dir(path: &Path) -> Result<IdaInstall> {
             install_dir.display()
         ))
     })?;
+    let install_dir = normalize_ida_runtime_path(install_dir);
     if !install_dir.is_dir() {
         return Err(DbgFlowError::Backend(format!(
             "invalid IDA install dir {}; expected a directory",
@@ -154,6 +155,20 @@ fn absolutize_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+pub(crate) fn normalize_ida_runtime_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,7 +184,7 @@ mod tests {
 
         assert_eq!(
             install.install_dir,
-            root.canonicalize().expect("canonicalize")
+            normalize_ida_runtime_path(root.canonicalize().expect("canonicalize"))
         );
     }
 
@@ -183,6 +198,18 @@ mod tests {
         let error = validate_ida_install_dir(&root).expect_err("reject missing idalib");
 
         assert!(error.to_string().contains("missing idalib.dll"));
+    }
+
+    #[test]
+    fn strips_windows_verbatim_paths_for_ida_runtime() {
+        assert_eq!(
+            normalize_ida_runtime_path(PathBuf::from(r"\\?\C:\IDA\sample.exe")),
+            PathBuf::from(r"C:\IDA\sample.exe")
+        );
+        assert_eq!(
+            normalize_ida_runtime_path(PathBuf::from(r"\\?\UNC\server\share\sample.exe")),
+            PathBuf::from(r"\\server\share\sample.exe")
+        );
     }
 
     fn test_dir(name: &str) -> PathBuf {

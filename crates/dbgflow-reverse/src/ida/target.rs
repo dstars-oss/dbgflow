@@ -1,3 +1,4 @@
+use super::install::normalize_ida_runtime_path;
 use dbgflow_common::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,7 @@ pub fn validate_ida_target(target: IdaTarget) -> Result<IdaTarget> {
             raw_path.display()
         ))
     })?;
+    let canonical = normalize_ida_runtime_path(canonical);
     if !canonical.is_file() {
         return Err(DbgFlowError::Backend(format!(
             "invalid IDA target path {}; expected an existing file",

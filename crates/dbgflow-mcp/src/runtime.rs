@@ -1148,11 +1148,7 @@ url = "http://127.0.0.1:7897"
             Some("srv*C:\\symbols*https://msdl.microsoft.com/download/symbols")
         );
         assert_eq!(config.app.ttd_dir.as_deref(), Some(ttd.as_path()));
-        let canonical_ida = ida.canonicalize().expect("canonical ida");
-        assert_eq!(
-            config.app.ida_install_dir.as_deref(),
-            Some(canonical_ida.as_path())
-        );
+        assert_eq!(config.app.ida_install_dir.as_deref(), Some(ida.as_path()));
         assert_eq!(
             config.app.ida_python_executable.as_deref(),
             Some(python.as_path())

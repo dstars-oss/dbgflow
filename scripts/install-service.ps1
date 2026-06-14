@@ -251,11 +251,11 @@ function Copy-IdaProMcpVendor {
         throw "IDA vendor destination must be under install root: $destination"
     }
 
-    if (Test-Path -LiteralPath $destination) {
-        Remove-Item -LiteralPath $destination -Recurse -Force
-    }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-    Copy-Item -LiteralPath $SourceRoot -Destination $destination -Recurse -Force
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    Get-ChildItem -LiteralPath $SourceRoot -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
+    }
 
     $vendorSrc = Join-Path $destination "src"
     if (-not (Test-Path -LiteralPath (Join-Path $vendorSrc "ida_pro_mcp\idalib_supervisor.py") -PathType Leaf)) {
