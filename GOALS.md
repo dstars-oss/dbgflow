@@ -254,45 +254,28 @@ dbgflow-mcp
 
 ### M5. IdaLib Reverse Worker
 
-实现基于 idalib 的 headless reverse worker：
+实现基于 vendored `ida-pro-mcp` 的 headless idalib supervisor reverse worker：
 
-* 支持 runtime 配置探测或指定 IDA install 与 SDK / idalib 运行环境。
-* 支持每个 reverse analysis session 使用独立 worker 子进程。
-* 支持 `ida.*` tool descriptor 与 reverse session lifecycle MVP。
-* 支持只读查询能力：函数、反汇编、字符串、imports / exports、xrefs、类型和伪代码。
-* 支持受控标注修改能力：rename、comment 和 type。
-* 支持 reverse artifacts、审计日志和错误记录。
+* vendor `ida-pro-mcp` Python runtime、profiles 和 LICENSE attribution。
+* Rust 侧通过 stdio JSON-RPC lazy start supervisor，并保留 reverse session、artifact 和 audit 外壳。
+* 采用 upstream Headless idalib Session Model：一个 supervisor 管理多个 database worker。
+* dbgflow `SessionId` 始终映射到 upstream database id；公开 tool selector 不接受 upstream id。
+* 同一 reverse session 内串行化 tool calls，不同 IDA sessions 由 upstream worker 隔离并可重叠执行。
+* `ida.close_session` 默认调用 `idb_save` 后脱管；保存失败时保留 session 和 database mapping，不强杀 headless worker，不关闭 GUI instance。
+* 支持 reverse artifacts、审计日志、错误记录和 upstream `_meta` / 大结果归档。
 
-当前 MVP tool 名称：
+当前管理 tool 名称：
 
 ```text
 ida.create_session
 ida.get_session
+ida.list_sessions
 ida.close_session
-ida.get_metadata
-ida.list_segments
-ida.list_functions
-ida.list_strings
-ida.list_imports
-ida.list_exports
-ida.lookup_functions
-ida.disassemble
-ida.decompile
-ida.list_xrefs
-ida.rename
-ida.set_comment
-ida.set_type
 ```
 
-`ida.close_session` 默认请求保存打开的数据库；`.idb` / `.i64` target 默认原地操作。
-当前基础 idalib close ABI 不返回保存成功与否，事件和 session warning 会把保存结果
-记录为 `unknown`。rich reverse tools 通过 Rust direct binding 直接加载官方
-`ida.dll` / `idalib.dll` runtime symbols；缺少 symbol、license 或 processor 支持时
-返回明确 unsupported error，基础 session / metadata / segment / function 查询仍可用。
-qstring 和 xrefblk_t 依赖能力会在 database 打开后用当前 IDB 中的安全样本做 runtime
-validation；未通过时 metadata warning 和 unsupported error 会记录具体原因。分页 rich
-tools 在 Rust 层统一应用默认 limit 100、最大 limit 10000。`ida.decompile` 保持明确
-unsupported，直到 Hex-Rays dispatcher 完成验证。
+默认工具面为 upstream 非 debugger tools 暴露成 `ida.<tool_name>`，但排除
+`idb_open`、`idb_list`、`dbg_*` 和 `py_exec_file`。`ida.py_eval` 默认启用并按可信
+本机敏感能力处理；`ida.idb_save` 作为普通 upstream tool 暴露，用于显式保存。
 
 ## 7. 关键设计决策
 
@@ -570,23 +553,26 @@ IDA / idalib，公开名称直接表达后端语义，而不是抽象为 `rev.*`
 * 如果未来增加其他 reverse backend，可在内部保留 `ReverseBackend` 抽象，再单独设计
   兼容或迁移策略。
 
-### D-018: idalib worker 采用 Rust-first runtime direct binding
+### D-018: idalib worker 采用 vendored `ida-pro-mcp` supervisor
 
 决定：
 
-idalib reverse worker 的首选实现路线是 Rust 主体开发，并通过 `libloading` 在运行时
-直接加载官方 `idalib.dll` / `ida.dll` symbols。默认构建不依赖 IDA SDK headers、
-C++ 编译器、bindgen、autocxx 或 cxx。Python idalib 可用于探索或验证 API 行为，
-但不作为默认生产实现路线。
+废弃旧 Rust direct-binding IDA 实现，不再通过 `libloading` 直接解析
+`idalib.dll` / `ida.dll` symbols。v1 复用 vendored `ida-pro-mcp` Python 代码，
+由 dbgflow 启动 `ida_pro_mcp.idalib_supervisor` stdio JSON-RPC supervisor，并把
+dbgflow reverse session / artifact / audit 外壳对接到 upstream Headless idalib
+Session Model。
 
 原因：
 
-* Rust 主进程、配置、validation、artifacts、日志和 MCP facade 可沿用现有工程边界。
-* direct binding 删除额外部署 native bridge DLL 的峰值，保持默认构建
-  runtime-only；C++ ABI 风险集中在 `dbgflow-reverse::ida` 私有 wrapper 和 real IDA
-  smoke test 中验证。
-* 不把 Python 运行时、虚拟环境和模块搜索路径作为首版生产依赖，可以降低部署和服务化
-  复杂度。
+* upstream 已经实现 headless idalib supervisor、per-database worker lifecycle、
+  schema/profile 和大结果下载机制，v1 复用它能更快获得完整 IDA 工具体系。
+* Rust direct binding 的 IDA ABI / symbol layout 风险高，且会持续追赶 upstream
+  IDAPython / idalib 行为；supervisor 方案把 IDA 语义集中在 upstream Python 层。
+* dbgflow 仍保留自身必须管理的边界：UUID session selector、target validation、
+  同 session 串行化、artifacts、audit、timeouts、health 和 MCP-facing schema。
+* Python runtime、`idapro>=0.0.9` 和 `PYTHONPATH` 成为 IDA reverse 能力的运行时
+  前置条件，但不影响 dbgflow Rust 构建和非 IDA 调试能力。
 
 ### D-019: reverse session 与 debug session 分离
 
@@ -732,19 +718,18 @@ linked elevated token 且配置允许，则优先使用 elevated token。
 
 ### P4
 
-* [x] 完成 IDA runtime 探测和 `[reverse.ida] install_dir` 配置设计。
+* [x] 完成 IDA runtime 探测和 `[reverse.ida] install_dir / python_executable / vendor_src_dir / max_workers` 配置设计。
 * [x] 安装脚本探测常见 IDA 安装目录，并在有效时写入 `[reverse.ida].install_dir`。
-* [x] 定义 `ReverseSessionManager` 和 reverse IDA worker 协议。
-* [x] 实现 Rust-first、no-SDK build-time dependency 的 IDA dynamic binding worker MVP。
-* [x] 设计 `ida.*` MCP tool schema 和 session lifecycle。
-* [x] 支持 headless binary / IDB analysis session MVP。
-* [x] 支持只读 segment / function 列表 MVP；direct rich binding 可返回 name / segment 等增强字段。
-* [x] 暴露函数、反汇编、字符串、imports / exports、xrefs、类型和伪代码 typed tool surface，并通过 Rust direct binding dispatch；移除未验证的一函数一块控制流占位工具。
-* [x] 暴露受控 IDB 标注修改 tool surface：rename、comment 和 type，默认 close 时保存。
-* [x] 支持 reverse query / mutation artifacts、审计日志和敏感输出记录。
+* [x] 定义 `ReverseSessionManager` 和 upstream supervisor JSON-RPC client。
+* [x] 废弃 Rust direct-binding IDA worker，改为 vendored `ida-pro-mcp` headless idalib supervisor。
+* [x] 设计 `ida.*` MCP tool schema 和 session lifecycle：管理工具由 dbgflow 提供，upstream 非 debugger tools 以 `ida.<tool_name>` 暴露。
+* [x] 支持 headless binary / IDB analysis session MVP，并将 dbgflow `SessionId` 映射到 upstream database id。
+* [x] 暴露 upstream 函数、反汇编、字符串、imports / exports、xrefs、类型、伪代码和受控 IDB 修改工具；默认排除 `idb_open`、`idb_list`、`dbg_*` 和 `py_exec_file`。
+* [x] `ida.close_session` 默认 `idb_save` 后脱管；保存失败时保留 session 以便重试，资源回收交给 upstream idle TTL。
+* [x] 支持 reverse query / mutation artifacts、upstream `_meta`、大结果下载归档、审计日志和敏感输出记录。
 * [x] reverse outputs 使用唯一 artifact 文件名，避免重复查询或修改覆盖旧审计结果。
-* [ ] 继续强化 Rust direct IDA binding 的版本升级流程，并在未来补齐 Hex-Rays dispatcher；qstring / xrefblk runtime validation 已完成 MVP。
-* [ ] 增强 close/save 结果来源；基础 idalib ABI 只能记录保存请求和 unknown 结果。
+* [ ] 增加真实 IDA / `idapro>=0.0.9` 环境 smoke：create、`server_health`、`list_funcs`、`decompile`、`py_eval`、`idb_save`、close。
+* [ ] 设计 vendored `ida-pro-mcp` 后续 upstream 同步和差异审计流程。
 * [ ] 支持后续 redaction 策略。
 
 ## 9. 近期开发计划
@@ -754,12 +739,9 @@ linked elevated token 且配置允许，则优先使用 elevated token。
 ```text
 1. 统一文档和 tool 描述口径：`dbg.eval` + WinDbg / DbgEng 原生命令是调试主入口
 2. 验证 `.run` trace 打开路径，明确 TTD 分析通过 WinDbg TTD 命令完成还是需要极薄 helper
-3. 完成 idalib / IDA SDK 架构设计、runtime 配置和安全边界设计
-4. 实现 ReverseBackend / ReverseSessionManager / IdaLibBackend worker spike
-5. 设计 `ida.*` tool schema、artifacts 和审计格式
-6. 支持 headless reverse session MVP：加载 binary / IDB 并查询函数、反汇编、xrefs 和伪代码
-7. 支持受控 IDB 标注修改 MVP：rename、comment 和 type
-8. 继续增强 target/path validation、redaction、报告消费格式和真实环境验证
+3. 在真实 IDA / idapro 环境跑 `ida.*` smoke，并补充 env-gated 测试说明
+4. 设计 vendored `ida-pro-mcp` upstream 同步、license attribution 和差异审计流程
+5. 继续增强 target/path validation、redaction、报告消费格式和真实环境验证
 ```
 
 优先保持架构清晰，而不是过早追求完整调试能力。

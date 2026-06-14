@@ -24,7 +24,7 @@ endpoint, and Windows service install / uninstall subcommands:
 - install-time DbgEng symbol path configuration
 - launch-only profiling with native ETW collectors
 - Time Travel Debugging recording with `TTD.exe` for launch, attach, and bounded monitor scenarios
-- IDA dynamic-binding reverse-analysis session MVP without IDA SDK build-time dependencies
+- IDA reverse-analysis sessions through a vendored `ida-pro-mcp` headless idalib supervisor
 
 Current tool names:
 
@@ -40,19 +40,10 @@ Current tool names:
 - `ida.get_session`
 - `ida.list_sessions`
 - `ida.close_session`
-- `ida.get_metadata`
-- `ida.list_segments`
-- `ida.list_functions`
-- `ida.list_strings`
-- `ida.list_imports`
-- `ida.list_exports`
-- `ida.lookup_functions`
-- `ida.disassemble`
-- `ida.decompile`
-- `ida.list_xrefs`
-- `ida.rename`
-- `ida.set_comment`
-- `ida.set_type`
+- upstream `ida-pro-mcp` non-debugger tools exposed as `ida.<tool_name>`, for example
+  `ida.server_health`, `ida.list_funcs`, `ida.func_query`, `ida.disasm`,
+  `ida.decompile`, `ida.xrefs_to`, `ida.imports`, `ida.idb_save`,
+  `ida.rename`, `ida.set_comments`, `ida.set_type`, and `ida.py_eval`
 
 `dbg.create_session` uses get-or-create semantics and returns quickly with a
 `Starting` session while the backend opens the target in the background. Use
@@ -207,51 +198,70 @@ Example TTD recording request:
 ```
 
 `ida.create_session` opens an IDA database or an IDA loader-recognized binary
-input in a long-lived reverse-analysis session. The IDA worker is a separate
-subprocess per reverse session and dynamically loads `idalib.dll` and `ida.dll`
-at runtime. Building dbgflow does not require the IDA SDK, Clang, bindgen,
-`idalib-rs`, or an IDA installation.
+input in a long-lived reverse-analysis session. dbgflow vendors the Python
+runtime from `ida-pro-mcp` and starts one headless idalib supervisor over stdio:
 
-The direct-binding path supports session lifecycle, metadata, segment/function
-listing, and the first Rust-only rich reverse tools through runtime symbols
-loaded from official IDA DLLs. `ida.get_metadata` reports a `rich_api`
-capability matrix for direct bindings, missing symbols, the IDA 9.3 x64 version
-gate, and Hex-Rays availability. Missing rich capabilities return clear
-per-tool errors while the session remains usable for other queries. qstring and
-xrefblk_t based tools are runtime-validated after a database opens; if validation
-cannot find a safe sample or detects an unexpected layout, the affected tools
-stay disabled and `rich_api.warnings` records the concrete reason. `ida.decompile`
-remains an explicit unsupported typed tool until a Hex-Rays dispatcher is
-validated. `ida.set_comment` defaults to the disassembly comment view; requesting
-decompiler or both views fails before writing. dbgflow still does not expose
-arbitrary IDA eval, IDAPython, debugger control, byte/assembly patching, or GUI
-adoption.
+```text
+python -m ida_pro_mcp.idalib_supervisor --stdio --unsafe --profile <generated-profile> --max-workers <n>
+```
 
-`ida.close_session` requests saving the open database by default (`save: true`).
-Existing `.idb` / `.i64` database targets are operated on in place; pass
-`save: false` only when the session changes should be discarded. The base
-`idalib` close ABI does not report whether saving succeeded, so close events
-and session warnings record that save result as `unknown` rather than claiming
-success.
+The supervisor owns the upstream Headless idalib Session Model and manages one
+isolated idalib worker per database. dbgflow keeps the public session selector
+as its own UUID `session_id`, records artifacts/audit logs, serializes calls
+within the same reverse session, and routes different IDA sessions to separate
+upstream workers that can execute independently.
 
-Configure IDA with `[reverse.ida].install_dir`; when omitted, dbgflow uses
-`DBGFLOW_IDA_DIR` when present and then probes
-`C:\Program Files\IDA Professional 9.3`. A
-configured install directory must contain `ida.exe`, `ida.dll`, `idalib.dll`,
-and `ida.hlp`. Reverse artifacts are written under
-`artifacts\reverse_sessions\<session_id>` with `request.json`, `session.json`,
-`events.jsonl`, `worker.log`, and unique per-tool JSON outputs under
-`outputs\`. Paged read APIs return a limited page, but their artifacts retain
-the complete filtered JSON result. Rich paged tools apply a default limit of
-100 and a maximum limit of 10000 before calling the worker.
+Configure IDA with `[reverse.ida]`:
+
+```toml
+[reverse.ida]
+install_dir = "C:\\Program Files\\IDA Professional 9.3"
+python_executable = "C:\\path\\to\\python.exe"       # optional
+vendor_src_dir = "D:\\Repos\\Project\\dbgflow\\vendor\\ida-pro-mcp\\src" # optional
+max_workers = 4                                      # optional
+```
+
+`install_dir` can also come from `DBGFLOW_IDA_DIR`; `python_executable` can come
+from `DBGFLOW_IDA_PYTHON`; `vendor_src_dir` can come from
+`DBGFLOW_IDA_PRO_MCP_SRC`. The selected Python environment must already have
+`idapro>=0.0.9` installed or activated. The configured IDA directory must contain
+`ida.exe`, `ida.dll`, `idalib.dll`, and `ida.hlp`. Building dbgflow does not
+require the IDA SDK, Clang, bindgen, or `idalib-rs`.
+
+The MCP surface keeps dbgflow management tools (`ida.create_session`,
+`ida.get_session`, `ida.list_sessions`, `ida.close_session`) and exposes
+upstream non-debugger tools as `ida.<tool_name>`. dbgflow intentionally does not
+expose upstream `idb_open`, `idb_list`, `dbg_*` debugger tools, or
+`py_exec_file`. `ida.py_eval` is enabled because it is useful for local reverse
+automation, but it executes IDAPython in a trusted local IDA context and should
+be treated as a sensitive capability.
+
+Upstream tool schemas are preserved except that upstream `database` is replaced
+by required dbgflow `session_id`. Successful calls return `{ session_id, tool,
+result, artifact, warnings }`; `result` is upstream `structuredContent`.
+Requests, upstream responses, `_meta`, and downloadable large outputs are stored
+under `artifacts\reverse_sessions\<session_id>\outputs\`.
+
+`ida.close_session` requests saving the upstream database by default
+(`save: true`) by calling `idb_save`, then marks the dbgflow session `Closed` and
+forgets the `session_id` to upstream database mapping. It does not force-kill a
+headless worker or close a GUI IDA instance; upstream idle TTL handles worker
+cleanup. Pass `save: false` only when you want dbgflow to detach without an
+explicit save request. If the save request fails, dbgflow keeps the session
+open and returns an error so the caller can retry or choose an explicit
+`save: false` detach.
 
 Example IDA session request:
 
 ```json
 {
   "target": { "kind": "binary", "path": "C:\\samples\\a.exe" },
+  "mode": "prefer_headless",
   "run_auto_analysis": true,
-  "startup_timeout_ms": 60000
+  "build_caches": true,
+  "init_hexrays": true,
+  "idle_ttl_sec": 3600,
+  "startup_timeout_ms": 1800000
 }
 ```
 

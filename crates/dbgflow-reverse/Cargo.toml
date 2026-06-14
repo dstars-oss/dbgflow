@@ -6,6 +6,5 @@ license.workspace = true
 
 [dependencies]
 dbgflow-common = { path = "../dbgflow-common" }
-libloading.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -5,9 +5,7 @@ use dbgflow_common::process::{ProcessLaunchConfig, ToolCallContext};
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_debug::session::worker::{ProcessWorkerLauncher, SessionWorkerLauncher};
 use dbgflow_debug::session::SessionId;
-use dbgflow_reverse::ida::{
-    IdaRuntimeConfig, IdaSessionManager, ProcessReverseWorkerLauncher, ReverseWorkerLauncher,
-};
+use dbgflow_reverse::ida::{IdaRuntimeConfig, IdaSessionManager};
 use dbgflow_trace::profile::ProfileManager;
 use dbgflow_trace::ttd::{TtdRecorderRuntime, TtdRecordingManager};
 use serde::Deserialize;
@@ -34,7 +32,7 @@ pub struct McpServerConfig {
     pub proxy: ProxyEnvironment,
     pub process_launch: ProcessLaunchConfig,
     pub ttd_dir: Option<PathBuf>,
-    pub ida_install_dir: Option<PathBuf>,
+    pub ida_runtime: IdaRuntimeConfig,
     pub symbol_path: Option<String>,
     pub logger: Arc<dyn LogSink>,
 }
@@ -46,7 +44,7 @@ impl McpServerConfig {
             proxy: ProxyEnvironment::none(),
             process_launch: ProcessLaunchConfig::default(),
             ttd_dir: None,
-            ida_install_dir: None,
+            ida_runtime: IdaRuntimeConfig::default(),
             symbol_path: None,
             logger,
         }
@@ -68,7 +66,12 @@ impl McpServerConfig {
     }
 
     pub fn with_ida_install_dir(mut self, ida_install_dir: Option<PathBuf>) -> Self {
-        self.ida_install_dir = ida_install_dir;
+        self.ida_runtime.install_dir = ida_install_dir;
+        self
+    }
+
+    pub fn with_ida_runtime(mut self, ida_runtime: IdaRuntimeConfig) -> Self {
+        self.ida_runtime = ida_runtime;
         self
     }
 
@@ -190,7 +193,7 @@ impl McpServer {
                 return None;
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": self.service.tool_descriptors() })),
+            "tools/list" => Ok(json!({ "tools": self.service.tool_descriptor_values() })),
             "tools/call" => self.call_tool(
                 message.get("params").cloned().unwrap_or_default(),
                 http_request_id,
@@ -519,7 +522,10 @@ pub fn server_with_data_dir_proxy_ttd_ida_and_symbol_path(
         data_dir,
         proxy,
         ttd_dir,
-        ida_install_dir,
+        IdaRuntimeConfig {
+            install_dir: ida_install_dir,
+            ..Default::default()
+        },
         symbol_path,
         ProcessLaunchConfig::default(),
     )
@@ -529,7 +535,7 @@ pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_and_process(
     data_dir: impl Into<PathBuf>,
     proxy: ProxyEnvironment,
     ttd_dir: Option<PathBuf>,
-    ida_install_dir: Option<PathBuf>,
+    ida_runtime: IdaRuntimeConfig,
     symbol_path: Option<String>,
     process_launch: ProcessLaunchConfig,
 ) -> std::result::Result<McpServer, String> {
@@ -542,7 +548,7 @@ pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_and_process(
         McpServerConfig::new(data_dir, logger)
             .with_proxy(proxy)
             .with_ttd_dir(ttd_dir)
-            .with_ida_install_dir(ida_install_dir)
+            .with_ida_runtime(ida_runtime)
             .with_symbol_path(symbol_path)
             .with_process_launch(process_launch),
     ))
@@ -607,7 +613,10 @@ pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_and_logger(
         data_dir,
         proxy,
         ttd_dir,
-        ida_install_dir,
+        IdaRuntimeConfig {
+            install_dir: ida_install_dir,
+            ..Default::default()
+        },
         symbol_path,
         ProcessLaunchConfig::default(),
         logger,
@@ -618,7 +627,7 @@ pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_process_and_logger(
     data_dir: impl Into<PathBuf>,
     proxy: ProxyEnvironment,
     ttd_dir: Option<PathBuf>,
-    ida_install_dir: Option<PathBuf>,
+    ida_runtime: IdaRuntimeConfig,
     symbol_path: Option<String>,
     process_launch: ProcessLaunchConfig,
     logger: Arc<dyn LogSink>,
@@ -627,7 +636,7 @@ pub fn server_with_data_dir_proxy_ttd_ida_symbol_path_process_and_logger(
         McpServerConfig::new(data_dir, logger)
             .with_proxy(proxy)
             .with_ttd_dir(ttd_dir)
-            .with_ida_install_dir(ida_install_dir)
+            .with_ida_runtime(ida_runtime)
             .with_symbol_path(symbol_path)
             .with_process_launch(process_launch),
     )
@@ -658,12 +667,9 @@ pub fn server_from_config(config: McpServerConfig) -> McpServer {
         config.logger.clone(),
         config.process_launch.clone(),
     );
-    let ida_sessions = IdaSessionManager::with_worker_launcher_runtime_process_and_logger(
-        default_process_reverse_worker_launcher(),
+    let ida_sessions = IdaSessionManager::with_runtime_process_and_logger(
         &artifact_root,
-        IdaRuntimeConfig {
-            install_dir: config.ida_install_dir,
-        },
+        config.ida_runtime,
         config.process_launch,
         config.logger.clone(),
     );
@@ -688,18 +694,6 @@ fn default_process_worker_launcher() -> Arc<dyn SessionWorkerLauncher> {
         })
         .unwrap_or_else(|_| PathBuf::from("dbgflow-mcp"));
     Arc::new(ProcessWorkerLauncher::with_executable(executable))
-}
-
-fn default_process_reverse_worker_launcher() -> Arc<dyn ReverseWorkerLauncher> {
-    let executable = std::env::current_exe()
-        .or_else(|_| {
-            std::env::args_os()
-                .next()
-                .map(PathBuf::from)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "current exe"))
-        })
-        .unwrap_or_else(|_| PathBuf::from("dbgflow-mcp"));
-    Arc::new(ProcessReverseWorkerLauncher::with_executable(executable))
 }
 
 fn is_valid_request_id(id: &Value) -> bool {
@@ -860,17 +854,20 @@ mod tests {
             .iter()
             .any(|target| target["properties"]["kind"]["const"] == "database"));
         assert!(tools.iter().any(|tool| {
-            tool["name"] == "ida.list_segments"
-                && tool["inputSchema"]["required"][0] == "session_id"
+            tool["name"] == "ida.list_funcs" && tool["inputSchema"]["required"][0] == "session_id"
         }));
-        assert!(tools
-            .iter()
-            .any(|tool| tool["name"] == "ida.list_functions"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.server_health"));
         assert!(tools.iter().any(|tool| tool["name"] == "ida.decompile"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.disasm"));
         assert!(tools.iter().any(|tool| tool["name"] == "ida.rename"));
-        assert!(!tools
-            .iter()
-            .any(|tool| tool["name"] == "ida.list_basic_blocks"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.py_eval"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.idb_save"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ida.idb_open"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ida.idb_list"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ida.py_exec_file"));
+        assert!(!tools.iter().any(|tool| tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("ida.dbg_"))));
         let ida_close = tools
             .iter()
             .find(|tool| tool["name"] == "ida.close_session")

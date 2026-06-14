@@ -3,12 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const DBGFLOW_IDA_DIR_ENV: &str = "DBGFLOW_IDA_DIR";
+pub const DBGFLOW_IDA_PYTHON_ENV: &str = "DBGFLOW_IDA_PYTHON";
+pub const DBGFLOW_IDA_PRO_MCP_SRC_ENV: &str = "DBGFLOW_IDA_PRO_MCP_SRC";
 pub const IDA_INSTALL_ENV: &str = "IDADIR";
 const DEFAULT_WINDOWS_IDA_DIR: &str = r"C:\Program Files\IDA Professional 9.3";
+const DEFAULT_MAX_WORKERS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IdaRuntimeConfig {
     pub install_dir: Option<PathBuf>,
+    pub python_executable: Option<PathBuf>,
+    pub vendor_src_dir: Option<PathBuf>,
+    pub max_workers: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +22,14 @@ pub struct IdaInstall {
     pub install_dir: PathBuf,
     pub ida_dll: PathBuf,
     pub idalib_dll: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdaSupervisorRuntime {
+    pub install: IdaInstall,
+    pub python_executable: PathBuf,
+    pub vendor_src_dir: PathBuf,
+    pub max_workers: usize,
 }
 
 pub fn resolve_ida_install(config: &IdaRuntimeConfig) -> Result<IdaInstall> {
@@ -26,6 +40,15 @@ pub fn resolve_ida_install(config: &IdaRuntimeConfig) -> Result<IdaInstall> {
         return validate_ida_install_dir(&path);
     }
     validate_ida_install_dir(Path::new(DEFAULT_WINDOWS_IDA_DIR))
+}
+
+pub fn resolve_supervisor_runtime(config: &IdaRuntimeConfig) -> Result<IdaSupervisorRuntime> {
+    Ok(IdaSupervisorRuntime {
+        install: resolve_ida_install(config)?,
+        python_executable: resolve_python_executable(config),
+        vendor_src_dir: resolve_vendor_src_dir(config)?,
+        max_workers: config.max_workers.unwrap_or(DEFAULT_MAX_WORKERS),
+    })
 }
 
 pub fn validate_ida_install_dir(path: &Path) -> Result<IdaInstall> {
@@ -71,6 +94,64 @@ pub fn validate_ida_install_dir(path: &Path) -> Result<IdaInstall> {
         idalib_dll: install_dir.join("idalib.dll"),
         install_dir,
     })
+}
+
+fn resolve_python_executable(config: &IdaRuntimeConfig) -> PathBuf {
+    config
+        .python_executable
+        .clone()
+        .or_else(|| std::env::var_os(DBGFLOW_IDA_PYTHON_ENV).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("python"))
+}
+
+fn resolve_vendor_src_dir(config: &IdaRuntimeConfig) -> Result<PathBuf> {
+    let candidates = config
+        .vendor_src_dir
+        .clone()
+        .into_iter()
+        .chain(std::env::var_os(DBGFLOW_IDA_PRO_MCP_SRC_ENV).map(PathBuf::from))
+        .chain(current_exe_vendor_src_dir())
+        .chain(workspace_vendor_src_dir())
+        .collect::<Vec<_>>();
+
+    for candidate in candidates {
+        let resolved = absolutize_path(&candidate)?;
+        if resolved
+            .join("ida_pro_mcp")
+            .join("idalib_supervisor.py")
+            .is_file()
+        {
+            return Ok(resolved);
+        }
+    }
+
+    Err(DbgFlowError::Backend(
+        "ida-pro-mcp vendored src directory was not found; set DBGFLOW_IDA_PRO_MCP_SRC".to_string(),
+    ))
+}
+
+fn current_exe_vendor_src_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .map(|dir| dir.join("vendor").join("ida-pro-mcp").join("src"))
+}
+
+fn workspace_vendor_src_dir() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("vendor").join("ida-pro-mcp").join("src"))
+}
+
+fn absolutize_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .map_err(|error| DbgFlowError::Backend(format!("resolve current dir: {error}")))?
+            .join(path))
+    }
 }
 
 #[cfg(test)]

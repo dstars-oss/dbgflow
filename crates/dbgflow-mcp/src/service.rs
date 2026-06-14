@@ -124,7 +124,12 @@ fn run_service(config: ServiceProcessConfig) -> Result<(), String> {
             data_dir,
             config.app.proxy.clone(),
             config.app.ttd_dir.clone(),
-            config.app.ida_install_dir.clone(),
+            dbgflow_reverse::ida::IdaRuntimeConfig {
+                install_dir: config.app.ida_install_dir.clone(),
+                python_executable: config.app.ida_python_executable.clone(),
+                vendor_src_dir: config.app.ida_vendor_src_dir.clone(),
+                max_workers: config.app.ida_max_workers,
+            },
             config.app.symbol_path.clone(),
             config.app.process_launch.clone(),
             logger.clone(),

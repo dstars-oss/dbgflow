@@ -1,7 +1,9 @@
 use dbgflow_common::process::{ChildIdentity, FallbackChildIdentity, ProcessLaunchConfig};
 use dbgflow_common::proxy::ProxyEnvironment;
 use dbgflow_debug::backend::dbgeng::DBGFLOW_DBGENG_DIR_ENV;
-use dbgflow_reverse::ida::DBGFLOW_IDA_DIR_ENV;
+use dbgflow_reverse::ida::{
+    DBGFLOW_IDA_DIR_ENV, DBGFLOW_IDA_PRO_MCP_SRC_ENV, DBGFLOW_IDA_PYTHON_ENV,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -34,6 +36,9 @@ pub struct AppConfig {
     pub ttd_dir: Option<PathBuf>,
     pub dbgeng_dir: Option<PathBuf>,
     pub ida_install_dir: Option<PathBuf>,
+    pub ida_python_executable: Option<PathBuf>,
+    pub ida_vendor_src_dir: Option<PathBuf>,
+    pub ida_max_workers: Option<usize>,
     pub symbol_path: Option<String>,
 }
 
@@ -116,6 +121,24 @@ impl RuntimeConfig {
             .and_then(|ida| ida.install_dir.as_ref())
             .map(|path| parse_ida_install_dir_path(path, "reverse.ida.install_dir"))
             .transpose()?;
+        let ida_python_executable = reverse
+            .as_ref()
+            .and_then(|reverse| reverse.ida.as_ref())
+            .and_then(|ida| ida.python_executable.as_ref())
+            .map(|path| parse_existing_file_path(path, "reverse.ida.python_executable"))
+            .transpose()?;
+        let ida_vendor_src_dir = reverse
+            .as_ref()
+            .and_then(|reverse| reverse.ida.as_ref())
+            .and_then(|ida| ida.vendor_src_dir.as_ref())
+            .map(|path| parse_ida_vendor_src_dir(path, "reverse.ida.vendor_src_dir"))
+            .transpose()?;
+        let ida_max_workers = reverse
+            .as_ref()
+            .and_then(|reverse| reverse.ida.as_ref())
+            .and_then(|ida| ida.max_workers)
+            .map(parse_ida_max_workers)
+            .transpose()?;
         let proxy = proxy_from_config(raw.proxy)?;
         let process_launch = process_launch_from_config(raw.process)?;
 
@@ -134,6 +157,9 @@ impl RuntimeConfig {
                 ttd_dir,
                 dbgeng_dir,
                 ida_install_dir,
+                ida_python_executable,
+                ida_vendor_src_dir,
+                ida_max_workers,
                 symbol_path,
             },
         })
@@ -279,6 +305,9 @@ fn parse_legacy_http_options(args: Vec<OsString>) -> Result<AppConfig, String> {
         ttd_dir: None,
         dbgeng_dir: None,
         ida_install_dir: None,
+        ida_python_executable: None,
+        ida_vendor_src_dir: None,
+        ida_max_workers: None,
         symbol_path: None,
     })
 }
@@ -434,7 +463,7 @@ where
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  dbgflow-mcp http --bind <addr> --data-dir <path> [options]\n  dbgflow-mcp http --config <path>                Run local HTTP MCP transport\n  dbgflow-mcp service run --config <path>         Run as a Windows service process\n  dbgflow-mcp service install --config <path>     Install and start the Windows service\n  dbgflow-mcp service uninstall [options]         Stop, uninstall, and remove install root\n  dbgflow-mcp worker session                      Run an internal debug session worker process\n  dbgflow-mcp worker reverse-ida                  Run an internal IDA reverse worker process\n\nHTTP options:\n  --bind <addr>                                   Loopback bind address; default 127.0.0.1:7331\n  --data-dir <path>                               Required for direct HTTP mode\n  --proxy-url <url>                               Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars\n  --no-proxy                                     Clears known proxy vars for session workers"
+    "Usage:\n  dbgflow-mcp http --bind <addr> --data-dir <path> [options]\n  dbgflow-mcp http --config <path>                Run local HTTP MCP transport\n  dbgflow-mcp service run --config <path>         Run as a Windows service process\n  dbgflow-mcp service install --config <path>     Install and start the Windows service\n  dbgflow-mcp service uninstall [options]         Stop, uninstall, and remove install root\n  dbgflow-mcp worker session                      Run an internal debug session worker process\n\nHTTP options:\n  --bind <addr>                                   Loopback bind address; default 127.0.0.1:7331\n  --data-dir <path>                               Required for direct HTTP mode\n  --proxy-url <url>                               Sets _NT_SYMBOL_PROXY plus HTTP(S) proxy vars\n  --no-proxy                                     Clears known proxy vars for session workers"
 }
 
 pub fn service_install_help_text() -> &'static str {
@@ -455,6 +484,16 @@ pub fn apply_runtime_environment(config: &AppConfig) {
         std::env::set_var(DBGFLOW_IDA_DIR_ENV, ida_install_dir);
     } else {
         std::env::remove_var(DBGFLOW_IDA_DIR_ENV);
+    }
+    if let Some(python_executable) = &config.ida_python_executable {
+        std::env::set_var(DBGFLOW_IDA_PYTHON_ENV, python_executable);
+    } else {
+        std::env::remove_var(DBGFLOW_IDA_PYTHON_ENV);
+    }
+    if let Some(vendor_src_dir) = &config.ida_vendor_src_dir {
+        std::env::set_var(DBGFLOW_IDA_PRO_MCP_SRC_ENV, vendor_src_dir);
+    } else {
+        std::env::remove_var(DBGFLOW_IDA_PRO_MCP_SRC_ENV);
     }
 }
 
@@ -576,6 +615,9 @@ struct RawReverseConfig {
 #[derive(Debug, Deserialize)]
 struct RawReverseIdaConfig {
     install_dir: Option<PathBuf>,
+    python_executable: Option<PathBuf>,
+    vendor_src_dir: Option<PathBuf>,
+    max_workers: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -704,6 +746,24 @@ fn parse_ida_install_dir_path(path: &Path, label: &str) -> Result<PathBuf, Strin
         .map_err(|error| error.to_string())
 }
 
+fn parse_ida_vendor_src_dir(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = parse_existing_dir_path(path, label)?;
+    if !path.join("ida_pro_mcp").is_dir() {
+        return Err(format!(
+            "{label} must point to a vendored ida-pro-mcp src directory containing ida_pro_mcp: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn parse_ida_max_workers(max_workers: usize) -> Result<usize, String> {
+    if max_workers == 0 {
+        return Err("reverse.ida.max_workers must be greater than zero".to_string());
+    }
+    Ok(max_workers)
+}
+
 fn infer_ttd_dir_from_dbgeng_dir(dbgeng_dir: Option<&Path>) -> Option<PathBuf> {
     let dbgeng_dir = dbgeng_dir?;
     let ttd_dir = dbgeng_dir.join("ttd");
@@ -728,6 +788,17 @@ fn parse_existing_dir_path(path: &Path, label: &str) -> Result<PathBuf, String> 
     if !path.is_dir() {
         return Err(format!(
             "{label} must point to an existing directory: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn parse_existing_file_path(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let path = normalize_absolute_required(path, label)?;
+    if !path.is_file() {
+        return Err(format!(
+            "{label} must point to an existing file: {}",
             path.display()
         ));
     }
@@ -1009,10 +1080,14 @@ mod tests {
         let dbgeng = root.join("dbgeng");
         let ttd = root.join("ttd");
         let ida = root.join("ida");
+        let python = root.join("python").join("python.exe");
+        let vendor_src = root.join("vendor").join("ida-pro-mcp").join("src");
         std::fs::create_dir_all(&dbgeng).expect("create dbgeng dir");
         std::fs::create_dir_all(&ttd).expect("create ttd dir");
         touch(dbgeng.join("dbgeng.dll"));
         touch(ttd.join("TTD.exe"));
+        touch(python.clone());
+        std::fs::create_dir_all(vendor_src.join("ida_pro_mcp")).expect("create vendored package");
         for file_name in ["ida.exe", "ida.dll", "idalib.dll", "ida.hlp"] {
             touch(ida.join(file_name));
         }
@@ -1041,6 +1116,9 @@ ttd_dir = "{}"
 
 [reverse.ida]
 install_dir = "{}"
+python_executable = "{}"
+vendor_src_dir = "{}"
+max_workers = 8
 
 [proxy]
 mode = "url"
@@ -1051,6 +1129,8 @@ url = "http://127.0.0.1:7897"
                 toml_path(&dbgeng),
                 toml_path(&ttd),
                 toml_path(&ida),
+                toml_path(&python),
+                toml_path(&vendor_src),
             ),
         );
 
@@ -1073,6 +1153,15 @@ url = "http://127.0.0.1:7897"
             config.app.ida_install_dir.as_deref(),
             Some(canonical_ida.as_path())
         );
+        assert_eq!(
+            config.app.ida_python_executable.as_deref(),
+            Some(python.as_path())
+        );
+        assert_eq!(
+            config.app.ida_vendor_src_dir.as_deref(),
+            Some(vendor_src.as_path())
+        );
+        assert_eq!(config.app.ida_max_workers, Some(8));
         assert_eq!(
             config.app.process_launch,
             ProcessLaunchConfig {

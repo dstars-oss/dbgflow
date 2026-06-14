@@ -1,4 +1,3 @@
-mod dynamic;
 mod install;
 mod manager;
 mod model;
@@ -6,22 +5,18 @@ mod target;
 pub mod worker;
 
 pub use install::{
-    resolve_ida_install, validate_ida_install_dir, IdaInstall, IdaRuntimeConfig,
-    DBGFLOW_IDA_DIR_ENV,
+    resolve_ida_install, resolve_supervisor_runtime, validate_ida_install_dir, IdaInstall,
+    IdaRuntimeConfig, IdaSupervisorRuntime, DBGFLOW_IDA_DIR_ENV, DBGFLOW_IDA_PRO_MCP_SRC_ENV,
+    DBGFLOW_IDA_PYTHON_ENV,
 };
-pub use manager::{
-    CreateIdaSession, DecompileSessionResult, DisassembleResult, IdaSessionManager,
-    ListExportsResult, ListFunctionsResult, ListImportsResult, ListSegmentsResult,
-    ListStringsResult, ListXrefsResult, LookupFunctionsResult, MetadataResult, MutationResult,
-};
+pub use manager::{CreateIdaSession, IdaSessionManager};
 pub use model::{
-    CloseDatabaseResult, CommentItem, CommentView, DecompileRequest, DecompileResult,
-    DirectIdaCapabilities, DisassembleRequest, Disassembly, DisassemblyLine, ExportInfo,
-    FunctionInfo, FunctionLookup, IdaInfo, IdaMetadata, IdaRichApiStatus, IdaVersion, ImportInfo,
-    ListXrefsRequest, LookupFunctionsRequest, MutationItemResult, PageInfo, PageRequest,
-    RenameItem, RenameRequest, ReverseSession, ReverseSessionState, SaveStatus, SegmentInfo,
-    SetCommentRequest, SetTypeRequest, StringInfo, TypeItem, XrefDirection, XrefInfo, XrefKind,
-    XrefsResult,
+    CloseDatabaseResult, IdaOpenMode, IdaSessionHealth, IdaToolCallResult, IdaUpstreamSession,
+    ReverseSession, ReverseSessionState, SaveStatus, UpstreamIdaToolRequest,
+    UpstreamToolDescriptor,
 };
 pub use target::{validate_ida_target, IdaTarget};
-pub use worker::{ProcessReverseWorkerLauncher, ReverseWorkerLauncher};
+pub use worker::{
+    fallback_tool_descriptors, is_allowed_upstream_tool, IdaSupervisor, OpenIdaDatabase,
+    OpenIdaDatabaseResult, ProcessIdaSupervisor, SupervisorToolCallResult,
+};

@@ -4,17 +4,13 @@ use dbgflow_common::{DbgFlowError, Result};
 use dbgflow_debug::backend::DebugTarget;
 use dbgflow_debug::session::{EvalSessionResult, Session, SessionId, SessionManager};
 use dbgflow_reverse::ida::{
-    CommentItem, CommentView, CreateIdaSession, DecompileRequest, DecompileSessionResult,
-    DisassembleRequest, DisassembleResult, IdaRuntimeConfig, IdaSessionManager, ListExportsResult,
-    ListFunctionsResult, ListImportsResult, ListSegmentsResult, ListStringsResult,
-    ListXrefsRequest, ListXrefsResult, LookupFunctionsRequest, LookupFunctionsResult,
-    MetadataResult, MutationResult, PageRequest, RenameItem, RenameRequest, ReverseSession,
-    SetCommentRequest, SetTypeRequest, TypeItem, XrefDirection, XrefKind,
+    CreateIdaSession, IdaSessionManager, IdaToolCallResult, ReverseSession, UpstreamIdaToolRequest,
+    UpstreamToolDescriptor,
 };
 use dbgflow_trace::profile::{ProfileCollectorConfig, ProfileManager, ProfileResult, RunProfile};
 use dbgflow_trace::ttd::{RecordTtd, TtdRecordingManager, TtdRecordingResult};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -31,19 +27,7 @@ pub const IDA_CREATE_SESSION: &str = "ida.create_session";
 pub const IDA_GET_SESSION: &str = "ida.get_session";
 pub const IDA_LIST_SESSIONS: &str = "ida.list_sessions";
 pub const IDA_CLOSE_SESSION: &str = "ida.close_session";
-pub const IDA_GET_METADATA: &str = "ida.get_metadata";
-pub const IDA_LIST_SEGMENTS: &str = "ida.list_segments";
-pub const IDA_LIST_FUNCTIONS: &str = "ida.list_functions";
-pub const IDA_LIST_STRINGS: &str = "ida.list_strings";
-pub const IDA_LIST_IMPORTS: &str = "ida.list_imports";
-pub const IDA_LIST_EXPORTS: &str = "ida.list_exports";
-pub const IDA_LOOKUP_FUNCTIONS: &str = "ida.lookup_functions";
-pub const IDA_DISASSEMBLE: &str = "ida.disassemble";
-pub const IDA_DECOMPILE: &str = "ida.decompile";
-pub const IDA_LIST_XREFS: &str = "ida.list_xrefs";
-pub const IDA_RENAME: &str = "ida.rename";
-pub const IDA_SET_COMMENT: &str = "ida.set_comment";
-pub const IDA_SET_TYPE: &str = "ida.set_type";
+const IDA_PREFIX: &str = "ida.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -67,7 +51,7 @@ impl ToolService {
             sessions,
             profiles: ProfileManager::new("artifacts"),
             ttd_recordings: TtdRecordingManager::new("artifacts"),
-            ida_sessions: IdaSessionManager::new("artifacts", IdaRuntimeConfig::default()),
+            ida_sessions: IdaSessionManager::new("artifacts", Default::default()),
         }
     }
 
@@ -76,7 +60,7 @@ impl ToolService {
             sessions,
             profiles,
             ttd_recordings: TtdRecordingManager::new("artifacts"),
-            ida_sessions: IdaSessionManager::new("artifacts", IdaRuntimeConfig::default()),
+            ida_sessions: IdaSessionManager::new("artifacts", Default::default()),
         }
     }
 
@@ -89,7 +73,7 @@ impl ToolService {
             sessions,
             profiles,
             ttd_recordings,
-            ida_sessions: IdaSessionManager::new("artifacts", IdaRuntimeConfig::default()),
+            ida_sessions: IdaSessionManager::new("artifacts", Default::default()),
         }
     }
 
@@ -116,12 +100,27 @@ impl ToolService {
             sessions: SessionManager::with_artifact_root(&root),
             profiles: ProfileManager::new(&root),
             ttd_recordings: TtdRecordingManager::new(&root),
-            ida_sessions: IdaSessionManager::new(&root, IdaRuntimeConfig::default()),
+            ida_sessions: IdaSessionManager::new(&root, Default::default()),
         }
     }
 
     pub fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
         super::schema::tool_descriptors()
+    }
+
+    pub fn tool_descriptor_values(&self) -> Vec<Value> {
+        let mut tools = self
+            .tool_descriptors()
+            .into_iter()
+            .filter_map(|descriptor| serde_json::to_value(descriptor).ok())
+            .collect::<Vec<_>>();
+        tools.extend(
+            self.ida_sessions
+                .upstream_tool_descriptors()
+                .into_iter()
+                .map(upstream_tool_descriptor_value),
+        );
+        tools
     }
 
     pub fn create_session(&self, request: CreateSessionRequest) -> Result<Session> {
@@ -205,104 +204,12 @@ impl ToolService {
         self.ida_sessions.close_session_with_save(session_id, save)
     }
 
-    pub fn get_ida_metadata(&self, session_id: SessionId) -> Result<MetadataResult> {
-        self.ida_sessions.get_metadata(session_id)
-    }
-
-    pub fn list_ida_segments(
+    pub fn call_ida_upstream_tool(
         &self,
-        session_id: SessionId,
-        page: PageRequest,
-    ) -> Result<ListSegmentsResult> {
-        self.ida_sessions.list_segments_page(session_id, page)
-    }
-
-    pub fn list_ida_functions(
-        &self,
-        session_id: SessionId,
-        page: PageRequest,
-    ) -> Result<ListFunctionsResult> {
-        self.ida_sessions.list_functions_page(session_id, page)
-    }
-
-    pub fn list_ida_strings(
-        &self,
-        session_id: SessionId,
-        page: PageRequest,
-    ) -> Result<ListStringsResult> {
-        self.ida_sessions.list_strings(session_id, page)
-    }
-
-    pub fn list_ida_imports(
-        &self,
-        session_id: SessionId,
-        page: PageRequest,
-    ) -> Result<ListImportsResult> {
-        self.ida_sessions.list_imports(session_id, page)
-    }
-
-    pub fn list_ida_exports(
-        &self,
-        session_id: SessionId,
-        page: PageRequest,
-    ) -> Result<ListExportsResult> {
-        self.ida_sessions.list_exports(session_id, page)
-    }
-
-    pub fn lookup_ida_functions(
-        &self,
-        session_id: SessionId,
-        request: LookupFunctionsRequest,
-    ) -> Result<LookupFunctionsResult> {
-        self.ida_sessions.lookup_functions(session_id, request)
-    }
-
-    pub fn disassemble_ida(
-        &self,
-        session_id: SessionId,
-        request: DisassembleRequest,
-    ) -> Result<DisassembleResult> {
-        self.ida_sessions.disassemble(session_id, request)
-    }
-
-    pub fn decompile_ida(
-        &self,
-        session_id: SessionId,
-        request: DecompileRequest,
-    ) -> Result<DecompileSessionResult> {
-        self.ida_sessions.decompile(session_id, request)
-    }
-
-    pub fn list_ida_xrefs(
-        &self,
-        session_id: SessionId,
-        request: ListXrefsRequest,
-    ) -> Result<ListXrefsResult> {
-        self.ida_sessions.list_xrefs(session_id, request)
-    }
-
-    pub fn rename_ida(
-        &self,
-        session_id: SessionId,
-        request: RenameRequest,
-    ) -> Result<MutationResult> {
-        self.ida_sessions.rename(session_id, request)
-    }
-
-    pub fn set_ida_comment(
-        &self,
-        session_id: SessionId,
-        request: SetCommentRequest,
-    ) -> Result<MutationResult> {
-        self.ida_sessions.set_comment(session_id, request)
-    }
-
-    pub fn set_ida_type(
-        &self,
-        session_id: SessionId,
-        request: SetTypeRequest,
-    ) -> Result<MutationResult> {
-        self.ida_sessions.set_type(session_id, request)
+        tool_name: &str,
+        request: UpstreamIdaToolRequest,
+    ) -> Result<IdaToolCallResult> {
+        self.ida_sessions.call_upstream_tool(tool_name, request)
     }
 
     pub fn subscribe_session_updates(&self) -> mpsc::Receiver<SessionId> {
@@ -380,81 +287,9 @@ impl ToolService {
                     .map_err(ToolCallError::execution)
                     .and_then(to_value)
             }
-            IDA_GET_METADATA => {
-                let request: GetIdaSessionRequest = decode_arguments(arguments)?;
-                self.get_ida_metadata(request.session_id)
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LIST_SEGMENTS => {
-                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
-                self.list_ida_segments(request.session_id, request.page())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LIST_FUNCTIONS => {
-                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
-                self.list_ida_functions(request.session_id, request.page())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LIST_STRINGS => {
-                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
-                self.list_ida_strings(request.session_id, request.page())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LIST_IMPORTS => {
-                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
-                self.list_ida_imports(request.session_id, request.page())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LIST_EXPORTS => {
-                let request: ListIdaPagedRequest = decode_arguments(arguments)?;
-                self.list_ida_exports(request.session_id, request.page())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LOOKUP_FUNCTIONS => {
-                let request: IdaLookupFunctionsToolRequest = decode_arguments(arguments)?;
-                self.lookup_ida_functions(request.session_id, request.into_inner())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_DISASSEMBLE => {
-                let request: IdaDisassembleToolRequest = decode_arguments(arguments)?;
-                self.disassemble_ida(request.session_id, request.into_inner())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_DECOMPILE => {
-                let request: IdaDecompileToolRequest = decode_arguments(arguments)?;
-                self.decompile_ida(request.session_id, request.into_inner())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_LIST_XREFS => {
-                let request: IdaListXrefsToolRequest = decode_arguments(arguments)?;
-                self.list_ida_xrefs(request.session_id, request.into_inner())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_RENAME => {
-                let request: IdaRenameToolRequest = decode_arguments(arguments)?;
-                self.rename_ida(request.session_id, request.into_inner())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_SET_COMMENT => {
-                let request: IdaSetCommentToolRequest = decode_arguments(arguments)?;
-                self.set_ida_comment(request.session_id, request.into_inner())
-                    .map_err(ToolCallError::execution)
-                    .and_then(to_value)
-            }
-            IDA_SET_TYPE => {
-                let request: IdaSetTypeToolRequest = decode_arguments(arguments)?;
-                self.set_ida_type(request.session_id, request.into_inner())
+            _ if name.starts_with(IDA_PREFIX) => {
+                let upstream_name = &name[IDA_PREFIX.len()..];
+                self.call_ida_upstream_tool(upstream_name, decode_arguments(arguments)?)
                     .map_err(ToolCallError::execution)
                     .and_then(to_value)
             }
@@ -526,165 +361,6 @@ pub struct CloseIdaSessionRequest {
     pub session_id: SessionId,
     #[serde(default = "default_close_ida_save")]
     pub save: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ListIdaPagedRequest {
-    pub session_id: SessionId,
-    #[serde(default)]
-    pub offset: usize,
-    pub limit: Option<usize>,
-    pub filter: Option<String>,
-}
-
-impl ListIdaPagedRequest {
-    fn page(self) -> PageRequest {
-        PageRequest {
-            offset: self.offset,
-            limit: self.limit,
-            filter: self.filter,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdaLookupFunctionsToolRequest {
-    pub session_id: SessionId,
-    pub queries: Vec<String>,
-}
-
-impl IdaLookupFunctionsToolRequest {
-    fn into_inner(self) -> LookupFunctionsRequest {
-        LookupFunctionsRequest {
-            queries: self.queries,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdaDisassembleToolRequest {
-    pub session_id: SessionId,
-    pub target: String,
-    #[serde(default)]
-    pub offset: usize,
-    pub limit: Option<usize>,
-}
-
-impl IdaDisassembleToolRequest {
-    fn into_inner(self) -> DisassembleRequest {
-        DisassembleRequest {
-            target: self.target,
-            offset: self.offset,
-            limit: self.limit,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdaDecompileToolRequest {
-    pub session_id: SessionId,
-    pub target: String,
-    #[serde(default = "default_include_addresses")]
-    pub include_addresses: bool,
-}
-
-impl IdaDecompileToolRequest {
-    fn into_inner(self) -> DecompileRequest {
-        DecompileRequest {
-            target: self.target,
-            include_addresses: self.include_addresses,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdaListXrefsToolRequest {
-    pub session_id: SessionId,
-    pub target: String,
-    #[serde(default = "default_xref_direction")]
-    pub direction: XrefDirection,
-    #[serde(default = "default_xref_kind")]
-    pub kind: XrefKind,
-    #[serde(default)]
-    pub offset: usize,
-    pub limit: Option<usize>,
-}
-
-impl IdaListXrefsToolRequest {
-    fn into_inner(self) -> ListXrefsRequest {
-        ListXrefsRequest {
-            target: self.target,
-            direction: self.direction,
-            kind: self.kind,
-            offset: self.offset,
-            limit: self.limit,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdaRenameToolRequest {
-    pub session_id: SessionId,
-    pub items: Vec<RenameItem>,
-    #[serde(default)]
-    pub dry_run: bool,
-    #[serde(default)]
-    pub allow_overwrite: bool,
-}
-
-impl IdaRenameToolRequest {
-    fn into_inner(self) -> RenameRequest {
-        RenameRequest {
-            items: self.items,
-            dry_run: self.dry_run,
-            allow_overwrite: self.allow_overwrite,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdaSetCommentToolRequest {
-    pub session_id: SessionId,
-    pub items: Vec<CommentItem>,
-    #[serde(default)]
-    pub repeatable: bool,
-    #[serde(default = "default_comment_view")]
-    pub view: CommentView,
-}
-
-impl IdaSetCommentToolRequest {
-    fn into_inner(self) -> SetCommentRequest {
-        SetCommentRequest {
-            items: self.items,
-            repeatable: self.repeatable,
-            view: self.view,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdaSetTypeToolRequest {
-    pub session_id: SessionId,
-    pub items: Vec<TypeItem>,
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-impl IdaSetTypeToolRequest {
-    fn into_inner(self) -> SetTypeRequest {
-        SetTypeRequest {
-            items: self.items,
-            dry_run: self.dry_run,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -799,20 +475,54 @@ fn default_close_ida_save() -> bool {
     true
 }
 
-fn default_include_addresses() -> bool {
-    true
+fn upstream_tool_descriptor_value(tool: UpstreamToolDescriptor) -> Value {
+    let mut input_schema = tool.input_schema;
+    inject_session_id_schema(&mut input_schema);
+    let mut descriptor = Map::new();
+    descriptor.insert(
+        "name".to_string(),
+        Value::String(format!("ida.{}", tool.name)),
+    );
+    descriptor.insert("description".to_string(), Value::String(tool.description));
+    descriptor.insert("inputSchema".to_string(), input_schema);
+    if let Some(output_schema) = tool.output_schema {
+        descriptor.insert("outputSchema".to_string(), output_schema);
+    }
+    Value::Object(descriptor)
 }
 
-fn default_xref_direction() -> XrefDirection {
-    XrefDirection::Both
-}
-
-fn default_xref_kind() -> XrefKind {
-    XrefKind::Any
-}
-
-fn default_comment_view() -> CommentView {
-    CommentView::Disassembly
+fn inject_session_id_schema(schema: &mut Value) {
+    if !schema.is_object() {
+        *schema = json!({"type": "object"});
+    }
+    let object = schema.as_object_mut().expect("object schema");
+    object.insert("type".to_string(), Value::String("object".to_string()));
+    let properties = object
+        .entry("properties")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !properties.is_object() {
+        *properties = Value::Object(Map::new());
+    }
+    let props = properties.as_object_mut().expect("properties");
+    props.remove("database");
+    props.insert(
+        "session_id".to_string(),
+        json!({
+            "type": "string",
+            "description": "dbgflow IDA session id returned by ida.create_session."
+        }),
+    );
+    let required = object
+        .entry("required")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !required.is_array() {
+        *required = Value::Array(Vec::new());
+    }
+    let req = required.as_array_mut().expect("required");
+    req.retain(|item| item.as_str() != Some("database"));
+    if !req.iter().any(|item| item.as_str() == Some("session_id")) {
+        req.push(Value::String("session_id".to_string()));
+    }
 }
 
 #[cfg(test)]
@@ -825,6 +535,83 @@ mod tests {
         RecordTtd, TtdRecordMode, TtdRecordingOptions, TtdReplayCpuSupport, TtdTarget,
     };
     use serde_json::json;
+
+    #[test]
+    fn tool_descriptors_include_ida_management_and_upstream_surface() {
+        let service = ToolService::new_for_tests();
+        let tools = service.tool_descriptor_values();
+
+        assert!(tools.iter().any(|tool| tool["name"] == IDA_CREATE_SESSION));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.decompile"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.py_eval"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ida.idb_save"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ida.idb_open"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ida.idb_list"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ida.py_exec_file"));
+        assert!(!tools.iter().any(|tool| tool["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("ida.dbg_"))));
+
+        let decompile = tools
+            .iter()
+            .find(|tool| tool["name"] == "ida.decompile")
+            .expect("decompile");
+        assert!(decompile["inputSchema"]["properties"]
+            .get("session_id")
+            .is_some());
+        assert!(decompile["inputSchema"]["properties"]
+            .get("database")
+            .is_none());
+    }
+
+    #[test]
+    fn ida_create_session_arguments_decode_upstream_options() {
+        let value = json!({
+            "target": {
+                "kind": "binary",
+                "path": "C:\\samples\\a.exe"
+            },
+            "run_auto_analysis": false,
+            "build_caches": false,
+            "init_hexrays": true,
+            "mode": "force_headless",
+            "idle_ttl_sec": 7200,
+            "startup_timeout_ms": 60000
+        });
+
+        let request: CreateIdaSession = decode_arguments(value).expect("decode ida create");
+
+        assert!(!request.run_auto_analysis);
+        assert!(!request.build_caches);
+        assert!(request.init_hexrays);
+        assert_eq!(request.idle_ttl_sec, 7200);
+        assert_eq!(request.startup_timeout_ms, Some(60000));
+    }
+
+    #[test]
+    fn ida_close_session_defaults_to_save() {
+        let value = json!({
+            "session_id": "00000000-0000-0000-0000-000000000000"
+        });
+
+        let request: CloseIdaSessionRequest = decode_arguments(value).expect("decode close");
+
+        assert!(request.save);
+    }
+
+    #[test]
+    fn upstream_ida_tool_request_keeps_extra_arguments() {
+        let value = json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "addr": "main",
+            "count": 10
+        });
+
+        let request: UpstreamIdaToolRequest = decode_arguments(value).expect("decode upstream");
+
+        assert_eq!(request.arguments["addr"], "main");
+        assert_eq!(request.arguments["count"], 10);
+    }
 
     #[test]
     fn tool_descriptors_include_record_profile() {
@@ -852,185 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_descriptors_include_record_ttd() {
-        let service = ToolService::new_for_tests();
-
-        let descriptors = service.tool_descriptors();
-        let record_ttd = descriptors
-            .iter()
-            .find(|descriptor| descriptor.name == RECORD_TTD)
-            .expect("trace.record_ttd descriptor");
-
-        assert!(record_ttd.description.contains("TTD"));
-        assert_eq!(record_ttd.input_schema["type"], "object");
-        assert!(record_ttd.input_schema["properties"]["target"]["oneOf"]
-            .as_array()
-            .expect("target variants")
-            .iter()
-            .any(|target| target["properties"]["kind"]["const"] == "monitor"));
-    }
-
-    #[test]
-    fn tool_descriptors_include_ida_session_tools() {
-        let service = ToolService::new_for_tests();
-
-        let descriptors = service.tool_descriptors();
-
-        assert!(descriptors
-            .iter()
-            .any(|descriptor| descriptor.name == IDA_CREATE_SESSION));
-        assert!(descriptors
-            .iter()
-            .any(|descriptor| descriptor.name == IDA_LIST_SEGMENTS));
-        assert!(descriptors
-            .iter()
-            .any(|descriptor| descriptor.name == IDA_LIST_FUNCTIONS));
-        for name in [
-            IDA_GET_METADATA,
-            IDA_LIST_STRINGS,
-            IDA_LIST_IMPORTS,
-            IDA_LIST_EXPORTS,
-            IDA_LOOKUP_FUNCTIONS,
-            IDA_DISASSEMBLE,
-            IDA_DECOMPILE,
-            IDA_LIST_XREFS,
-            IDA_RENAME,
-            IDA_SET_COMMENT,
-            IDA_SET_TYPE,
-        ] {
-            assert!(
-                descriptors.iter().any(|descriptor| descriptor.name == name),
-                "missing descriptor {name}"
-            );
-        }
-        let close = descriptors
-            .iter()
-            .find(|descriptor| descriptor.name == IDA_CLOSE_SESSION)
-            .expect("ida.close_session descriptor");
-        assert!(close.input_schema["properties"].get("save").is_some());
-        assert!(!descriptors
-            .iter()
-            .any(|descriptor| descriptor.name == "ida.list_basic_blocks"));
-    }
-
-    #[test]
-    fn ida_create_session_arguments_decode_binary_target() {
-        let value = json!({
-            "target": {
-                "kind": "binary",
-                "path": "C:\\samples\\a.exe"
-            },
-            "run_auto_analysis": true,
-            "startup_timeout_ms": 60000
-        });
-
-        let request: CreateIdaSession = decode_arguments(value).expect("decode ida create");
-
-        assert!(matches!(
-            request.target,
-            dbgflow_reverse::ida::IdaTarget::Binary { .. }
-        ));
-        assert!(request.run_auto_analysis);
-        assert_eq!(request.startup_timeout_ms, Some(60000));
-    }
-
-    #[test]
-    fn ida_create_session_arguments_reject_unknown_target_kind() {
-        let value = json!({
-            "target": {
-                "kind": "probe",
-                "path": "C:\\samples\\a.exe"
-            }
-        });
-
-        let error =
-            decode_arguments::<CreateIdaSession>(value).expect_err("reject unknown ida target");
-
-        assert!(error.to_string().contains("probe"));
-    }
-
-    #[test]
-    fn ida_close_session_defaults_to_save() {
-        let value = json!({
-            "session_id": "00000000-0000-0000-0000-000000000000"
-        });
-
-        let request: CloseIdaSessionRequest = decode_arguments(value).expect("decode close");
-
-        assert!(request.save);
-    }
-
-    #[test]
-    fn ida_tool_arguments_decode_rich_requests() {
-        let xrefs = json!({
-            "session_id": "00000000-0000-0000-0000-000000000000",
-            "target": "main",
-            "direction": "to",
-            "kind": "code",
-            "offset": 10,
-            "limit": 20
-        });
-        let comments = json!({
-            "session_id": "00000000-0000-0000-0000-000000000000",
-            "items": [
-                { "target": "0x401000", "comment": "entry point" }
-            ],
-            "repeatable": true,
-            "view": "both"
-        });
-
-        let xrefs: IdaListXrefsToolRequest = decode_arguments(xrefs).expect("decode xrefs");
-        let comments: IdaSetCommentToolRequest =
-            decode_arguments(comments).expect("decode comments");
-
-        assert_eq!(xrefs.direction, XrefDirection::To);
-        assert_eq!(xrefs.kind, XrefKind::Code);
-        assert_eq!(xrefs.offset, 10);
-        assert_eq!(comments.view, CommentView::Both);
-        assert!(comments.repeatable);
-    }
-
-    #[test]
-    fn ida_set_comment_defaults_to_disassembly_view() {
-        let comments = json!({
-            "session_id": "00000000-0000-0000-0000-000000000000",
-            "items": [
-                { "target": "0x401000", "comment": "entry point" }
-            ]
-        });
-
-        let comments: IdaSetCommentToolRequest =
-            decode_arguments(comments).expect("decode comments");
-
-        assert_eq!(comments.view, CommentView::Disassembly);
-    }
-
-    #[test]
-    fn tools_call_lists_ida_sessions_without_ida_runtime() {
-        let service = ToolService::new_for_tests();
-
-        let value = service
-            .call_tool(IDA_LIST_SESSIONS, json!({}))
-            .expect("list ida sessions");
-
-        assert_eq!(value.as_array().expect("sessions array").len(), 0);
-    }
-
-    #[test]
-    fn tools_call_rejects_removed_ida_basic_blocks_tool() {
-        let service = ToolService::new_for_tests();
-
-        let error = service
-            .call_tool(
-                "ida.list_basic_blocks",
-                json!({ "session_id": SessionId::new(), "target": "0x1000" }),
-            )
-            .expect_err("removed tool is rejected");
-
-        assert!(error.to_string().contains("unknown tool"));
-    }
-
-    #[test]
     fn run_profile_arguments_decode_to_launch_target_and_native_etw() {
         let value = json!({
             "target": {
@@ -1049,7 +657,7 @@ mod tests {
             ]
         });
 
-        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
+        let request = decode_arguments::<RunProfileRequest>(value).expect("decode request");
         assert_eq!(request.timeout_ms, 1000);
         assert_eq!(request.collectors.len(), 1);
         assert_eq!(
@@ -1076,7 +684,7 @@ mod tests {
             "timeout_ms": 1000
         });
 
-        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
+        let request = decode_arguments::<RunProfileRequest>(value).expect("decode request");
         assert_eq!(request.collectors.len(), 1);
         assert!(matches!(
             request.collectors[0],
@@ -1086,124 +694,6 @@ mod tests {
                 stacks: EtwStackConfig { enabled: true }
             } if event_sets == &vec![EtwEventSet::Process, EtwEventSet::FileIo]
         ));
-    }
-
-    #[test]
-    fn run_profile_arguments_decode_native_etw_file_io_event_set() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "collectors": [
-                {
-                    "kind": "native_etw",
-                    "scope": { "kind": "target_process" },
-                    "event_sets": ["process", "file_io"]
-                }
-            ]
-        });
-
-        let request: RunProfileRequest = decode_arguments(value).expect("decode request");
-
-        assert!(matches!(
-            request.collectors[0],
-            ProfileCollectorConfig::NativeEtw {
-                scope: EtwProfileScope::TargetProcess,
-                ref event_sets,
-                stacks: EtwStackConfig { enabled: true }
-            } if event_sets == &vec![EtwEventSet::Process, EtwEventSet::FileIo]
-        ));
-    }
-
-    #[test]
-    fn run_profile_arguments_reject_legacy_process_lifecycle_event_set() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "collectors": [
-                {
-                    "kind": "native_etw",
-                    "scope": { "kind": "target_process" },
-                    "event_sets": ["process_lifecycle"]
-                }
-            ]
-        });
-
-        let error =
-            decode_arguments::<RunProfileRequest>(value).expect_err("reject old event set name");
-
-        assert!(error.to_string().contains("process_lifecycle"));
-    }
-
-    #[test]
-    fn run_profile_arguments_reject_legacy_collector() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "collector": {
-                "kind": "native_etw",
-                "preset": "system_overview"
-            }
-        });
-
-        let error =
-            decode_arguments::<RunProfileRequest>(value).expect_err("reject legacy collector");
-        assert!(error.to_string().contains("unknown field"));
-        assert!(error.to_string().contains("collector"));
-    }
-
-    #[test]
-    fn run_profile_arguments_reject_legacy_native_etw_preset() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "collectors": [
-                {
-                    "kind": "native_etw",
-                    "preset": "system_overview"
-                }
-            ]
-        });
-
-        let error = decode_arguments::<RunProfileRequest>(value).expect_err("reject legacy preset");
-        assert!(error.to_string().contains("unknown field"));
-        assert!(error.to_string().contains("preset"));
-    }
-
-    #[test]
-    fn run_profile_arguments_reject_procmon_collector() {
-        let value = json!({
-            "target": {
-                "kind": "launch",
-                "executable": "C:\\Windows\\System32\\cmd.exe"
-            },
-            "timeout_ms": 1000,
-            "collectors": [
-                {
-                    "kind": "procmon",
-                    "capture_stacks": true,
-                    "filters": {
-                        "operations": ["CreateFile", "ReadFile"],
-                        "paths": ["C:\\data\\large_input.bin"]
-                    }
-                }
-            ]
-        });
-
-        let error =
-            decode_arguments::<RunProfileRequest>(value).expect_err("reject procmon collector");
-        assert!(error.to_string().contains("procmon"));
     }
 
     #[test]
@@ -1258,61 +748,5 @@ mod tests {
                 ..Default::default()
             }
         );
-    }
-
-    #[test]
-    fn record_ttd_arguments_decode_attach_with_default_options() {
-        let value = json!({
-            "target": {
-                "kind": "attach",
-                "pid": 1234
-            },
-            "timeout_ms": 1000
-        });
-
-        let request: RecordTtd = decode_arguments(value).expect("decode record_ttd");
-
-        assert!(matches!(request.target, TtdTarget::Attach { pid: 1234 }));
-        assert_eq!(request.options, TtdRecordingOptions::default());
-    }
-
-    #[test]
-    fn record_ttd_arguments_decode_monitor() {
-        let value = json!({
-            "target": {
-                "kind": "monitor",
-                "program": "notepad.exe",
-                "cmd_line_filter": "specialfile.txt"
-            },
-            "timeout_ms": 1000
-        });
-
-        let request: RecordTtd = decode_arguments(value).expect("decode record_ttd");
-
-        assert!(matches!(
-            request.target,
-            TtdTarget::Monitor {
-                ref program,
-                ref cmd_line_filter
-            } if program == std::path::Path::new("notepad.exe")
-                && cmd_line_filter.as_deref() == Some("specialfile.txt")
-        ));
-    }
-
-    #[test]
-    fn record_ttd_arguments_reject_unknown_fields() {
-        let value = json!({
-            "target": {
-                "kind": "attach",
-                "pid": 1234
-            },
-            "timeout_ms": 1000,
-            "ttd_dir": "C:\\TTD"
-        });
-
-        let error = decode_arguments::<RecordTtd>(value).expect_err("reject unknown field");
-
-        assert!(error.to_string().contains("unknown field"));
-        assert!(error.to_string().contains("ttd_dir"));
     }
 }

@@ -1,785 +1,931 @@
-use super::dynamic::DynamicIdaApi;
-use super::install::{validate_ida_install_dir, IdaInstall, IDA_INSTALL_ENV};
-use super::model::{
-    CloseDatabaseResult, DecompileRequest, DecompileResult, DisassembleRequest, Disassembly,
-    ExportInfo, FunctionInfo, FunctionLookup, IdaInfo, IdaMetadata, ImportInfo, ListXrefsRequest,
-    LookupFunctionsRequest, MutationItemResult, PageRequest, RenameRequest, SegmentInfo,
-    SetCommentRequest, SetTypeRequest, StringInfo,
+use super::install::{
+    resolve_supervisor_runtime, IdaRuntimeConfig, IdaSupervisorRuntime, IDA_INSTALL_ENV,
 };
-use super::target::IdaTarget;
+use super::model::{IdaOpenMode, IdaUpstreamSession, UpstreamToolDescriptor};
 use dbgflow_common::logging::LogSink;
 use dbgflow_common::process::{
     log_process_launch, spawn_process, EnvChange, LaunchStdio, ManagedChild, ProcessLaunchContext,
     ProcessLaunchSpec,
 };
-use dbgflow_common::SessionId;
 use dbgflow_common::{DbgFlowError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
+use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::thread;
 use std::time::Duration;
 
-pub const REVERSE_WORKER_COMMAND: &str = "worker";
-pub const REVERSE_WORKER_KIND_IDA: &str = "reverse-ida";
+const DEFAULT_OPEN_TIMEOUT_MS: u64 = 1_800_000;
+const SUPERVISOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-const EXIT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+type PendingResponse = std::sync::mpsc::Sender<Result<Value>>;
+type PendingResponses = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+
+pub const UPSTREAM_IDB_OPEN: &str = "idb_open";
+pub const UPSTREAM_IDB_LIST: &str = "idb_list";
+pub const UPSTREAM_IDB_SAVE: &str = "idb_save";
+
+pub const DEFAULT_UPSTREAM_TOOLS: &[&str] = &[
+    "add_bookmark",
+    "analyze_batch",
+    "analyze_component",
+    "analyze_function",
+    "append_comments",
+    "basic_blocks",
+    "callees",
+    "callgraph",
+    "declare_stack",
+    "declare_type",
+    "decompile",
+    "define_code",
+    "define_func",
+    "delete_stack",
+    "diff_before_after",
+    "disasm",
+    "entity_query",
+    "enum_upsert",
+    "export_funcs",
+    "find",
+    "find_bytes",
+    "find_regex",
+    "find_xref_signatures",
+    "force_recompile",
+    "func_profile",
+    "func_query",
+    "get_bytes",
+    "get_global_value",
+    "get_int",
+    "get_string",
+    "idb_save",
+    "imports",
+    "imports_query",
+    "infer_types",
+    "insn_query",
+    "int_convert",
+    "list_funcs",
+    "list_globals",
+    "lookup_funcs",
+    "make_data",
+    "make_signature",
+    "make_signature_for_function",
+    "make_signature_for_range",
+    "patch",
+    "patch_asm",
+    "put_int",
+    "py_eval",
+    "read_struct",
+    "rename",
+    "search_structs",
+    "search_text",
+    "server_health",
+    "set_comments",
+    "set_op_type",
+    "set_type",
+    "stack_frame",
+    "survey_binary",
+    "trace_data_flow",
+    "type_apply_batch",
+    "type_inspect",
+    "type_query",
+    "undefine",
+    "xref_query",
+    "xrefs_to",
+    "xrefs_to_field",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenIdaDatabase {
-    pub install_dir: PathBuf,
-    pub target: IdaTarget,
+    pub input_path: PathBuf,
+    pub mode: IdaOpenMode,
     pub run_auto_analysis: bool,
+    pub build_caches: bool,
+    pub init_hexrays: bool,
+    pub idle_ttl_sec: u64,
+    pub preferred_session_id: String,
+    pub startup_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenIdaDatabaseResult {
-    pub ida: IdaInfo,
-    pub warnings: Vec<String>,
+    pub session: IdaUpstreamSession,
+    pub warmup: Option<Value>,
+    pub message: Option<String>,
 }
 
-pub trait ReverseWorkerLauncher: Send + Sync {
-    fn spawn(
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorToolCallResult {
+    pub structured_content: Value,
+    pub mcp_result: Value,
+    pub is_error: bool,
+    pub error_message: Option<String>,
+}
+
+pub trait IdaSupervisor: Send + Sync {
+    fn tool_descriptors(&self) -> Result<Vec<UpstreamToolDescriptor>>;
+    fn open_session(&self, request: OpenIdaDatabase) -> Result<OpenIdaDatabaseResult>;
+    fn list_sessions(&self) -> Result<Vec<IdaUpstreamSession>>;
+    fn call_tool(
         &self,
-        session_id: SessionId,
-        install: IdaInstall,
-        worker_log_path: PathBuf,
-        launch_context: ProcessLaunchContext,
-        logger: Arc<dyn LogSink>,
-    ) -> Result<Arc<dyn ReverseWorker>>;
-}
-
-pub trait ReverseWorker: Send + Sync {
-    fn open_database(&self, request: OpenIdaDatabase) -> Result<OpenIdaDatabaseResult>;
-    fn get_metadata(&self) -> Result<IdaMetadata>;
-    fn list_segments(&self) -> Result<Vec<SegmentInfo>>;
-    fn list_functions(&self) -> Result<Vec<FunctionInfo>>;
-    fn list_strings(&self, request: PageRequest) -> Result<Vec<StringInfo>>;
-    fn list_imports(&self, request: PageRequest) -> Result<Vec<ImportInfo>>;
-    fn list_exports(&self, request: PageRequest) -> Result<Vec<ExportInfo>>;
-    fn lookup_functions(&self, request: LookupFunctionsRequest) -> Result<Vec<FunctionLookup>>;
-    fn disassemble(&self, request: DisassembleRequest) -> Result<Disassembly>;
-    fn decompile(&self, request: DecompileRequest) -> Result<DecompileResult>;
-    fn list_xrefs(&self, request: ListXrefsRequest) -> Result<super::model::XrefsResult>;
-    fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>>;
-    fn set_comment(&self, request: SetCommentRequest) -> Result<Vec<MutationItemResult>>;
-    fn set_type(&self, request: SetTypeRequest) -> Result<Vec<MutationItemResult>>;
+        database_id: &str,
+        tool_name: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<SupervisorToolCallResult>;
     fn has_exited(&self) -> Result<bool>;
-    fn close(&self, save: bool) -> Result<CloseDatabaseResult>;
     fn kill(&self, reason: &str) -> Result<()>;
 }
 
-#[derive(Debug, Default)]
-pub struct ProcessReverseWorkerLauncher {
-    executable: Option<PathBuf>,
-}
-
-impl ProcessReverseWorkerLauncher {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_executable(executable: impl Into<PathBuf>) -> Self {
-        Self {
-            executable: Some(executable.into()),
-        }
-    }
-}
-
-impl ReverseWorkerLauncher for ProcessReverseWorkerLauncher {
-    fn spawn(
-        &self,
-        session_id: SessionId,
-        install: IdaInstall,
-        worker_log_path: PathBuf,
-        launch_context: ProcessLaunchContext,
-        logger: Arc<dyn LogSink>,
-    ) -> Result<Arc<dyn ReverseWorker>> {
-        let executable = match &self.executable {
-            Some(executable) => executable.clone(),
-            None => std::env::current_exe().map_err(|error| {
-                DbgFlowError::Backend(format!("resolve reverse worker executable failed: {error}"))
-            })?,
-        };
-        Ok(Arc::new(ProcessReverseWorker::spawn(
-            session_id,
-            executable,
-            install,
-            worker_log_path,
-            launch_context,
-            logger,
-        )?))
-    }
-}
-
 #[derive(Clone)]
-struct ProcessReverseWorker {
-    inner: Arc<ProcessReverseWorkerInner>,
+pub struct ProcessIdaSupervisor {
+    inner: Arc<ProcessIdaSupervisorInner>,
 }
 
-struct ProcessReverseWorkerInner {
-    _session_id: SessionId,
-    pid: u32,
-    child: Mutex<ManagedChild>,
-    stdin: Mutex<File>,
-    stdout: Mutex<BufReader<File>>,
-    request_lock: Mutex<()>,
+struct ProcessIdaSupervisorInner {
+    artifact_root: PathBuf,
+    runtime: IdaRuntimeConfig,
+    launch_context: ProcessLaunchContext,
+    logger: Arc<dyn LogSink>,
+    state: Mutex<Option<SupervisorProcess>>,
+    active_child: Mutex<Option<Arc<Mutex<ManagedChild>>>>,
+    active_pending: Mutex<Option<PendingResponses>>,
+}
+
+struct SupervisorProcess {
+    child: Arc<Mutex<ManagedChild>>,
+    stdin: Arc<Mutex<File>>,
+    pending: PendingResponses,
     next_request_id: AtomicU64,
 }
 
-impl Drop for ProcessReverseWorkerInner {
-    fn drop(&mut self) {
-        let Ok(child) = self.child.get_mut() else {
-            return;
-        };
-        if matches!(child.try_wait(), Ok(None)) {
-            let _ = child.kill();
-            let _ = child.wait();
+impl ProcessIdaSupervisor {
+    pub fn new(
+        artifact_root: impl Into<PathBuf>,
+        runtime: IdaRuntimeConfig,
+        launch_context: ProcessLaunchContext,
+        logger: Arc<dyn LogSink>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ProcessIdaSupervisorInner {
+                artifact_root: artifact_root.into(),
+                runtime,
+                launch_context,
+                logger,
+                state: Mutex::new(None),
+                active_child: Mutex::new(None),
+                active_pending: Mutex::new(None),
+            }),
         }
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        let method = method.to_string();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params.unwrap_or_else(|| Value::Object(Map::new())),
+        });
+        self.request_blocking(request, timeout)
+    }
+
+    fn request_blocking(&self, mut request: Value, timeout: Option<Duration>) -> Result<Value> {
+        let (request_id, stdin, pending) = {
+            let mut state = self.inner.state.lock().map_err(|_| {
+                DbgFlowError::Backend("IDA supervisor state lock poisoned".to_string())
+            })?;
+            self.ensure_started_locked(&mut state)?;
+            let process = state.as_ref().expect("started above");
+            (
+                process.next_request_id.fetch_add(1, Ordering::Relaxed),
+                process.stdin.clone(),
+                process.pending.clone(),
+            )
+        };
+        request["id"] = Value::from(request_id);
+        let (tx, rx) = std::sync::mpsc::channel();
+        pending
+            .lock()
+            .map_err(|_| {
+                DbgFlowError::Backend("IDA supervisor pending map lock poisoned".to_string())
+            })?
+            .insert(request_id, tx);
+
+        let write_result = (|| -> Result<()> {
+            let mut stdin = stdin.lock().map_err(|_| {
+                DbgFlowError::Backend("IDA supervisor stdin lock poisoned".to_string())
+            })?;
+            serde_json::to_writer(&mut *stdin, &request).map_err(|error| {
+                DbgFlowError::Backend(format!("write supervisor request: {error}"))
+            })?;
+            writeln!(&mut *stdin).map_err(|error| {
+                DbgFlowError::Backend(format!("write supervisor request newline: {error}"))
+            })?;
+            stdin.flush().map_err(|error| {
+                DbgFlowError::Backend(format!("flush supervisor request: {error}"))
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = pending
+                .lock()
+                .map(|mut pending| pending.remove(&request_id));
+            return Err(error);
+        }
+
+        match timeout {
+            Some(timeout) => match rx.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = pending
+                        .lock()
+                        .map(|mut pending| pending.remove(&request_id));
+                    let _ = self.kill("ida_supervisor_request_timeout");
+                    Err(DbgFlowError::Backend(format!(
+                        "ida-pro-mcp supervisor request timed out after {} ms",
+                        timeout.as_millis()
+                    )))
+                }
+                Err(error) => Err(DbgFlowError::Backend(format!(
+                    "ida-pro-mcp supervisor response channel failed: {error}"
+                ))),
+            },
+            None => rx.recv().map_err(|error| {
+                DbgFlowError::Backend(format!(
+                    "ida-pro-mcp supervisor response channel failed: {error}"
+                ))
+            })?,
+        }
+    }
+
+    fn read_supervisor_stdout(mut stdout: BufReader<File>, pending: PendingResponses) {
+        loop {
+            let mut line = String::new();
+            let read = match stdout.read_line(&mut line) {
+                Ok(read) => read,
+                Err(error) => {
+                    fail_pending(
+                        &pending,
+                        DbgFlowError::Backend(format!("read supervisor response: {error}")),
+                    );
+                    return;
+                }
+            };
+            if read == 0 {
+                fail_pending(
+                    &pending,
+                    DbgFlowError::Backend(
+                        "ida-pro-mcp supervisor exited before responding".to_string(),
+                    ),
+                );
+                return;
+            }
+            let response: Value = match serde_json::from_str(&line) {
+                Ok(response) => response,
+                Err(error) => {
+                    fail_pending(
+                        &pending,
+                        DbgFlowError::Backend(format!(
+                            "parse supervisor response: {error}: {line}"
+                        )),
+                    );
+                    return;
+                }
+            };
+            let Some(request_id) = response.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let sender = pending
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&request_id));
+            let Some(sender) = sender else {
+                continue;
+            };
+            let result = if let Some(error) = response.get("error") {
+                Err(DbgFlowError::Backend(
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ida-pro-mcp supervisor request failed")
+                        .to_string(),
+                ))
+            } else {
+                Ok(response.get("result").cloned().unwrap_or(Value::Null))
+            };
+            let _ = sender.send(result);
+        }
+    }
+
+    fn ensure_started_locked(&self, state: &mut Option<SupervisorProcess>) -> Result<()> {
+        if let Some(process) = state {
+            if process
+                .child
+                .lock()
+                .map_err(|_| {
+                    DbgFlowError::Backend("IDA supervisor child lock poisoned".to_string())
+                })?
+                .try_wait()?
+                .is_none()
+            {
+                return Ok(());
+            }
+            *state = None;
+            self.clear_active_child()?;
+        }
+
+        let runtime = resolve_supervisor_runtime(&self.inner.runtime)?;
+        let profile_path = self.write_default_profile()?;
+        let log_path = self.supervisor_log_path()?;
+        let spec = supervisor_launch_spec(&runtime, &profile_path, &log_path)?;
+        let mut child = spawn_process(&spec, &self.inner.launch_context).map_err(|error| {
+            DbgFlowError::Backend(format!(
+                "spawn ida-pro-mcp supervisor {} failed: {error}",
+                runtime.python_executable.display()
+            ))
+        })?;
+        log_process_launch(
+            &self.inner.logger,
+            "reverse_ida",
+            "ida_supervisor_process_launch_resolved",
+            child.audit(),
+        );
+        let stdin = child.take_stdin().ok_or_else(|| {
+            DbgFlowError::Backend("ida-pro-mcp supervisor stdin was not captured".to_string())
+        })?;
+        let stdout = child.take_stdout().ok_or_else(|| {
+            DbgFlowError::Backend("ida-pro-mcp supervisor stdout was not captured".to_string())
+        })?;
+        let child = Arc::new(Mutex::new(child));
+        let stdin = Arc::new(Mutex::new(stdin));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        *self.inner.active_child.lock().map_err(|_| {
+            DbgFlowError::Backend("IDA supervisor child handle lock poisoned".to_string())
+        })? = Some(child.clone());
+        *self.inner.active_pending.lock().map_err(|_| {
+            DbgFlowError::Backend("IDA supervisor pending handle lock poisoned".to_string())
+        })? = Some(pending.clone());
+        let pending_for_reader = pending.clone();
+        thread::spawn(move || {
+            Self::read_supervisor_stdout(BufReader::new(stdout), pending_for_reader);
+        });
+
+        *state = Some(SupervisorProcess {
+            child,
+            stdin,
+            pending,
+            next_request_id: AtomicU64::new(1),
+        });
+        Ok(())
+    }
+
+    fn clear_active_child(&self) -> Result<()> {
+        *self.inner.active_child.lock().map_err(|_| {
+            DbgFlowError::Backend("IDA supervisor child handle lock poisoned".to_string())
+        })? = None;
+        *self.inner.active_pending.lock().map_err(|_| {
+            DbgFlowError::Backend("IDA supervisor pending handle lock poisoned".to_string())
+        })? = None;
+        Ok(())
+    }
+
+    fn write_default_profile(&self) -> Result<PathBuf> {
+        let dir = self.inner.artifact_root.join("reverse_sessions");
+        fs::create_dir_all(&dir).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        let path = dir.join("ida-pro-mcp-dbgflow-profile.txt");
+        fs::write(&path, default_profile_text())
+            .map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(path)
+    }
+
+    fn supervisor_log_path(&self) -> Result<PathBuf> {
+        let dir = self.inner.artifact_root.join("reverse_sessions");
+        fs::create_dir_all(&dir).map_err(|error| DbgFlowError::Artifact(error.to_string()))?;
+        Ok(dir.join("ida-pro-mcp-supervisor.log"))
     }
 }
 
-impl ProcessReverseWorker {
-    fn spawn(
-        session_id: SessionId,
-        executable: PathBuf,
-        install: IdaInstall,
-        worker_log_path: PathBuf,
-        launch_context: ProcessLaunchContext,
-        logger: Arc<dyn LogSink>,
-    ) -> Result<Self> {
-        let spec = reverse_worker_launch_spec(&executable, &install, &worker_log_path)?;
-        let mut child = spawn_process(&spec, &launch_context).map_err(|error| {
-            DbgFlowError::Backend(format!(
-                "spawn reverse worker {} failed: {error}",
-                executable.display()
-            ))
-        })?;
-        let pid = child.pid();
-        let stdin = child.take_stdin().ok_or_else(|| {
-            DbgFlowError::Backend("reverse worker stdin was not captured".to_string())
-        })?;
-        let stdout = child.take_stdout().ok_or_else(|| {
-            DbgFlowError::Backend("reverse worker stdout was not captured".to_string())
-        })?;
-        log_process_launch(
-            &logger,
-            "reverse_ida",
-            "worker_process_launch_resolved",
-            child.audit(),
-        );
+impl IdaSupervisor for ProcessIdaSupervisor {
+    fn tool_descriptors(&self) -> Result<Vec<UpstreamToolDescriptor>> {
+        let result = self.request("tools/list", None, Some(SUPERVISOR_REQUEST_TIMEOUT))?;
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                DbgFlowError::Backend("tools/list response missing tools".to_string())
+            })?;
+        Ok(tools
+            .iter()
+            .filter_map(upstream_tool_descriptor_from_value)
+            .filter(|tool| is_allowed_upstream_tool(&tool.name))
+            .collect())
+    }
 
-        Ok(Self {
-            inner: Arc::new(ProcessReverseWorkerInner {
-                _session_id: session_id,
-                pid,
-                child: Mutex::new(child),
-                stdin: Mutex::new(stdin),
-                stdout: Mutex::new(BufReader::new(stdout)),
-                request_lock: Mutex::new(()),
-                next_request_id: AtomicU64::new(0),
-            }),
+    fn open_session(&self, request: OpenIdaDatabase) -> Result<OpenIdaDatabaseResult> {
+        let mut arguments = Map::new();
+        arguments.insert(
+            "input_path".to_string(),
+            Value::String(request.input_path.display().to_string()),
+        );
+        arguments.insert(
+            "mode".to_string(),
+            Value::String(request.mode.as_upstream().to_string()),
+        );
+        arguments.insert(
+            "run_auto_analysis".to_string(),
+            Value::Bool(request.run_auto_analysis),
+        );
+        arguments.insert(
+            "build_caches".to_string(),
+            Value::Bool(request.build_caches),
+        );
+        arguments.insert(
+            "init_hexrays".to_string(),
+            Value::Bool(request.init_hexrays),
+        );
+        arguments.insert(
+            "idle_ttl_sec".to_string(),
+            Value::from(request.idle_ttl_sec),
+        );
+        arguments.insert(
+            "preferred_session_id".to_string(),
+            Value::String(request.preferred_session_id),
+        );
+        arguments.insert(
+            "open_timeout_sec".to_string(),
+            Value::from((request.startup_timeout_ms.max(1) as f64) / 1000.0),
+        );
+        let timeout = Duration::from_millis(request.startup_timeout_ms.max(1))
+            .saturating_add(Duration::from_secs(30));
+        let response = self.call_management_tool(UPSTREAM_IDB_OPEN, arguments, Some(timeout))?;
+        if let Some(error) = response
+            .structured_content
+            .get("error")
+            .and_then(Value::as_str)
+        {
+            return Err(DbgFlowError::Backend(error.to_string()));
+        }
+        let session = response
+            .structured_content
+            .get("session")
+            .cloned()
+            .ok_or_else(|| DbgFlowError::Backend("idb_open response missing session".to_string()))
+            .and_then(ida_session_from_value)?;
+        Ok(OpenIdaDatabaseResult {
+            session,
+            warmup: response.structured_content.get("warmup").cloned(),
+            message: response
+                .structured_content
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         })
     }
 
-    fn request<T>(&self, request: WorkerRequest) -> Result<T>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
-        let _guard = self.inner.request_lock.lock().map_err(|_| {
-            DbgFlowError::Backend("reverse worker request lock poisoned".to_string())
-        })?;
-        if self.has_exited()? {
-            return Err(DbgFlowError::Backend(format!(
-                "reverse worker process already exited: pid {}",
-                self.inner.pid
-            )));
-        }
-
-        let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let input = WorkerInput {
-            request_id,
-            request,
-        };
+    fn list_sessions(&self) -> Result<Vec<IdaUpstreamSession>> {
+        let response = self.call_management_tool(UPSTREAM_IDB_LIST, Map::new(), None)?;
+        if let Some(error) = response
+            .structured_content
+            .get("error")
+            .and_then(Value::as_str)
         {
-            let mut stdin = self.inner.stdin.lock().map_err(|_| {
-                DbgFlowError::Backend("reverse worker stdin lock poisoned".to_string())
-            })?;
-            serde_json::to_writer(&mut *stdin, &input).map_err(|error| {
-                DbgFlowError::Backend(format!("write reverse worker request: {error}"))
-            })?;
-            writeln!(&mut *stdin).map_err(|error| {
-                DbgFlowError::Backend(format!("write reverse worker request newline: {error}"))
-            })?;
-            stdin.flush().map_err(|error| {
-                DbgFlowError::Backend(format!("flush reverse worker request: {error}"))
-            })?;
+            return Err(DbgFlowError::Backend(error.to_string()));
         }
-
-        loop {
-            let mut line = String::new();
-            let read = self
-                .inner
-                .stdout
-                .lock()
-                .map_err(|_| {
-                    DbgFlowError::Backend("reverse worker stdout lock poisoned".to_string())
-                })?
-                .read_line(&mut line)
-                .map_err(|error| {
-                    DbgFlowError::Backend(format!("read reverse worker response: {error}"))
-                })?;
-            if read == 0 {
-                return Err(DbgFlowError::Backend(format!(
-                    "reverse worker exited before responding to request {request_id}"
-                )));
-            }
-            let output: WorkerOutput = serde_json::from_str(&line).map_err(|error| {
-                DbgFlowError::Backend(format!("parse reverse worker response: {error}: {line}"))
+        let sessions = response
+            .structured_content
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                DbgFlowError::Backend("idb_list response missing sessions".to_string())
             })?;
-            if output.request_id != request_id {
-                continue;
-            }
-            if !output.ok {
-                return Err(output.error.map_or_else(
-                    || DbgFlowError::Backend("reverse worker request failed".to_string()),
-                    worker_error_to_dbgflow,
-                ));
-            }
-            let result = output.result.unwrap_or(Value::Null);
-            return serde_json::from_value(result).map_err(|error| {
-                DbgFlowError::Backend(format!("decode reverse worker result: {error}"))
-            });
-        }
-    }
-}
-
-impl ReverseWorker for ProcessReverseWorker {
-    fn open_database(&self, request: OpenIdaDatabase) -> Result<OpenIdaDatabaseResult> {
-        self.request(WorkerRequest::OpenDatabase(request))
+        sessions
+            .iter()
+            .cloned()
+            .map(ida_session_from_value)
+            .collect()
     }
 
-    fn get_metadata(&self) -> Result<IdaMetadata> {
-        self.request(WorkerRequest::GetMetadata)
-    }
-
-    fn list_segments(&self) -> Result<Vec<SegmentInfo>> {
-        self.request(WorkerRequest::ListSegments)
-    }
-
-    fn list_functions(&self) -> Result<Vec<FunctionInfo>> {
-        self.request(WorkerRequest::ListFunctions)
-    }
-
-    fn list_strings(&self, request: PageRequest) -> Result<Vec<StringInfo>> {
-        self.request(WorkerRequest::ListStrings(request))
-    }
-
-    fn list_imports(&self, request: PageRequest) -> Result<Vec<ImportInfo>> {
-        self.request(WorkerRequest::ListImports(request))
-    }
-
-    fn list_exports(&self, request: PageRequest) -> Result<Vec<ExportInfo>> {
-        self.request(WorkerRequest::ListExports(request))
-    }
-
-    fn lookup_functions(&self, request: LookupFunctionsRequest) -> Result<Vec<FunctionLookup>> {
-        self.request(WorkerRequest::LookupFunctions(request))
-    }
-
-    fn disassemble(&self, request: DisassembleRequest) -> Result<Disassembly> {
-        self.request(WorkerRequest::Disassemble(request))
-    }
-
-    fn decompile(&self, request: DecompileRequest) -> Result<DecompileResult> {
-        self.request(WorkerRequest::Decompile(request))
-    }
-
-    fn list_xrefs(&self, request: ListXrefsRequest) -> Result<super::model::XrefsResult> {
-        self.request(WorkerRequest::ListXrefs(request))
-    }
-
-    fn rename(&self, request: RenameRequest) -> Result<Vec<MutationItemResult>> {
-        self.request(WorkerRequest::Rename(request))
-    }
-
-    fn set_comment(&self, request: SetCommentRequest) -> Result<Vec<MutationItemResult>> {
-        self.request(WorkerRequest::SetComment(request))
-    }
-
-    fn set_type(&self, request: SetTypeRequest) -> Result<Vec<MutationItemResult>> {
-        self.request(WorkerRequest::SetType(request))
+    fn call_tool(
+        &self,
+        database_id: &str,
+        tool_name: &str,
+        mut arguments: Map<String, Value>,
+    ) -> Result<SupervisorToolCallResult> {
+        arguments.insert(
+            "database".to_string(),
+            Value::String(database_id.to_string()),
+        );
+        self.call_management_tool(tool_name, arguments, None)
     }
 
     fn has_exited(&self) -> Result<bool> {
-        let mut child =
-            self.inner.child.lock().map_err(|_| {
-                DbgFlowError::Backend("reverse worker child lock poisoned".to_string())
+        let mut state =
+            self.inner.state.lock().map_err(|_| {
+                DbgFlowError::Backend("IDA supervisor state lock poisoned".to_string())
             })?;
-        child.try_wait().map(|status| status.is_some())
-    }
-
-    fn close(&self, save: bool) -> Result<CloseDatabaseResult> {
-        let result: CloseDatabaseResult = self.request(WorkerRequest::Close { save })?;
-        let deadline = std::time::Instant::now() + EXIT_WAIT_TIMEOUT;
-        loop {
-            if self.has_exited()? {
-                return Ok(result);
+        match state.as_mut() {
+            Some(process) => {
+                let exited = process
+                    .child
+                    .lock()
+                    .map_err(|_| {
+                        DbgFlowError::Backend("IDA supervisor child lock poisoned".to_string())
+                    })?
+                    .try_wait()?
+                    .is_some();
+                if exited {
+                    *state = None;
+                    self.clear_active_child()?;
+                }
+                Ok(exited)
             }
-            if std::time::Instant::now() >= deadline {
-                self.kill("reverse_worker_close_timeout")?;
-                return Ok(result);
-            }
-            std::thread::sleep(Duration::from_millis(50));
+            None => Ok(true),
         }
     }
 
     fn kill(&self, _reason: &str) -> Result<()> {
-        let mut child =
-            self.inner.child.lock().map_err(|_| {
-                DbgFlowError::Backend("reverse worker child lock poisoned".to_string())
+        let child = self
+            .inner
+            .active_child
+            .lock()
+            .map_err(|_| {
+                DbgFlowError::Backend("IDA supervisor child handle lock poisoned".to_string())
+            })?
+            .take();
+        if let Some(child) = child {
+            let mut child = child.lock().map_err(|_| {
+                DbgFlowError::Backend("IDA supervisor child lock poisoned".to_string())
             })?;
-        if child.try_wait()?.is_none() {
-            child.kill()?;
-            let _ = child.wait();
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+                let _ = child.wait();
+            }
+        }
+        let pending = self
+            .inner
+            .active_pending
+            .lock()
+            .map_err(|_| {
+                DbgFlowError::Backend("IDA supervisor pending handle lock poisoned".to_string())
+            })?
+            .take();
+        if let Some(pending) = pending {
+            fail_pending(
+                &pending,
+                DbgFlowError::Backend("ida-pro-mcp supervisor was killed".to_string()),
+            );
+        }
+        match self.inner.state.try_lock() {
+            Ok(mut state) => *state = None,
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(DbgFlowError::Backend(
+                    "IDA supervisor state lock poisoned".to_string(),
+                ));
+            }
         }
         Ok(())
     }
 }
 
-fn reverse_worker_launch_spec(
-    executable: &Path,
-    install: &IdaInstall,
-    worker_log_path: &Path,
+fn fail_pending(pending: &PendingResponses, error: DbgFlowError) {
+    let senders = pending
+        .lock()
+        .map(|mut pending| {
+            pending
+                .drain()
+                .map(|(_, sender)| sender)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let message = error.to_string();
+    for sender in senders {
+        let _ = sender.send(Err(DbgFlowError::Backend(message.clone())));
+    }
+}
+
+impl ProcessIdaSupervisor {
+    fn call_management_tool(
+        &self,
+        tool_name: &str,
+        arguments: Map<String, Value>,
+        timeout: Option<Duration>,
+    ) -> Result<SupervisorToolCallResult> {
+        let result = self.request(
+            "tools/call",
+            Some(json!({
+                "name": tool_name,
+                "arguments": Value::Object(arguments),
+            })),
+            timeout.or(Some(SUPERVISOR_REQUEST_TIMEOUT)),
+        )?;
+        decode_tool_result(result)
+    }
+}
+
+fn supervisor_launch_spec(
+    runtime: &IdaSupervisorRuntime,
+    profile_path: &Path,
+    log_path: &Path,
 ) -> Result<ProcessLaunchSpec> {
-    let mut spec = ProcessLaunchSpec::new(executable);
+    let mut spec = ProcessLaunchSpec::new(&runtime.python_executable);
     spec.args = vec![
-        REVERSE_WORKER_COMMAND.into(),
-        REVERSE_WORKER_KIND_IDA.into(),
+        "-m".into(),
+        "ida_pro_mcp.idalib_supervisor".into(),
+        "--stdio".into(),
+        "--unsafe".into(),
+        "--profile".into(),
+        profile_path.as_os_str().to_os_string(),
+        "--max-workers".into(),
+        runtime.max_workers.to_string().into(),
     ];
-    spec.env = ida_env_changes(&install.install_dir)?;
+    spec.env = supervisor_env_changes(runtime)?;
     spec.stdin = LaunchStdio::Piped;
     spec.stdout = LaunchStdio::Piped;
-    spec.stderr = LaunchStdio::File(worker_log_path.to_path_buf());
+    spec.stderr = LaunchStdio::File(log_path.to_path_buf());
+    spec.current_dir = runtime.vendor_src_dir.parent().map(Path::to_path_buf);
     spec.hide_console_window();
     Ok(spec)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerInput {
-    request_id: u64,
-    request: WorkerRequest,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "method", content = "params", rename_all = "snake_case")]
-enum WorkerRequest {
-    OpenDatabase(OpenIdaDatabase),
-    GetMetadata,
-    ListSegments,
-    ListFunctions,
-    ListStrings(PageRequest),
-    ListImports(PageRequest),
-    ListExports(PageRequest),
-    LookupFunctions(LookupFunctionsRequest),
-    Disassemble(DisassembleRequest),
-    Decompile(DecompileRequest),
-    ListXrefs(ListXrefsRequest),
-    Rename(RenameRequest),
-    SetComment(SetCommentRequest),
-    SetType(SetTypeRequest),
-    Close { save: bool },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerOutput {
-    request_id: u64,
-    ok: bool,
-    result: Option<Value>,
-    error: Option<WorkerErrorInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WorkerErrorInfo {
-    kind: String,
-    message: String,
-}
-
-impl WorkerErrorInfo {
-    fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            message: message.into(),
-        }
+fn supervisor_env_changes(runtime: &IdaSupervisorRuntime) -> Result<Vec<EnvChange>> {
+    let mut python_path_entries = vec![runtime.vendor_src_dir.clone()];
+    if let Some(existing) = std::env::var_os("PYTHONPATH") {
+        python_path_entries.extend(std::env::split_paths(&existing));
     }
+    let python_path = std::env::join_paths(python_path_entries)
+        .map_err(|error| DbgFlowError::Backend(format!("construct PYTHONPATH: {error}")))?;
 
-    fn backend(message: impl Into<String>) -> Self {
-        Self::new("backend", message)
-    }
-}
-
-pub fn run_reverse_ida_worker_stdio(
-    input: impl BufRead,
-    mut output: impl Write,
-) -> std::io::Result<()> {
-    let mut runtime = WorkerRuntime::default();
-    for line in input.lines() {
-        let line = line?;
-        let parsed = serde_json::from_str::<WorkerInput>(&line);
-        let response = match parsed {
-            Ok(input) => runtime.handle(input),
-            Err(error) => WorkerOutput {
-                request_id: 0,
-                ok: false,
-                result: None,
-                error: Some(WorkerErrorInfo::backend(format!(
-                    "parse worker request: {error}"
-                ))),
-            },
-        };
-        serde_json::to_writer(&mut output, &response)?;
-        writeln!(&mut output)?;
-        output.flush()?;
-        if runtime.should_exit {
-            break;
-        }
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct WorkerRuntime {
-    api: Option<DynamicIdaApi>,
-    target: Option<IdaTarget>,
-    database_open: bool,
-    should_exit: bool,
-}
-
-impl WorkerRuntime {
-    fn handle(&mut self, input: WorkerInput) -> WorkerOutput {
-        match self.handle_request(input.request) {
-            Ok(result) => WorkerOutput {
-                request_id: input.request_id,
-                ok: true,
-                result: Some(result),
-                error: None,
-            },
-            Err(error) => WorkerOutput {
-                request_id: input.request_id,
-                ok: false,
-                result: None,
-                error: Some(worker_error_from_dbgflow(error)),
-            },
-        }
-    }
-
-    fn handle_request(&mut self, request: WorkerRequest) -> Result<Value> {
-        match request {
-            WorkerRequest::OpenDatabase(request) => self.open_database(request),
-            WorkerRequest::GetMetadata => {
-                let api = self.require_api()?;
-                let target = self.require_target()?;
-                serde_json::to_value(api.metadata(target)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::ListSegments => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.list_segments()?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::ListFunctions => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.list_functions()?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::ListStrings(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.list_strings(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::ListImports(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.list_imports(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::ListExports(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.list_exports(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::LookupFunctions(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.lookup_functions(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::Disassemble(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.disassemble(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::Decompile(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.decompile(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::ListXrefs(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.list_xrefs(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::Rename(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.rename(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::SetComment(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.set_comment(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::SetType(request) => {
-                let api = self.require_api()?;
-                serde_json::to_value(api.set_type(request)?)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-            WorkerRequest::Close { save } => {
-                let close_result = if let Some(api) = &self.api {
-                    if self.database_open {
-                        let result = api.close_database(save);
-                        self.database_open = false;
-                        result
-                    } else {
-                        CloseDatabaseResult::no_worker(save)
-                    }
-                } else {
-                    CloseDatabaseResult::no_worker(save)
-                };
-                self.should_exit = true;
-                serde_json::to_value(close_result)
-                    .map_err(|error| DbgFlowError::Backend(error.to_string()))
-            }
-        }
-    }
-
-    fn open_database(&mut self, request: OpenIdaDatabase) -> Result<Value> {
-        if self.api.is_some() {
-            return Err(DbgFlowError::Backend(
-                "IDA worker already has an open database".to_string(),
-            ));
-        }
-        let install = validate_ida_install_dir(&request.install_dir)?;
-        let mut api = DynamicIdaApi::load_and_initialize(&install)?;
-        api.open_database(
-            &request.target.path().to_string_lossy(),
-            request.run_auto_analysis,
-        )?;
-        let result = OpenIdaDatabaseResult {
-            ida: api.info(),
-            warnings: rich_api_warnings(&api),
-        };
-        self.target = Some(request.target);
-        self.database_open = true;
-        self.api = Some(api);
-        serde_json::to_value(result).map_err(|error| DbgFlowError::Backend(error.to_string()))
-    }
-
-    fn require_api(&self) -> Result<&DynamicIdaApi> {
-        self.api.as_ref().ok_or_else(|| {
-            DbgFlowError::Backend("IDA worker does not have an open database".to_string())
-        })
-    }
-
-    fn require_target(&self) -> Result<&IdaTarget> {
-        self.target.as_ref().ok_or_else(|| {
-            DbgFlowError::Backend("IDA worker does not have an open target".to_string())
-        })
-    }
-}
-
-fn rich_api_warnings(api: &DynamicIdaApi) -> Vec<String> {
-    let status = api.rich_api_status();
-    if status.available {
-        status.warnings
-    } else {
-        let detail = if status.missing_symbols.is_empty() {
-            "no direct rich API symbols were available".to_string()
-        } else {
-            format!("missing symbols: {}", status.missing_symbols.join(", "))
-        };
-        vec![format!("IDA direct rich API unavailable: {detail}")]
-    }
-}
-
-fn worker_error_from_dbgflow(error: DbgFlowError) -> WorkerErrorInfo {
-    match error {
-        DbgFlowError::BackendNotFound(message) => {
-            WorkerErrorInfo::new("backend_not_found", message)
-        }
-        DbgFlowError::Backend(message) => WorkerErrorInfo::new("backend", message),
-        DbgFlowError::SessionNotFound(session_id) => {
-            WorkerErrorInfo::new("session_not_found", session_id.to_string())
-        }
-        DbgFlowError::SessionClosed(session_id) => {
-            WorkerErrorInfo::new("session_closed", session_id.to_string())
-        }
-        DbgFlowError::Artifact(message) => WorkerErrorInfo::new("artifact", message),
-    }
-}
-
-fn worker_error_to_dbgflow(error: WorkerErrorInfo) -> DbgFlowError {
-    match error.kind.as_str() {
-        "backend_not_found" => DbgFlowError::BackendNotFound(error.message),
-        "backend" => DbgFlowError::Backend(error.message),
-        "artifact" => DbgFlowError::Artifact(error.message),
-        "session_not_found" => serde_json::from_value(Value::String(error.message.clone()))
-            .map(DbgFlowError::SessionNotFound)
-            .unwrap_or_else(|_| {
-                DbgFlowError::Backend(format!("session_not_found: {}", error.message))
-            }),
-        "session_closed" => serde_json::from_value(Value::String(error.message.clone()))
-            .map(DbgFlowError::SessionClosed)
-            .unwrap_or_else(|_| {
-                DbgFlowError::Backend(format!("session_closed: {}", error.message))
-            }),
-        _ => DbgFlowError::Backend(error.message),
-    }
-}
-
-fn ida_env_changes(install_dir: &Path) -> Result<Vec<EnvChange>> {
-    let mut path_entries = vec![install_dir.to_path_buf()];
+    let mut path_entries = vec![runtime.install.install_dir.clone()];
     if let Some(existing) = std::env::var_os("PATH") {
         path_entries.extend(std::env::split_paths(&existing));
     }
-    let joined = std::env::join_paths(path_entries).map_err(|error| {
-        DbgFlowError::Backend(format!("construct reverse worker PATH: {error}"))
-    })?;
+    let path = std::env::join_paths(path_entries)
+        .map_err(|error| DbgFlowError::Backend(format!("construct PATH: {error}")))?;
+
     Ok(vec![
-        EnvChange::set(IDA_INSTALL_ENV, install_dir.as_os_str()),
-        EnvChange::set("PATH", joined),
+        EnvChange::set(IDA_INSTALL_ENV, runtime.install.install_dir.as_os_str()),
+        EnvChange::set("PYTHONPATH", python_path),
+        EnvChange::set("PATH", path),
+        EnvChange::set("PYTHONUNBUFFERED", "1"),
+        EnvChange::set(
+            "IDA_MCP_OPEN_TIMEOUT",
+            (DEFAULT_OPEN_TIMEOUT_MS / 1000).to_string(),
+        ),
     ])
+}
+
+fn decode_tool_result(result: Value) -> Result<SupervisorToolCallResult> {
+    let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+    let structured_content = result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or_else(|| content_text_json(&result).unwrap_or(Value::Null));
+    let error_message = is_error.then(|| tool_error_text(&result));
+    Ok(SupervisorToolCallResult {
+        structured_content,
+        mcp_result: result,
+        is_error,
+        error_message,
+    })
+}
+
+fn content_text_json(result: &Value) -> Option<Value> {
+    let text = result
+        .get("content")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()?;
+    serde_json::from_str(text).ok()
+}
+
+fn tool_error_text(result: &Value) -> String {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("ida-pro-mcp tool call failed")
+        .to_string()
+}
+
+fn upstream_tool_descriptor_from_value(value: &Value) -> Option<UpstreamToolDescriptor> {
+    let name = value.get("name")?.as_str()?.to_string();
+    Some(UpstreamToolDescriptor {
+        name,
+        description: value
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("IDA Pro MCP upstream tool")
+            .to_string(),
+        input_schema: value
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(default_upstream_input_schema),
+        output_schema: value.get("outputSchema").cloned(),
+    })
+}
+
+fn ida_session_from_value(value: Value) -> Result<IdaUpstreamSession> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| DbgFlowError::Backend("IDA session entry is not an object".to_string()))?;
+    let database_id = object
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if database_id.is_empty() && object.get("adopted").and_then(Value::as_bool) != Some(false) {
+        return Err(DbgFlowError::Backend(
+            "IDA session entry missing session_id".to_string(),
+        ));
+    }
+    Ok(IdaUpstreamSession {
+        database_id,
+        input_path: PathBuf::from(
+            object
+                .get("input_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+        filename: object
+            .get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        backend: object
+            .get("backend")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        adopted: object.get("adopted").and_then(Value::as_bool),
+        owned: object.get("owned").and_then(Value::as_bool),
+        pid: object
+            .get("pid")
+            .and_then(Value::as_u64)
+            .map(|pid| pid as u32),
+        worker_pid: object
+            .get("worker_pid")
+            .and_then(Value::as_u64)
+            .map(|pid| pid as u32),
+        is_active: object.get("is_active").and_then(Value::as_bool),
+        is_analyzing: object.get("is_analyzing").and_then(Value::as_bool),
+        metadata: object.get("metadata").cloned().unwrap_or(Value::Null),
+    })
+}
+
+pub fn is_allowed_upstream_tool(tool_name: &str) -> bool {
+    DEFAULT_UPSTREAM_TOOLS.contains(&tool_name)
+        && tool_name != "py_exec_file"
+        && tool_name != UPSTREAM_IDB_OPEN
+        && tool_name != UPSTREAM_IDB_LIST
+        && !tool_name.starts_with("dbg_")
+}
+
+pub fn default_profile_text() -> String {
+    let mut text = String::from(
+        "# dbgflow default ida-pro-mcp profile\n# Generated by dbgflow; debugger tools and py_exec_file are intentionally excluded.\n\n",
+    );
+    for tool in DEFAULT_UPSTREAM_TOOLS {
+        text.push_str(tool);
+        text.push('\n');
+    }
+    text
+}
+
+pub fn fallback_tool_descriptors() -> Vec<UpstreamToolDescriptor> {
+    DEFAULT_UPSTREAM_TOOLS
+        .iter()
+        .map(|tool| UpstreamToolDescriptor {
+            name: (*tool).to_string(),
+            description: format!("IDA Pro MCP upstream tool `{tool}`."),
+            input_schema: default_upstream_input_schema(),
+            output_schema: None,
+        })
+        .collect()
+}
+
+fn default_upstream_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "dbgflow IDA session id returned by ida.create_session."
+            }
+        },
+        "required": ["session_id"],
+        "additionalProperties": true
+    })
+}
+
+pub fn download_ida_mcp_output(download_url: &str) -> Result<Value> {
+    let parsed = parse_http_url(download_url)?;
+    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port)).map_err(|error| {
+        DbgFlowError::Backend(format!(
+            "connect to IDA output download endpoint failed: {error}"
+        ))
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| DbgFlowError::Backend(format!("set read timeout: {error}")))?;
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n\r\n",
+        parsed.path, parsed.host_header
+    )
+    .map_err(|error| DbgFlowError::Backend(format!("write output download request: {error}")))?;
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response).map_err(|error| {
+        DbgFlowError::Backend(format!("read output download response: {error}"))
+    })?;
+    let marker = b"\r\n\r\n";
+    let body_start = response
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|index| index + marker.len())
+        .ok_or_else(|| {
+            DbgFlowError::Backend("invalid HTTP response from IDA output endpoint".to_string())
+        })?;
+    let header = String::from_utf8_lossy(&response[..body_start]);
+    if !header.starts_with("HTTP/1.1 200") && !header.starts_with("HTTP/1.0 200") {
+        return Err(DbgFlowError::Backend(format!(
+            "IDA output download failed: {}",
+            header.lines().next().unwrap_or("invalid HTTP status")
+        )));
+    }
+    serde_json::from_slice(&response[body_start..])
+        .map_err(|error| DbgFlowError::Backend(format!("parse IDA output JSON: {error}")))
+}
+
+struct ParsedHttpUrl {
+    host: String,
+    host_header: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_http_url(url: &str) -> Result<ParsedHttpUrl> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        DbgFlowError::Backend("IDA output download URL must use http://".to_string())
+    })?;
+    let (authority, path) = rest
+        .split_once('/')
+        .map(|(authority, path)| (authority, format!("/{path}")))
+        .unwrap_or((rest, "/".to_string()));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+        .ok_or_else(|| DbgFlowError::Backend("IDA output download URL missing port".to_string()))?;
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err(DbgFlowError::Backend(
+            "IDA output download URL must be loopback".to_string(),
+        ));
+    }
+    Ok(ParsedHttpUrl {
+        host: host.to_string(),
+        host_header: authority.to_string(),
+        port,
+        path,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::io::Cursor;
 
     #[test]
-    fn worker_response_reports_parse_error() {
-        let mut out = Vec::new();
-        run_reverse_ida_worker_stdio(Cursor::new("{not-json}\n"), &mut out)
-            .expect("worker returns parse error");
-        let response: WorkerOutput = serde_json::from_slice(&out).expect("worker response");
-
-        let error = response.error.expect("error");
-        assert_eq!(error.kind, "backend");
-        assert!(error.message.contains("parse worker request"));
-        assert!(!error.message.contains("backend error:"));
+    fn default_profile_includes_py_eval_and_excludes_debugger() {
+        let text = default_profile_text();
+        assert!(text.lines().any(|line| line == "py_eval"));
+        assert!(!text.lines().any(|line| line == "py_exec_file"));
+        assert!(!text.lines().any(|line| line.starts_with("dbg_")));
     }
 
     #[test]
-    fn worker_error_round_trip_does_not_duplicate_backend_prefix() {
-        let info = worker_error_from_dbgflow(DbgFlowError::Backend(
-            "ida.decompile is unsupported".to_string(),
-        ));
-        assert_eq!(info.kind, "backend");
-        assert_eq!(info.message, "ida.decompile is unsupported");
-
-        let error = worker_error_to_dbgflow(info);
-        assert_eq!(
-            error.to_string(),
-            "backend error: ida.decompile is unsupported"
-        );
-        assert!(!error.to_string().contains("backend error: backend error:"));
+    fn allowed_tool_filter_matches_default_surface() {
+        assert!(is_allowed_upstream_tool("decompile"));
+        assert!(is_allowed_upstream_tool("py_eval"));
+        assert!(!is_allowed_upstream_tool("py_exec_file"));
+        assert!(!is_allowed_upstream_tool("dbg_start"));
+        assert!(!is_allowed_upstream_tool(UPSTREAM_IDB_OPEN));
     }
 
     #[test]
-    fn worker_error_round_trip_preserves_session_error_kind() {
-        let session_id = SessionId::new();
-
-        let not_found = worker_error_to_dbgflow(worker_error_from_dbgflow(
-            DbgFlowError::SessionNotFound(session_id),
-        ));
-        assert!(matches!(
-            not_found,
-            DbgFlowError::SessionNotFound(id) if id == session_id
-        ));
-
-        let closed = worker_error_to_dbgflow(worker_error_from_dbgflow(
-            DbgFlowError::SessionClosed(session_id),
-        ));
-        assert!(matches!(
-            closed,
-            DbgFlowError::SessionClosed(id) if id == session_id
-        ));
-    }
-
-    #[test]
-    fn worker_runtime_serializes_errors_without_display_prefix() {
-        let mut runtime = WorkerRuntime::default();
-        let output = runtime.handle(WorkerInput {
-            request_id: 11,
-            request: WorkerRequest::Decompile(DecompileRequest {
-                target: "0x401000".to_string(),
-                include_addresses: true,
-            }),
-        });
-
-        assert!(!output.ok);
-        let error = output.error.expect("error");
-        assert_eq!(error.kind, "backend");
-        assert!(error.message.contains("open database"));
-        assert!(!error.message.contains("backend error:"));
-    }
-
-    #[test]
-    fn worker_request_round_trips_open_shape() {
-        let input = WorkerInput {
-            request_id: 7,
-            request: WorkerRequest::OpenDatabase(OpenIdaDatabase {
-                install_dir: PathBuf::from(r"C:\Program Files\IDA Professional 9.3"),
-                target: IdaTarget::Binary {
-                    path: PathBuf::from(r"C:\sample.exe"),
-                },
-                run_auto_analysis: true,
-            }),
-        };
-
-        let encoded = serde_json::to_string(&input).expect("encode");
-        let decoded: WorkerInput = serde_json::from_str(&encoded).expect("decode");
-
-        assert_eq!(decoded.request_id, 7);
-    }
-
-    #[test]
-    fn reverse_worker_launch_spec_hides_console_window() {
-        let executable = PathBuf::from("dbgflow-mcp.exe");
-        let install_dir = std::env::temp_dir().join("dbgflow-fake-ida-install");
-        let install = IdaInstall {
-            ida_dll: install_dir.join("ida.dll"),
-            idalib_dll: install_dir.join("idalib.dll"),
-            install_dir,
-        };
-        let worker_log_path = PathBuf::from("worker.log");
-        let spec = reverse_worker_launch_spec(&executable, &install, &worker_log_path)
-            .expect("build reverse worker launch spec");
-        let mut expected = ProcessLaunchSpec::new(&executable);
-        expected.hide_console_window();
-
-        assert_eq!(
-            spec.args,
-            vec![
-                OsString::from(REVERSE_WORKER_COMMAND),
-                OsString::from(REVERSE_WORKER_KIND_IDA)
-            ]
-        );
-        assert_eq!(spec.stdin, LaunchStdio::Piped);
-        assert_eq!(spec.stdout, LaunchStdio::Piped);
-        assert_eq!(spec.stderr, LaunchStdio::File(worker_log_path));
-        assert_eq!(spec.creation_flags, expected.creation_flags);
+    fn parses_loopback_download_url() {
+        let parsed = parse_http_url("http://127.0.0.1:1234/output/abc.json").expect("parse");
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 1234);
+        assert_eq!(parsed.path, "/output/abc.json");
     }
 }
