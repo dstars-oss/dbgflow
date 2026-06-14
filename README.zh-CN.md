@@ -202,9 +202,12 @@ max_workers = 4                                      # optional
 
 `install_dir` 也可来自 `DBGFLOW_IDA_DIR`；`python_executable` 也可来自
 `DBGFLOW_IDA_PYTHON`；`vendor_src_dir` 也可来自 `DBGFLOW_IDA_PRO_MCP_SRC`。
-选中的 Python 环境必须已安装或激活 `idapro>=0.0.9`。配置的 IDA 目录必须包含
-`ida.exe`、`ida.dll`、`idalib.dll` 和 `ida.hlp`。编译 dbgflow 源码不需要 IDA SDK、
-Clang、bindgen 或 `idalib-rs`。
+手动配置时，选中的 Python 环境必须已安装或激活 `idapro>=0.0.9` 和
+`tomli-w>=1.0.0`。Windows 安装脚本会在 install root 下创建专用 IDA venv，
+安装这些 runtime packages，把 vendored `ida-pro-mcp` runtime 复制到已安装的
+`bin\vendor` 目录，并把解析后的 `python_executable` 和 `vendor_src_dir` 写入
+`config.toml`。配置的 IDA 目录必须包含 `ida.exe`、`ida.dll`、`idalib.dll` 和
+`ida.hlp`。编译 dbgflow 源码不需要 IDA SDK、Clang、bindgen 或 `idalib-rs`。
 
 MCP tool surface 保留 dbgflow 管理工具（`ida.create_session`、`ida.get_session`、
 `ida.list_sessions`、`ida.close_session`），并将 upstream 非 debugger tools 暴露为
@@ -271,6 +274,9 @@ ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
 
 [reverse.ida]
 install_dir = "C:\\Program Files\\IDA Professional 9.3"
+python_executable = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\python\\ida-venv\\Scripts\\python.exe"
+vendor_src_dir = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\bin\\vendor\\ida-pro-mcp\\src"
+max_workers = 4
 
 [process]
 child_identity = "mcp_peer_session"
@@ -334,9 +340,16 @@ System32 最后的顺序探测 DbgEng。TTD 是可选依赖；脚本会先从已
 DbgEng 目录按 `<dbgeng_dir>\ttd` 推导，
 再回退到独立 TTD package 和 `PATH` 探测。可用 `-TtdDir <path>` 显式覆盖该位置。
 脚本也会从 `DBGFLOW_IDA_DIR`、Windows uninstall registry 和常见 Program Files
-目录探测 IDA 安装目录；当目录包含 `ida.exe`、`ida.dll`、`idalib.dll` 和
-`ida.hlp` 时写入 `[reverse.ida].install_dir`。可用 `-IdaInstallDir <path>` 显式覆盖
-IDA 探测结果。
+目录探测 IDA 安装目录。当找到有效 IDA 目录时，脚本会把 vendored
+`vendor\ida-pro-mcp` 树复制到 `<install-root>\bin\vendor\ida-pro-mcp`，创建
+`<install-root>\python\ida-venv`，在 IDA 自带 `py-activate-idalib.py` 存在时用它
+激活 idalib，安装 `idapro>=0.0.9` 和 `tomli-w>=1.0.0`，验证 vendored
+supervisor/worker import，并写入 `[reverse.ida].install_dir`、`python_executable`、
+`vendor_src_dir` 和 `max_workers`。可用 `-IdaInstallDir <path>` 显式覆盖 IDA
+探测结果，`-IdaPythonExecutable <python.exe>` 选择用于创建 venv 的 Python 3.11+
+解释器，`-IdaMaxWorkers <n>` 设置 supervisor worker 上限。若没有探测到 IDA 安装，
+脚本会跳过 IDA venv/runtime setup，并不写入 `[reverse.ida]`。安装 IDA Python
+依赖时，`-ProxyUrl <url>` 也会传给 pip。
 
 使用 `-ProxyUrl <url>`、`-NoProxy` 或现有 proxy 环境变量控制生成的 `[proxy]`
 配置。使用 `-SymbolPath <path>` 写入 `[debugger].symbol_path`；如果未传该参数，

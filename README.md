@@ -223,10 +223,15 @@ max_workers = 4                                      # optional
 
 `install_dir` can also come from `DBGFLOW_IDA_DIR`; `python_executable` can come
 from `DBGFLOW_IDA_PYTHON`; `vendor_src_dir` can come from
-`DBGFLOW_IDA_PRO_MCP_SRC`. The selected Python environment must already have
-`idapro>=0.0.9` installed or activated. The configured IDA directory must contain
-`ida.exe`, `ida.dll`, `idalib.dll`, and `ida.hlp`. Building dbgflow does not
-require the IDA SDK, Clang, bindgen, or `idalib-rs`.
+`DBGFLOW_IDA_PRO_MCP_SRC`. For manual configuration, the selected Python
+environment must have `idapro>=0.0.9` and `tomli-w>=1.0.0` installed or
+activated. The Windows install script creates a dedicated IDA venv under the
+install root, installs those runtime packages, copies the vendored
+`ida-pro-mcp` runtime into the installed `bin\vendor` tree, and writes the
+resolved `python_executable` and `vendor_src_dir` into `config.toml`.
+The configured IDA directory must contain `ida.exe`, `ida.dll`, `idalib.dll`,
+and `ida.hlp`. Building dbgflow does not require the IDA SDK, Clang, bindgen,
+or `idalib-rs`.
 
 The MCP surface keeps dbgflow management tools (`ida.create_session`,
 `ida.get_session`, `ida.list_sessions`, `ida.close_session`) and exposes
@@ -308,6 +313,9 @@ ttd_dir = "C:\\Users\\dstars\\Bin\\TTD"
 
 [reverse.ida]
 install_dir = "C:\\Program Files\\IDA Professional 9.3"
+python_executable = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\python\\ida-venv\\Scripts\\python.exe"
+vendor_src_dir = "C:\\Users\\dstars\\AppData\\Local\\dbgflow\\bin\\vendor\\ida-pro-mcp\\src"
+max_workers = 4
 
 [process]
 child_identity = "mcp_peer_session"
@@ -388,9 +396,19 @@ first derives it from the resolved DbgEng directory as `<dbgeng_dir>\ttd`, then
 falls back to standalone TTD discovery and `PATH`. Use `-TtdDir <path>` to
 override that location. The script also detects common IDA installation
 directories from `DBGFLOW_IDA_DIR`, Windows uninstall registry entries, and
-standard Program Files locations, then writes `[reverse.ida].install_dir` when
-the directory contains `ida.exe`, `ida.dll`, `idalib.dll`, and `ida.hlp`. Use
-`-IdaInstallDir <path>` to override IDA discovery.
+standard Program Files locations. When a valid IDA directory is found, the
+script copies the vendored `vendor\ida-pro-mcp` tree to
+`<install-root>\bin\vendor\ida-pro-mcp`, creates
+`<install-root>\python\ida-venv`, activates idalib with IDA's
+`py-activate-idalib.py` when present, installs `idapro>=0.0.9` and
+`tomli-w>=1.0.0`, verifies the vendored supervisor/worker imports, and writes
+`[reverse.ida].install_dir`, `python_executable`, `vendor_src_dir`, and
+`max_workers`. Use `-IdaInstallDir <path>` to override IDA discovery,
+`-IdaPythonExecutable <python.exe>` to choose the Python 3.11+ interpreter used
+to create the venv, and `-IdaMaxWorkers <n>` to set the supervisor worker
+limit. If no IDA installation is found, the script skips the IDA venv/runtime
+setup and leaves `[reverse.ida]` unset. `-ProxyUrl <url>` is also passed to pip
+when installing the IDA Python dependencies.
 
 Use `-ProxyUrl <url>`, `-NoProxy`, or existing proxy environment variables to
 control the generated `[proxy]` section. Use `-SymbolPath <path>` to write

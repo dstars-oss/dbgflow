@@ -11,6 +11,9 @@ param(
     [string]$SymbolPath,
     [string]$TtdDir,
     [string]$IdaInstallDir,
+    [string]$IdaPythonExecutable,
+    [ValidateRange(1, 1024)]
+    [int]$IdaMaxWorkers = 4,
     [switch]$NoProxy,
     [switch]$NonInteractive
 )
@@ -21,6 +24,8 @@ $SymbolPathWasProvided = $PSBoundParameters.ContainsKey("SymbolPath")
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $RepoRoot = Split-Path -Parent $ScriptDir
 $Exe = Join-Path $RepoRoot "target\release\dbgflow-mcp.exe"
+$VendoredIdaProMcpRoot = Join-Path $RepoRoot "vendor\ida-pro-mcp"
+$IdaPythonPackages = @("idapro>=0.0.9", "tomli-w>=1.0.0")
 $KnownProxyKeys = @(
     "_NT_SYMBOL_PROXY",
     "HTTP_PROXY",
@@ -112,6 +117,218 @@ function Test-IdaInstallDirectory {
         }
     }
     return $true
+}
+
+function Test-IdaProMcpVendorRoot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return (Test-Path -LiteralPath (Join-Path $Path "LICENSE") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $Path "pyproject.toml") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path (Join-Path $Path "src") "ida_pro_mcp\idalib_supervisor.py") -PathType Leaf)
+}
+
+function Get-InstalledIdaVendorRoot {
+    param([Parameter(Mandatory = $true)][string]$InstallRoot)
+
+    return (Join-Path (Join-Path (Join-Path $InstallRoot "bin") "vendor") "ida-pro-mcp")
+}
+
+function Get-IdaVenvDir {
+    param([Parameter(Mandatory = $true)][string]$InstallRoot)
+
+    return (Join-Path (Join-Path $InstallRoot "python") "ida-venv")
+}
+
+function Get-IdaVenvPythonPath {
+    param([Parameter(Mandatory = $true)][string]$VenvDir)
+
+    return (Join-Path (Join-Path $VenvDir "Scripts") "python.exe")
+}
+
+function Invoke-CheckedProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][string]$ErrorMessage
+    )
+
+    $output = & $FilePath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in $output) {
+        Write-Host $line
+    }
+    if ($exitCode -ne 0) {
+        throw "$ErrorMessage (exit code $exitCode)"
+    }
+}
+
+function Invoke-CheckedPythonBootstrap {
+    param(
+        [Parameter(Mandatory = $true)]$Bootstrap,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][string]$ErrorMessage
+    )
+
+    $output = & $Bootstrap.Command @($Bootstrap.Arguments) @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in $output) {
+        Write-Host $line
+    }
+    if ($exitCode -ne 0) {
+        throw "$ErrorMessage (exit code $exitCode)"
+    }
+}
+
+function Test-PythonBootstrap {
+    param([Parameter(Mandatory = $true)]$Bootstrap)
+
+    try {
+        $code = "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        & $Bootstrap.Command @($Bootstrap.Arguments) -c $code *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
+
+function Resolve-IdaPythonBootstrap {
+    $candidates = New-Object System.Collections.Generic.List[object]
+
+    if ($IdaPythonExecutable) {
+        $path = Get-FullPath -Path $IdaPythonExecutable
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "IDA Python executable was not found: $path"
+        }
+        $candidates.Add([pscustomobject]@{ Command = $path; Arguments = @(); Display = $path })
+    }
+
+    $envPython = [System.Environment]::GetEnvironmentVariable("DBGFLOW_IDA_PYTHON")
+    if ($envPython) {
+        try {
+            $path = Get-FullPath -Path $envPython
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $candidates.Add([pscustomobject]@{ Command = $path; Arguments = @(); Display = $path })
+            }
+        }
+        catch {
+        }
+    }
+
+    $py = Get-Command "py.exe" -ErrorAction SilentlyContinue
+    if ($py -and $py.Source) {
+        $candidates.Add([pscustomobject]@{ Command = $py.Source; Arguments = @("-3.11"); Display = "$($py.Source) -3.11" })
+    }
+
+    foreach ($name in @("python.exe", "python3.exe")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command -and $command.Source) {
+            $candidates.Add([pscustomobject]@{ Command = $command.Source; Arguments = @(); Display = $command.Source })
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-PythonBootstrap -Bootstrap $candidate) {
+            return $candidate
+        }
+    }
+
+    throw "Python 3.11 or newer was not found. Install Python 3.11+ or pass -IdaPythonExecutable <python.exe>."
+}
+
+function Copy-IdaProMcpVendor {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][string]$InstallRoot
+    )
+
+    if (-not (Test-IdaProMcpVendorRoot -Path $SourceRoot)) {
+        throw "Vendored ida-pro-mcp runtime is incomplete: $SourceRoot"
+    }
+
+    $destination = Get-InstalledIdaVendorRoot -InstallRoot $InstallRoot
+    if (-not (Test-PathUnderRoot -Path $destination -Root $InstallRoot)) {
+        throw "IDA vendor destination must be under install root: $destination"
+    }
+
+    if (Test-Path -LiteralPath $destination) {
+        Remove-Item -LiteralPath $destination -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -LiteralPath $SourceRoot -Destination $destination -Recurse -Force
+
+    $vendorSrc = Join-Path $destination "src"
+    if (-not (Test-Path -LiteralPath (Join-Path $vendorSrc "ida_pro_mcp\idalib_supervisor.py") -PathType Leaf)) {
+        throw "Copied ida-pro-mcp runtime is incomplete: $vendorSrc"
+    }
+    return (Get-FullPath -Path $vendorSrc)
+}
+
+function Invoke-IdaPythonRuntimeCheck {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonExecutable,
+        [Parameter(Mandatory = $true)][string]$IdaInstallDir,
+        [Parameter(Mandatory = $true)][string]$VendorSrcDir
+    )
+
+    $oldIdaDir = [System.Environment]::GetEnvironmentVariable("IDADIR", "Process")
+    $oldPath = [System.Environment]::GetEnvironmentVariable("PATH", "Process")
+    $oldPythonPath = [System.Environment]::GetEnvironmentVariable("PYTHONPATH", "Process")
+    try {
+        [System.Environment]::SetEnvironmentVariable("IDADIR", $IdaInstallDir, "Process")
+        [System.Environment]::SetEnvironmentVariable("PATH", "$IdaInstallDir;$oldPath", "Process")
+        $pythonPath = if ($oldPythonPath) { "$VendorSrcDir;$oldPythonPath" } else { $VendorSrcDir }
+        [System.Environment]::SetEnvironmentVariable("PYTHONPATH", $pythonPath, "Process")
+
+        $code = "import sys; assert sys.version_info >= (3, 11); import tomli_w; import idapro; import ida_pro_mcp.idalib_supervisor; import ida_pro_mcp.idalib_server; print('IDA Python runtime OK')"
+        Invoke-CheckedProcess -FilePath $PythonExecutable -Arguments @("-c", $code) -ErrorMessage "IDA Python runtime verification failed"
+    }
+    finally {
+        [System.Environment]::SetEnvironmentVariable("IDADIR", $oldIdaDir, "Process")
+        [System.Environment]::SetEnvironmentVariable("PATH", $oldPath, "Process")
+        [System.Environment]::SetEnvironmentVariable("PYTHONPATH", $oldPythonPath, "Process")
+    }
+}
+
+function Initialize-IdaPythonVirtualEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [Parameter(Mandatory = $true)][string]$IdaInstallDir,
+        [Parameter(Mandatory = $true)][string]$VendorSrcDir,
+        [Parameter(Mandatory = $true)]$ProxyConfig
+    )
+
+    $venvDir = Get-IdaVenvDir -InstallRoot $InstallRoot
+    $venvPython = Get-IdaVenvPythonPath -VenvDir $venvDir
+    if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+        $bootstrap = Resolve-IdaPythonBootstrap
+        Write-Host "Creating IDA Python venv with $($bootstrap.Display): $venvDir"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $venvDir) | Out-Null
+        Invoke-CheckedPythonBootstrap -Bootstrap $bootstrap -Arguments @("-m", "venv", $venvDir) -ErrorMessage "Create IDA Python virtual environment failed"
+    } else {
+        Write-Host "Reusing IDA Python venv: $venvDir"
+    }
+
+    if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+        throw "IDA Python venv did not create python.exe: $venvPython"
+    }
+
+    $activateIdalib = Join-Path $IdaInstallDir "idalib\python\py-activate-idalib.py"
+    if (Test-Path -LiteralPath $activateIdalib -PathType Leaf) {
+        Write-Host "Activating idalib for venv using: $activateIdalib"
+        Invoke-CheckedProcess -FilePath $venvPython -Arguments @($activateIdalib, "--ida-install-dir", $IdaInstallDir) -ErrorMessage "Activate IDA idalib Python config failed"
+    }
+
+    Write-Host "Installing IDA Python runtime packages: $($IdaPythonPackages -join ', ')"
+    Invoke-CheckedProcess -FilePath $venvPython -Arguments @("-m", "ensurepip", "--upgrade") -ErrorMessage "Initialize pip in IDA Python venv failed"
+    $pipArgs = @("-m", "pip", "install")
+    if ($ProxyConfig.Url) {
+        $pipArgs += @("--proxy", $ProxyConfig.Url)
+    }
+    Invoke-CheckedProcess -FilePath $venvPython -Arguments ($pipArgs + @("--upgrade") + $IdaPythonPackages) -ErrorMessage "Install IDA Python runtime packages failed"
+
+    Invoke-IdaPythonRuntimeCheck -PythonExecutable $venvPython -IdaInstallDir $IdaInstallDir -VendorSrcDir $VendorSrcDir
+    return (Get-FullPath -Path $venvPython)
 }
 
 function Add-PathCandidate {
@@ -478,6 +695,9 @@ function Write-DbgFlowConfig {
         [string]$ResolvedSymbolPath,
         [string]$ResolvedTtdDir,
         [string]$ResolvedIdaInstallDir,
+        [string]$ResolvedIdaPythonExecutable,
+        [string]$ResolvedIdaVendorSrcDir,
+        [int]$ResolvedIdaMaxWorkers = 0,
         [Parameter(Mandatory = $true)]$ProxyConfig
     )
 
@@ -512,6 +732,15 @@ function Write-DbgFlowConfig {
         $lines.Add("")
         $lines.Add("[reverse.ida]")
         $lines.Add("install_dir = $(ConvertTo-TomlString $ResolvedIdaInstallDir)")
+        if ($ResolvedIdaPythonExecutable) {
+            $lines.Add("python_executable = $(ConvertTo-TomlString $ResolvedIdaPythonExecutable)")
+        }
+        if ($ResolvedIdaVendorSrcDir) {
+            $lines.Add("vendor_src_dir = $(ConvertTo-TomlString $ResolvedIdaVendorSrcDir)")
+        }
+        if ($ResolvedIdaMaxWorkers -gt 0) {
+            $lines.Add("max_workers = $ResolvedIdaMaxWorkers")
+        }
     }
 
     $lines.Add("")
@@ -619,6 +848,16 @@ try {
 
     $proxyConfig = Get-ProxyConfig
     $resolvedSymbolPath = Get-SymbolPathConfig
+    $plannedIdaVendorSrcDir = $null
+    $plannedIdaPythonExecutable = $null
+    $resolvedIdaVendorSrcDir = $null
+    $resolvedIdaPythonExecutable = $null
+    $resolvedIdaMaxWorkers = 0
+    if ($resolvedIdaInstallDir) {
+        $plannedIdaVendorSrcDir = Join-Path (Get-InstalledIdaVendorRoot -InstallRoot $InstallRoot) "src"
+        $plannedIdaPythonExecutable = Get-IdaVenvPythonPath -VenvDir (Get-IdaVenvDir -InstallRoot $InstallRoot)
+        $resolvedIdaMaxWorkers = $IdaMaxWorkers
+    }
 
     Write-Host "dbgflow Windows service install"
     Write-Host ""
@@ -632,6 +871,9 @@ try {
     Write-Host "Symbol path: $(if ($resolvedSymbolPath) { 'configured' } else { 'not configured' })"
     Write-Host "TTD dir: $(if ($resolvedTtdDir) { $resolvedTtdDir } else { 'not configured' })"
     Write-Host "IDA dir: $(if ($resolvedIdaInstallDir) { $resolvedIdaInstallDir } else { 'not configured' })"
+    Write-Host "IDA Python venv: $(if ($plannedIdaPythonExecutable) { $plannedIdaPythonExecutable } else { 'not configured' })"
+    Write-Host "IDA vendor src: $(if ($plannedIdaVendorSrcDir) { $plannedIdaVendorSrcDir } else { 'not configured' })"
+    Write-Host "IDA max workers: $(if ($resolvedIdaMaxWorkers -gt 0) { $resolvedIdaMaxWorkers } else { 'not configured' })"
     Write-Host "Child identity: mcp_peer_session (fallback active_interactive_session, elevate_if_admin true)"
     Write-Host "Proxy mode: $($proxyConfig.Mode)"
     if ($proxyConfig.Url) {
@@ -649,7 +891,13 @@ try {
         }
     }
 
-    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedTtdDir $resolvedTtdDir -ResolvedIdaInstallDir $resolvedIdaInstallDir -ProxyConfig $proxyConfig
+    if ($resolvedIdaInstallDir) {
+        Write-Host "Copying vendored ida-pro-mcp runtime..."
+        $resolvedIdaVendorSrcDir = Copy-IdaProMcpVendor -SourceRoot $VendoredIdaProMcpRoot -InstallRoot $InstallRoot
+        $resolvedIdaPythonExecutable = Initialize-IdaPythonVirtualEnvironment -InstallRoot $InstallRoot -IdaInstallDir $resolvedIdaInstallDir -VendorSrcDir $resolvedIdaVendorSrcDir -ProxyConfig $proxyConfig
+    }
+
+    Write-DbgFlowConfig -Path $ConfigPath -InstallRoot $InstallRoot -DataDir $DataDir -ResolvedDbgEngDir $resolvedDbgEngDir -ResolvedSymbolPath $resolvedSymbolPath -ResolvedTtdDir $resolvedTtdDir -ResolvedIdaInstallDir $resolvedIdaInstallDir -ResolvedIdaPythonExecutable $resolvedIdaPythonExecutable -ResolvedIdaVendorSrcDir $resolvedIdaVendorSrcDir -ResolvedIdaMaxWorkers $resolvedIdaMaxWorkers -ProxyConfig $proxyConfig
 
     & $Exe service install --config $ConfigPath
     exit $LASTEXITCODE

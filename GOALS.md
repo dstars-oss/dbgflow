@@ -621,7 +621,10 @@ reverse API。
   跨领域基础设施，集中到 `dbgflow-common` 可避免未来 `ida.*` 复制现有 profile / TTD 模式。
 * facade 保持现有 Rust 调用路径和测试兼容，让内部架构可以演进而不破坏 MCP wire API。
 
-### D-022: IDA MVP 采用运行时动态绑定而非构建期 SDK 绑定
+### D-022: IDA MVP 采用运行时动态绑定而非构建期 SDK 绑定（已由 D-018 取代）
+
+状态：已被 D-018 的 vendored `ida-pro-mcp` supervisor 方案取代；以下保留为历史
+决策记录。
 
 决定：
 
@@ -720,6 +723,7 @@ linked elevated token 且配置允许，则优先使用 elevated token。
 
 * [x] 完成 IDA runtime 探测和 `[reverse.ida] install_dir / python_executable / vendor_src_dir / max_workers` 配置设计。
 * [x] 安装脚本探测常见 IDA 安装目录，并在有效时写入 `[reverse.ida].install_dir`。
+* [x] 安装脚本为 IDA 创建专用 Python venv、安装 `idapro>=0.0.9` / `tomli-w`、复制 vendored `ida-pro-mcp` runtime，并写入完整 `[reverse.ida]` 配置。
 * [x] 定义 `ReverseSessionManager` 和 upstream supervisor JSON-RPC client。
 * [x] 废弃 Rust direct-binding IDA worker，改为 vendored `ida-pro-mcp` headless idalib supervisor。
 * [x] 设计 `ida.*` MCP tool schema 和 session lifecycle：管理工具由 dbgflow 提供，upstream 非 debugger tools 以 `ida.<tool_name>` 暴露。
